@@ -37,6 +37,9 @@ pub struct OrderMatchingEngineConfig {
     pub reject_stop_orders: bool,
     #[builder(default = true)]
     pub support_gtd_orders: bool,
+    /// Expire due GTD orders before matching; preserves legacy ordering by default.
+    #[builder(default)]
+    pub gtd_expiry_before_match: bool,
     #[builder(default = true)]
     pub support_contingent_orders: bool,
     #[builder(default = true)]

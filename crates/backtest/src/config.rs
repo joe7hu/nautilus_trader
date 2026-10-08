@@ -342,6 +342,9 @@ pub struct SimulatedVenueConfig {
     /// If good-till-date order expiry is supported.
     #[builder(default = true)]
     pub support_gtd_orders: bool,
+    /// Opt in to GTD expiry before data and matching at the expiry boundary.
+    #[builder(default = false)]
+    pub gtd_expiry_before_match: bool,
     /// If contingent order relationships are supported.
     #[builder(default = true)]
     pub support_contingent_orders: bool,

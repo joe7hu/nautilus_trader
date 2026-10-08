@@ -180,6 +180,7 @@ pub struct SimulatedExchange {
     liquidity_consumption: bool,
     reject_stop_orders: bool,
     support_gtd_orders: bool,
+    gtd_expiry_before_match: bool,
     support_contingent_orders: bool,
     use_position_ids: bool,
     use_random_ids: bool,
@@ -270,6 +271,7 @@ impl SimulatedExchange {
             liquidity_consumption: config.liquidity_consumption,
             reject_stop_orders: config.reject_stop_orders,
             support_gtd_orders: config.support_gtd_orders,
+            gtd_expiry_before_match: config.gtd_expiry_before_match,
             support_contingent_orders: config.support_contingent_orders,
             use_position_ids: config.use_position_ids,
             use_random_ids: config.use_random_ids,
@@ -478,6 +480,7 @@ impl SimulatedExchange {
             .liquidity_consumption(self.liquidity_consumption)
             .reject_stop_orders(self.reject_stop_orders)
             .support_gtd_orders(self.support_gtd_orders)
+            .gtd_expiry_before_match(self.gtd_expiry_before_match)
             .support_contingent_orders(self.support_contingent_orders)
             .use_position_ids(self.use_position_ids)
             .use_random_ids(self.use_random_ids)
@@ -779,6 +782,17 @@ impl SimulatedExchange {
     pub fn iterate_matching_engines(&mut self, ts_now: UnixNanos) {
         for matching_engine in self.matching_engines.values_mut() {
             matching_engine.iterate(ts_now, AggressorSide::NoAggressor);
+        }
+    }
+
+    /// Processes order expiry without matching or publishing market data.
+    pub(crate) fn process_order_expirations(&mut self, ts_now: UnixNanos) {
+        if !self.gtd_expiry_before_match || !self.support_gtd_orders {
+            return;
+        }
+        self.set_clock_time(ts_now);
+        for matching_engine in self.matching_engines.values_mut() {
+            matching_engine.process_order_expirations(ts_now);
         }
     }
 
