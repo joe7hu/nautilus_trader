@@ -705,4 +705,90 @@ mod causal_remaining {
             assert_eq!(fills[0].commission, Some(Money::from("0.25 USD")));
         }
     }
+    #[test]
+    fn stale_oto_list_leg_emits_one_rejection() {
+        let mut e = engine();
+        venue(&mut e, "CA", true, true);
+        let id = instrument(&mut e, "EUR/USD.CA");
+        let rejected = Rc::new(Cell::new(0));
+        let count = Rc::clone(&rejected);
+        let exec = Rc::downgrade(&e.kernel.exec_engine);
+        // Observe raw native dispatch, then forward to the unchanged real engine.
+        msgbus::register_order_event_endpoint(
+            MessagingSwitchboard::exec_engine_process(),
+            nautilus_common::msgbus::TypedIntoHandler::from(move |event: OrderEventAny| {
+                if matches!(&event,OrderEventAny::Rejected(r) if r.client_order_id==ClientOrderId::from("CHILD"))
+                {
+                    count.set(count.get() + 1);
+                }
+                if let Some(exec) = exec.upgrade() {
+                    exec.borrow_mut().process(&event);
+                }
+            }),
+        );
+        let parent = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(e.trader_id())
+            .instrument_id(id)
+            .client_order_id(ClientOrderId::from("PARENT"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(8))
+            .price(Price::from("1.00000"))
+            .contingency_type(ContingencyType::Oto)
+            .linked_order_ids(vec![ClientOrderId::from("CHILD")])
+            .build();
+        let child = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(e.trader_id())
+            .instrument_id(id)
+            .client_order_id(ClientOrderId::from("CHILD"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(8))
+            .price(Price::from("1.00000"))
+            .time_in_force(TimeInForce::Gtd)
+            .expire_time(5.into())
+            .parent_order_id(parent.client_order_id())
+            .build();
+        cache(&e, &parent);
+        cache(&e, &child);
+        let clocks = e.collect_all_clocks();
+        e.advance_time_impl(6.into(), &clocks).unwrap();
+        quote(id, 6, "1.00000", 16);
+        let list = nautilus_model::orders::OrderList::new(
+            nautilus_model::identifiers::OrderListId::from("OVERDUE-LIST"),
+            id,
+            parent.strategy_id(),
+            vec![parent.client_order_id(), child.client_order_id()],
+            6.into(),
+        );
+        send_execution_command(TradingCommand::SubmitOrderList(
+            nautilus_common::messages::execution::SubmitOrderList::new(
+                parent.trader_id(),
+                Some(ClientId::from("CA")),
+                parent.strategy_id(),
+                list,
+                vec![parent.init_event().clone(), child.init_event().clone()],
+                None,
+                None,
+                None,
+                UUID4::new(),
+                6.into(),
+                None,
+            ),
+        ));
+        e.settle_venues(6.into(), SettlementScope::All);
+        let result = snapshot(&e, &child);
+        assert_eq!(snapshot(&e, &parent).filled_qty(), Quantity::from(8));
+        assert_eq!(result.status(), OrderStatus::Rejected);
+        assert_eq!(result.filled_qty(), Quantity::from(0));
+        assert!(
+            !result
+                .events()
+                .into_iter()
+                .any(|e| matches!(e, OrderEventAny::Filled(_)))
+        );
+        assert_eq!(
+            rejected.get(),
+            1,
+            "one native rejection, including raw dispatch"
+        );
+    }
 }

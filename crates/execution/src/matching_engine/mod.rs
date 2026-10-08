@@ -2871,7 +2871,10 @@ impl OrderMatchingEngine {
             return;
         }
 
-        if self.config.gtd_expiry_before_match && order.is_closed() {
+        if self.config.gtd_expiry_before_match
+            && (order.is_closed()
+                || self.order_snapshot(order.client_order_id()).is_some_and(|cached| cached.is_closed()))
+        {
             return;
         }
 
