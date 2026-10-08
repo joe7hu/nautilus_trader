@@ -2871,6 +2871,10 @@ impl OrderMatchingEngine {
             return;
         }
 
+        if self.config.gtd_expiry_before_match && order.is_closed() {
+            return;
+        }
+
         // Ensure expiration semantics are enforced even when no fresh market-data
         // tick arrives for this instrument after expiry (e.g. after rotation).
         let ts_now = self.clock.borrow().timestamp_ns();
@@ -2933,6 +2937,15 @@ impl OrderMatchingEngine {
                         .into(),
                     );
                 }
+            }
+
+            // Latency-delayed submissions and activated OTO children may never
+            // have entered the core. Reject before any immediate matching.
+            if self.config.gtd_expiry_before_match
+                && self.config.support_gtd_orders
+                && order.expire_time().is_some_and(|expiry| ts_now >= expiry)
+            {
+                break 'validate Some("GTD deadline reached before acceptance".into());
             }
 
             // Contingent orders checks

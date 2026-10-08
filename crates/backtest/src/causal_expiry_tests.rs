@@ -584,4 +584,125 @@ mod causal_remaining {
             serde_json::json!({"case":"independent-clocks","first_clock":9,"second_clock":4,"first":"Expired@9","second":"Accepted"})
         );
     }
+    // The order is still outside the matching core when its deadline passes.
+    #[rstest]
+    fn delayed_insert_cannot_fill_after_deadline(
+        #[values(false, true)] causal: bool,
+        #[values(3_u64, 4)] delay: u64,
+    ) {
+        use nautilus_execution::models::latency::{LatencyModelHandle, StaticLatencyModel};
+        let mut e = engine();
+        venue(&mut e, "CA", causal, true);
+        let id = instrument(&mut e, "EUR/USD.CA");
+        e.venues
+            .get(&id.venue)
+            .unwrap()
+            .borrow_mut()
+            .set_latency_model(LatencyModelHandle::new(StaticLatencyModel::new(
+                Default::default(),
+                nautilus_core::DurationNanos::new(delay),
+                Default::default(),
+                Default::default(),
+            )));
+        let o = order(&e, id, "DELAYED", Some(5));
+        cache(&e, &o);
+        let clocks = e.collect_all_clocks();
+        e.advance_time_impl(2.into(), &clocks).unwrap();
+        quote(id, 2, "1.00000", 10);
+        submit(&o, 2);
+        e.settle_venues(2.into(), SettlementScope::All);
+        assert_eq!(snapshot(&e, &o).status(), OrderStatus::Submitted);
+        let at = 2 + delay;
+        e.advance_time_impl(at.into(), &clocks).unwrap();
+        e.settle_venues(at.into(), SettlementScope::All);
+        let result = snapshot(&e, &o);
+        assert_eq!(
+            result.status(),
+            if causal {
+                OrderStatus::Rejected
+            } else {
+                OrderStatus::Filled
+            }
+        );
+        assert_eq!(
+            result.filled_qty(),
+            Quantity::from(if causal { 0 } else { 8 })
+        );
+        let fills: Vec<_> = result
+            .events()
+            .into_iter()
+            .filter_map(|x| match x {
+                OrderEventAny::Filled(f) => Some(f),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fills.len(), if causal { 0 } else { 1 });
+        if !causal {
+            assert_eq!(fills[0].last_px, Price::from("1.00000"));
+            assert_eq!(fills[0].commission, Some(Money::from("0.25 USD")));
+        }
+    }
+    #[rstest]
+    fn overdue_oto_child_cannot_fill_on_activation(#[values(false, true)] causal: bool) {
+        let mut e = engine();
+        venue(&mut e, "CA", causal, true);
+        let id = instrument(&mut e, "EUR/USD.CA");
+        let parent = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(e.trader_id())
+            .instrument_id(id)
+            .client_order_id(ClientOrderId::from("PARENT"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(8))
+            .price(Price::from("1.00000"))
+            .contingency_type(ContingencyType::Oto)
+            .linked_order_ids(vec![ClientOrderId::from("CHILD")])
+            .build();
+        let child = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(e.trader_id())
+            .instrument_id(id)
+            .client_order_id(ClientOrderId::from("CHILD"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(8))
+            .price(Price::from("1.00000"))
+            .time_in_force(TimeInForce::Gtd)
+            .expire_time(5.into())
+            .parent_order_id(parent.client_order_id())
+            .build();
+        cache(&e, &parent);
+        cache(&e, &child);
+        let clocks = e.collect_all_clocks();
+        e.advance_time_impl(2.into(), &clocks).unwrap();
+        submit(&parent, 2);
+        submit(&child, 2);
+        e.settle_venues(2.into(), SettlementScope::All);
+        e.advance_time_impl(6.into(), &clocks).unwrap();
+        quote(id, 6, "1.00000", 16);
+        let result = snapshot(&e, &child);
+        assert_eq!(snapshot(&e, &parent).filled_qty(), Quantity::from(8));
+        assert_eq!(
+            result.status(),
+            if causal {
+                OrderStatus::Rejected
+            } else {
+                OrderStatus::Filled
+            }
+        );
+        assert_eq!(
+            result.filled_qty(),
+            Quantity::from(if causal { 0 } else { 8 })
+        );
+        let fills: Vec<_> = result
+            .events()
+            .into_iter()
+            .filter_map(|x| match x {
+                OrderEventAny::Filled(f) => Some(f),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fills.len(), if causal { 0 } else { 1 });
+        if !causal {
+            assert_eq!(fills[0].last_px, Price::from("1.00000"));
+            assert_eq!(fills[0].commission, Some(Money::from("0.25 USD")));
+        }
+    }
 }
