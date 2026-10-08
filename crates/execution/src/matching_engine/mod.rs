@@ -3913,6 +3913,31 @@ impl OrderMatchingEngine {
         }
     }
 
+    /// Expires due GTD orders without matching or changing market liquidity.
+    pub fn process_order_expirations(&mut self, timestamp_ns: UnixNanos) {
+        if !self.config.support_gtd_orders || !self.config.gtd_expiry_before_match {
+            return;
+        }
+        let ids: Vec<ClientOrderId> = self.core.iter_orders()
+            .map(|order| order.client_order_id).collect();
+        for id in ids {
+            if !self.core.order_exists(id) {
+                continue;
+            }
+            let due = {
+                let cache = self.cache.borrow();
+                cache.order(&id).filter(|order| !order.is_closed()
+                    && order.expire_time().is_some_and(|at| timestamp_ns >= at))
+                    .map(|order| self.order_snapshot(id).unwrap_or_else(|| order.clone()))
+            };
+            if let Some(order) = due {
+                self.delete_core_order(id);
+                self.cached_filled_qty.swap_remove(&id);
+                self.expire_order(&order);
+            }
+        }
+    }
+
     /// Iterate the matching engine by processing the bid and ask order sides
     /// and advancing time up to the given UNIX `timestamp_ns`.
     ///
@@ -3956,6 +3981,8 @@ impl OrderMatchingEngine {
                 self.core.ask = self.book.best_ask_price();
             }
         }
+
+        self.process_order_expirations(timestamp_ns);
 
         let mut matched_order = false;
 

@@ -1603,6 +1603,11 @@ impl BacktestEngine {
             self.last_ns = ts_now;
             Self::set_all_clocks_time(clocks, ts_now);
             logging_clock_set_static_time(ts_now.as_u64());
+            // Expiry must precede the next market datum, including custom clock
+            // data when no command is queued for the venue.
+            for exchange in self.venues.values() {
+                exchange.borrow_mut().process_order_expirations(ts_now);
+            }
         }
 
         Ok(())
@@ -1700,6 +1705,11 @@ impl BacktestEngine {
                 .expect("timer exists at timestamp");
             Self::set_all_clocks_time(clocks, ts_event);
             logging_clock_set_static_time(ts_event.as_u64());
+            // Due order expiry precedes timer callbacks and their queued commands,
+            // including timers drained by end(). Default venues remain unchanged.
+            for exchange in self.venues.values() {
+                exchange.borrow_mut().process_order_expirations(ts_event);
+            }
             handler.run();
             self.drain_command_queues();
 
@@ -3754,4 +3764,6 @@ mod tests {
             .market_status;
         assert_eq!(market_status, MarketStatus::Closed);
     }
+
+    include!("causal_expiry_tests.rs");
 }
