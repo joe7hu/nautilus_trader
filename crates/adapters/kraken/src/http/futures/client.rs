@@ -2812,19 +2812,21 @@ fn map_futures_trigger_signal(
     }
 }
 
+fn account_currency(code: &str) -> Currency {
+    if matches!(code, "XXBT" | "XBT" | "BTC") {
+        Currency::BTC()
+    } else {
+        Currency::new(code, 8, 0, code, CurrencyType::Crypto)
+    }
+}
+
 fn parse_multi_collateral_balances(account: &FuturesAccount, balances: &mut Vec<AccountBalance>) {
     for (currency_code, currency_info) in &account.currencies {
         if currency_info.quantity.is_zero() {
             continue;
         }
 
-        let currency = Currency::new(
-            currency_code.as_str(),
-            8,
-            0,
-            currency_code.as_str(),
-            CurrencyType::Crypto,
-        );
+        let currency = account_currency(currency_code);
 
         let total_amount = currency_info.quantity;
         let available_amount = currency_info.available.unwrap_or(total_amount);
@@ -2887,13 +2889,7 @@ fn parse_margin_account_balances(account: &FuturesAccount, balances: &mut Vec<Ac
             continue;
         }
 
-        let currency = Currency::new(
-            currency_code.as_str(),
-            8,
-            0,
-            currency_code.as_str(),
-            CurrencyType::Crypto,
-        );
+        let currency = account_currency(currency_code);
 
         let available = account
             .auxiliary
@@ -2941,13 +2937,7 @@ fn parse_cash_account_balances(account: &FuturesAccount, balances: &mut Vec<Acco
             continue;
         }
 
-        let currency = Currency::new(
-            currency_code.as_str(),
-            8,
-            0,
-            currency_code.as_str(),
-            CurrencyType::Crypto,
-        );
+        let currency = account_currency(currency_code);
 
         push_balance(balances, amount, Decimal::ZERO, currency, currency_code);
     }
@@ -3147,15 +3137,13 @@ mod tests {
     #[rstest]
     fn test_parse_multi_collateral_balances() {
         let mut currencies = AHashMap::new();
-        currencies.insert(
-            "BTC".to_string(),
-            FuturesFlexCurrency {
-                quantity: dec!(1.5),
-                value: None,
-                collateral: None,
-                available: Some(dec!(1.2)),
-            },
-        );
+        let btc = FuturesFlexCurrency {
+            quantity: dec!(1.5),
+            value: None,
+            collateral: None,
+            available: Some(dec!(1.2)),
+        };
+        currencies.insert("BTC".to_string(), btc);
 
         let account = FuturesAccount {
             account_type: KrakenFuturesAccountType::MultiCollateralMarginAccount,
@@ -3204,6 +3192,7 @@ mod tests {
 
         assert_eq!(balances.len(), 1);
         let balance = &balances[0];
+        assert_eq!(balance.currency, Currency::BTC());
         assert_eq!(balance.total.as_decimal(), dec!(10.00000003));
         assert_eq!(balance.locked.as_decimal(), dec!(9.99999999));
         assert_eq!(balance.free.as_decimal(), dec!(0.00000004));

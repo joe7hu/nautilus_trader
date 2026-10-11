@@ -30,7 +30,7 @@ use nautilus_sandbox::{
 use nautilus_system::get_global_pyo3_registry;
 use pyo3::{
     IntoPyObjectExt, Py, Python,
-    types::{PyAnyMethods, PyModule, PyTuple},
+    types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyTuple},
 };
 use rstest::rstest;
 
@@ -69,17 +69,15 @@ fn assert_exec_factory_extracts_from_python_object(py: Python<'_>) {
     let factory = Py::new(py, SandboxExecutionClientFactory::new())
         .expect("factory should convert to Python object")
         .into_any();
-    let config = Py::new(
-        py,
-        SandboxExecutionClientConfig {
-            account_id,
-            venue: Venue::new(SANDBOX),
-            starting_balances: vec![Money::from("100_000 USD")],
-            ..SandboxExecutionClientConfig::default()
-        },
-    )
-    .expect("config should convert to Python object")
-    .into_any();
+    let config = SandboxExecutionClientConfig {
+        account_id,
+        venue: Venue::new(SANDBOX),
+        starting_balances: vec![Money::from("100_000 USD")],
+        ..SandboxExecutionClientConfig::default()
+    };
+    let config = Py::new(py, config)
+        .expect("config should convert to Python object")
+        .into_any();
     let registry = get_global_pyo3_registry();
 
     let extracted_factory = registry
@@ -125,23 +123,21 @@ fn test_sandbox_python_extract_preserves_matching_knobs() {
         let factory = Py::new(py, SandboxExecutionClientFactory::new())
             .expect("factory should convert to Python object")
             .into_any();
-        let config = Py::new(
-            py,
-            SandboxExecutionClientConfig {
-                account_id,
-                venue: Venue::new(SANDBOX),
-                starting_balances: vec![Money::from("100_000 USD")],
-                queue_position: true,
-                liquidity_consumption: true,
-                bar_adaptive_high_low_ordering: true,
-                use_market_order_acks: true,
-                oto_full_trigger: true,
-                price_protection_points: 50,
-                ..SandboxExecutionClientConfig::default()
-            },
-        )
-        .expect("config should convert to Python object")
-        .into_any();
+        let config = SandboxExecutionClientConfig {
+            account_id,
+            venue: Venue::new(SANDBOX),
+            starting_balances: vec![Money::from("100_000 USD")],
+            queue_position: true,
+            liquidity_consumption: true,
+            bar_adaptive_high_low_ordering: true,
+            use_market_order_acks: true,
+            oto_full_trigger: true,
+            price_protection_points: 50,
+            ..SandboxExecutionClientConfig::default()
+        };
+        let config = Py::new(py, config)
+            .expect("config should convert to Python object")
+            .into_any();
         let registry = get_global_pyo3_registry();
         let extracted_config = registry
             .extract_config(py, config)
@@ -230,6 +226,51 @@ fn test_sandbox_config_positional_signature_is_backward_compatible() {
         assert!(
             config.getattr("latency_model").unwrap().is_none(),
             "latency_model must default to None when not passed",
+        );
+    });
+}
+
+// Exercise the real Python constructor and the registry used by LiveNode.
+#[rstest]
+fn test_sandbox_python_constructor_preserves_causal_expiry(
+    #[values(None, Some(false), Some(true))] enabled: Option<bool>,
+) {
+    setup_exec_event_sender();
+    Python::initialize();
+
+    Python::attach(|py| {
+        register_sandbox_python_module(py);
+        let kwargs = PyDict::new(py);
+
+        if let Some(value) = enabled {
+            kwargs.set_item("gtd_expiry_before_match", value).unwrap();
+        }
+        let config = py
+            .get_type::<SandboxExecutionClientConfig>()
+            .call(
+                (Venue::new(SANDBOX), vec![Money::from("100_000 USD")]),
+                Some(&kwargs),
+            )
+            .expect("Python constructor must accept the causal expiry opt-in");
+        let expected = enabled.unwrap_or(false);
+        assert_eq!(
+            config
+                .getattr("gtd_expiry_before_match")
+                .unwrap()
+                .extract::<bool>()
+                .unwrap(),
+            expected,
+        );
+        let registry = get_global_pyo3_registry();
+        let extracted = registry.extract_config(py, config.unbind()).unwrap();
+        let native = extracted
+            .as_any()
+            .downcast_ref::<SandboxExecutionClientConfig>()
+            .unwrap();
+        assert_eq!(native.gtd_expiry_before_match, expected);
+        assert_eq!(
+            native.to_matching_engine_config().gtd_expiry_before_match,
+            expected
         );
     });
 }

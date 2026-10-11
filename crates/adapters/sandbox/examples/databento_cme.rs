@@ -108,6 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         trade_execution: false,
         reject_stop_orders: true,
         support_gtd_orders: true,
+        gtd_expiry_before_match: false,
         support_contingent_orders: true,
         use_position_ids: true,
         use_random_ids: false,
