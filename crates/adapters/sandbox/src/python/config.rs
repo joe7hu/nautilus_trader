@@ -99,6 +99,7 @@ impl SandboxExecutionClientConfig {
             trade_execution,
             reject_stop_orders,
             support_gtd_orders,
+            gtd_expiry_before_match: false,
             support_contingent_orders,
             use_position_ids,
             use_random_ids,

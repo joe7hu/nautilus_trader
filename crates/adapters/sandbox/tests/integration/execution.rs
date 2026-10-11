@@ -131,6 +131,7 @@ fn create_config(
         trade_execution: false,
         reject_stop_orders: true,
         support_gtd_orders: true,
+        gtd_expiry_before_match: false,
         support_contingent_orders: true,
         use_position_ids: true,
         use_random_ids: false,
@@ -1080,6 +1081,15 @@ fn setup_engine_harness(
     instrument: &InstrumentAny,
     latency_model: Option<LatencyModelAny>,
 ) -> EngineHarness {
+    setup_engine_harness_with(trader_id, instrument, latency_model, |_| {})
+}
+
+fn setup_engine_harness_with(
+    trader_id: TraderId,
+    instrument: &InstrumentAny,
+    latency_model: Option<LatencyModelAny>,
+    customize: impl FnOnce(&mut SandboxExecutionClientConfig),
+) -> EngineHarness {
     *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
 
     let venue = instrument.id().venue;
@@ -1117,6 +1127,7 @@ fn setup_engine_harness(
     let account_id = AccountId::from(format!("{venue}-001").as_str());
     let mut config = create_config(trader_id, account_id, venue);
     config.latency_model = latency_model;
+    customize(&mut config);
     let core = ExecutionClientCore::new(
         trader_id,
         client_id,
@@ -3097,6 +3108,7 @@ fn test_instrument_close_sync_cleanup_handles_synchronous_position_closed_reentr
             trade_execution: false,
             reject_stop_orders: true,
             support_gtd_orders: true,
+            gtd_expiry_before_match: false,
             support_contingent_orders: true,
             use_position_ids: true,
             use_random_ids: false,
@@ -3519,6 +3531,142 @@ fn test_process_quote_tick_reuses_matching_engine(
     test_context.client.process_quote_tick(&quote2).unwrap();
 
     assert_eq!(test_context.client.matching_engine_count(), 1);
+}
+
+#[rstest]
+#[case::before_deadline(900_000_000, "filled")]
+#[case::at_deadline(1_000_000_000, "expired")]
+#[case::after_deadline(1_000_000_001, "expired")]
+fn test_gtd_quote_deadline_before_matching(
+    trader_id: TraderId,
+    instrument: InstrumentAny,
+    #[case] quote_ns: u64,
+    #[case] expected: &str,
+) {
+    let mut harness = setup_engine_harness_with(trader_id, &instrument, None, |config| {
+        config.gtd_expiry_before_match = true;
+    });
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .price(Price::from("100.00"))
+        .quantity(Quantity::from("1.000"))
+        .client_order_id("O-GTD-CUT".into())
+        .time_in_force(TimeInForce::Gtd)
+        .expire_time(UnixNanos::from(1_000_000_000))
+        .ts_init(UnixNanos::from(1))
+        .build();
+    send_through_engine(&harness, trader_id, order.clone());
+    let _ = harness.settle();
+    let _ = harness
+        .test_clock
+        .borrow_mut()
+        .advance_time(UnixNanos::from(quote_ns), true);
+    let quote = QuoteTick::new(
+        instrument.id(),
+        Price::from("99.00"),
+        Price::from("99.50"),
+        Quantity::from("1.000"),
+        Quantity::from("1.000"),
+        UnixNanos::from(quote_ns),
+        UnixNanos::from(quote_ns),
+    );
+    msgbus::publish_quote(
+        format!("data.quotes.{}.{}", instrument.id().venue, instrument.id()).into(),
+        &quote,
+    );
+    let events = harness.settle();
+    let kinds: Vec<_> = events.iter().map(order_event_kind).collect();
+    assert_eq!(kinds, vec![expected]);
+    let cached = harness.cache.borrow();
+    let cached = cached.order(&order.client_order_id()).unwrap();
+    assert_eq!(
+        cached.filled_qty(),
+        Quantity::from(if expected == "filled" {
+            "1.000"
+        } else {
+            "0.000"
+        })
+    );
+}
+
+#[rstest]
+fn test_gtd_timer_expires_without_market_data(trader_id: TraderId, instrument: InstrumentAny) {
+    let mut harness = setup_engine_harness_with(trader_id, &instrument, None, |config| {
+        config.gtd_expiry_before_match = true;
+    });
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .price(Price::from("100.00"))
+        .quantity(Quantity::from("1.000"))
+        .client_order_id("O-GTD-TIMER".into())
+        .time_in_force(TimeInForce::Gtd)
+        .expire_time(UnixNanos::from(1_000_000_000))
+        .ts_init(UnixNanos::from(1))
+        .build();
+    send_through_engine(&harness, trader_id, order.clone());
+    let _ = harness.settle();
+    advance_and_fire(&harness.test_clock, UnixNanos::from(1_000_000_000));
+    let events = harness.settle();
+    assert_eq!(
+        events.iter().map(order_event_kind).collect::<Vec<_>>(),
+        vec!["expired"]
+    );
+    let cache = harness.cache.borrow();
+    let cached = cache.order(&order.client_order_id()).unwrap();
+    assert_eq!(cached.status(), OrderStatus::Expired);
+    assert_eq!(cached.filled_qty(), Quantity::from("0.000"));
+}
+
+#[rstest]
+fn test_gtd_partial_remainder_expires_before_quote(trader_id: TraderId, instrument: InstrumentAny) {
+    let mut harness = setup_engine_harness_with(trader_id, &instrument, None, |config| {
+        config.liquidity_consumption = true;
+        config.gtd_expiry_before_match = true;
+    });
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .price(Price::from("100.00"))
+        .quantity(Quantity::from("1.000"))
+        .client_order_id("O-GTD-PARTIAL".into())
+        .time_in_force(TimeInForce::Gtd)
+        .expire_time(UnixNanos::from(1_000_000_000))
+        .ts_init(UnixNanos::from(1))
+        .build();
+    send_through_engine(&harness, trader_id, order.clone());
+    let _ = harness.settle();
+    for (at, size, expected) in [
+        (500_000_000, "0.400", "filled"),
+        (1_000_000_000, "1.000", "expired"),
+    ] {
+        let _ = harness
+            .test_clock
+            .borrow_mut()
+            .advance_time(UnixNanos::from(at), true);
+        let quote = QuoteTick::new(
+            instrument.id(),
+            Price::from("99.00"),
+            Price::from("99.50"),
+            Quantity::from(size),
+            Quantity::from(size),
+            UnixNanos::from(at),
+            UnixNanos::from(at),
+        );
+        msgbus::publish_quote(
+            format!("data.quotes.{}.{}", instrument.id().venue, instrument.id()).into(),
+            &quote,
+        );
+        let events = harness.settle();
+        assert_eq!(
+            events.iter().map(order_event_kind).collect::<Vec<_>>(),
+            vec![expected]
+        );
+        let cache = harness.cache.borrow();
+        let cached = cache.order(&order.client_order_id()).unwrap();
+        assert_eq!(cached.filled_qty(), Quantity::from("0.400"));
+    }
 }
 
 #[rstest]
@@ -4302,6 +4450,7 @@ fn test_submit_order_through_exec_engine_no_reentrant_panic(
         trade_execution: false,
         reject_stop_orders: true,
         support_gtd_orders: true,
+        gtd_expiry_before_match: false,
         support_contingent_orders: true,
         use_position_ids: true,
         use_random_ids: false,

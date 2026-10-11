@@ -108,6 +108,11 @@ pub struct SandboxExecutionClientConfig {
     /// If orders with GTD time in force will be supported by the venue.
     #[builder(default = true)]
     pub support_gtd_orders: bool,
+    /// Expires due GTD orders before matching and through the 100 ms native-clock sweep.
+    ///
+    /// Disabled by default to preserve historical matching behavior.
+    #[builder(default)]
+    pub gtd_expiry_before_match: bool,
     /// If contingent orders will be supported/respected by the venue.
     #[builder(default = true)]
     pub support_contingent_orders: bool,
@@ -161,6 +166,7 @@ impl SandboxExecutionClientConfig {
             .liquidity_consumption(self.liquidity_consumption)
             .reject_stop_orders(self.reject_stop_orders)
             .support_gtd_orders(self.support_gtd_orders)
+            .gtd_expiry_before_match(self.gtd_expiry_before_match)
             .support_contingent_orders(self.support_contingent_orders)
             .use_position_ids(self.use_position_ids)
             .use_random_ids(self.use_random_ids)
@@ -308,6 +314,7 @@ mod tests {
             use_market_order_acks: true,
             oto_full_trigger: true,
             price_protection_points: 100,
+            gtd_expiry_before_match: true,
             ..SandboxExecutionClientConfig::default()
         };
         let engine_config = config.to_matching_engine_config();
@@ -318,6 +325,20 @@ mod tests {
         assert!(engine_config.use_market_order_acks);
         assert!(engine_config.oto_full_trigger);
         assert_eq!(engine_config.price_protection_points, Some(100));
+        assert!(engine_config.gtd_expiry_before_match);
+    }
+
+    #[rstest]
+    fn test_gtd_expiry_configuration_preserves_legacy_default() {
+        let legacy: SandboxExecutionClientConfig = toml::from_str("").unwrap();
+        assert!(!legacy.gtd_expiry_before_match);
+        assert!(!legacy.to_matching_engine_config().gtd_expiry_before_match);
+        let opted_in: SandboxExecutionClientConfig =
+            toml::from_str("gtd_expiry_before_match = true").unwrap();
+        assert!(opted_in.to_matching_engine_config().gtd_expiry_before_match);
+        let serialized = toml::Value::try_from(&opted_in).unwrap();
+        let roundtrip: SandboxExecutionClientConfig = serialized.try_into().unwrap();
+        assert!(roundtrip.gtd_expiry_before_match);
     }
 
     #[rstest]
