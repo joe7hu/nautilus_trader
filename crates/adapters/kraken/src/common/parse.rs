@@ -73,6 +73,9 @@ fn parse_rfc3339_timestamp(value: &str, field: &str) -> anyhow::Result<UnixNanos
 /// ZUSD for USD). This function strips those prefixes for consistent lookups.
 #[inline]
 pub fn normalize_currency_code(code: &str) -> &str {
+    if matches!(code, "XXBT" | "XBT" | "BTC") {
+        return "BTC";
+    }
     code.strip_prefix("X")
         .or_else(|| code.strip_prefix("Z"))
         .unwrap_or(code)
@@ -506,6 +509,9 @@ fn parse_quantity(value: &str, field: &str) -> anyhow::Result<Quantity> {
 /// Uses [`Currency::get_or_create_crypto`] to handle unknown currency codes,
 /// which automatically registers newly listed Kraken assets.
 pub fn get_currency(code: &str) -> Currency {
+    if matches!(code, "XXBT" | "XBT" | "BTC") {
+        return Currency::BTC();
+    }
     Currency::get_or_create_crypto(code)
 }
 
@@ -1486,7 +1492,7 @@ mod tests {
         match instrument {
             InstrumentAny::CurrencyPair(pair) => {
                 assert_eq!(pair.id.venue.as_str(), "KRAKEN");
-                assert_eq!(pair.base_currency.code, "XXBT");
+                assert_eq!(pair.base_currency, Currency::BTC());
                 assert_eq!(pair.quote_currency.code, "USDT");
                 assert_eq!(pair.price_increment.as_decimal(), dec!(0.1));
                 assert_eq!(pair.size_increment.as_decimal(), dec!(0.00000001));
@@ -2308,7 +2314,8 @@ mod tests {
     }
 
     #[rstest]
-    #[case("XXBT", "XBT")]
+    #[case("XXBT", "BTC")]
+    #[case("XBT", "BTC")]
     #[case("XETH", "ETH")]
     #[case("ZUSD", "USD")]
     #[case("ZEUR", "EUR")]
