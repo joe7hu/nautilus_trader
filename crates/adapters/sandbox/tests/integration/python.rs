@@ -69,14 +69,15 @@ fn assert_exec_factory_extracts_from_python_object(py: Python<'_>) {
     let factory = Py::new(py, SandboxExecutionClientFactory::new())
         .expect("factory should convert to Python object")
         .into_any();
-    let config = Py::new(py, SandboxExecutionClientConfig {
+    let config = SandboxExecutionClientConfig {
         account_id,
         venue: Venue::new(SANDBOX),
         starting_balances: vec![Money::from("100_000 USD")],
         ..SandboxExecutionClientConfig::default()
-    })
-    .expect("config should convert to Python object")
-    .into_any();
+    };
+    let config = Py::new(py, config)
+        .expect("config should convert to Python object")
+        .into_any();
     let registry = get_global_pyo3_registry();
 
     let extracted_factory = registry
@@ -122,7 +123,7 @@ fn test_sandbox_python_extract_preserves_matching_knobs() {
         let factory = Py::new(py, SandboxExecutionClientFactory::new())
             .expect("factory should convert to Python object")
             .into_any();
-        let config = Py::new(py, SandboxExecutionClientConfig {
+        let config = SandboxExecutionClientConfig {
             account_id,
             venue: Venue::new(SANDBOX),
             starting_balances: vec![Money::from("100_000 USD")],
@@ -133,9 +134,10 @@ fn test_sandbox_python_extract_preserves_matching_knobs() {
             oto_full_trigger: true,
             price_protection_points: 50,
             ..SandboxExecutionClientConfig::default()
-        })
-        .expect("config should convert to Python object")
-        .into_any();
+        };
+        let config = Py::new(py, config)
+            .expect("config should convert to Python object")
+            .into_any();
         let registry = get_global_pyo3_registry();
         let extracted_config = registry
             .extract_config(py, config)

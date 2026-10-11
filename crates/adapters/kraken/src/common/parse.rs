@@ -201,8 +201,25 @@ pub(crate) fn parse_spot_instrument_with_fee_rates(
     let instrument_id = InstrumentId::new(Symbol::new(&normalized_symbol), *KRAKEN_VENUE);
     let raw_symbol = Symbol::new(pair_name);
 
-    let base_currency = get_currency(definition.base.as_str());
-    let quote_currency = get_currency(definition.quote.as_str());
+    // Bind this known legacy contract to canonical model currencies before
+    // account construction, keeping provider raw identity and all terms.
+    let (base_currency, quote_currency) =
+        if pair_name == "XXBTZUSD" || normalized_symbol == "BTC/USD" {
+            anyhow::ensure!(
+                pair_name == "XXBTZUSD"
+                    && normalized_symbol == "BTC/USD"
+                    && definition.altname.as_str() == "XBTUSD"
+                    && definition.base.as_str() == "XXBT"
+                    && definition.quote.as_str() == "ZUSD",
+                "Conflicting Kraken BTC/USD currency aliases"
+            );
+            (Currency::BTC(), Currency::USD())
+        } else {
+            (
+                get_currency(definition.base.as_str()),
+                get_currency(definition.quote.as_str()),
+            )
+        };
 
     let price_increment = parse_price(
         definition
@@ -1408,6 +1425,52 @@ mod tests {
         assert_eq!(parse_decimal_opt(Some("0")).unwrap(), None);
         assert_eq!(parse_decimal_opt(Some("")).unwrap(), None);
         assert_eq!(parse_decimal_opt(None).unwrap(), None);
+    }
+
+    #[rstest]
+    fn test_parse_btc_usd_canonical_currency_binding() {
+        let json = load_test_json("http_asset_pairs.json");
+        let response: KrakenResponse<AssetPairsResponse> = serde_json::from_str(&json).unwrap();
+        let mut definition = response.result.unwrap().into_values().next().unwrap();
+        definition.altname = "XBTUSD".into();
+        definition.wsname = Some("XBT/USD".into());
+        definition.quote = "ZUSD".into();
+        let instrument = parse_spot_instrument("XXBTZUSD", &definition, TS, TS).unwrap();
+        let InstrumentAny::CurrencyPair(pair) = instrument else {
+            panic!("Expected CurrencyPair");
+        };
+        assert_eq!(pair.id.to_string(), "BTC/USD.KRAKEN");
+        assert_eq!(pair.raw_symbol.as_str(), "XXBTZUSD");
+        assert_eq!(pair.base_currency, Currency::BTC());
+        assert_eq!(pair.quote_currency, Currency::USD());
+        assert_eq!(pair.price_increment.as_decimal(), dec!(0.1));
+        assert_eq!(pair.size_increment.as_decimal(), dec!(0.00000001));
+    }
+
+    #[rstest]
+    #[case("base")]
+    #[case("quote")]
+    #[case("altname")]
+    #[case("raw_symbol")]
+    #[case("wsname")]
+    fn test_parse_btc_usd_currency_binding_rejects_conflicting_aliases(#[case] field: &str) {
+        let json = load_test_json("http_asset_pairs.json");
+        let response: KrakenResponse<AssetPairsResponse> = serde_json::from_str(&json).unwrap();
+        let mut definition = response.result.unwrap().into_values().next().unwrap();
+        definition.altname = "XBTUSD".into();
+        definition.wsname = Some("XBT/USD".into());
+        definition.quote = "ZUSD".into();
+        let mut raw_symbol = "XXBTZUSD";
+
+        match field {
+            "base" => definition.base = "ETH".into(),
+            "quote" => definition.quote = "EUR".into(),
+            "altname" => definition.altname = "ETHUSD".into(),
+            "raw_symbol" => raw_symbol = "XETHZUSD",
+            "wsname" => definition.wsname = Some("ETH/USD".into()),
+            _ => unreachable!(),
+        }
+        assert!(parse_spot_instrument(raw_symbol, &definition, TS, TS).is_err());
     }
 
     #[rstest]
