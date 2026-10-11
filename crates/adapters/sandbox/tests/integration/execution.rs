@@ -3637,6 +3637,7 @@ fn test_gtd_partial_remainder_expires_before_quote(trader_id: TraderId, instrume
         .build();
     send_through_engine(&harness, trader_id, order.clone());
     let _ = harness.settle();
+
     for (at, size, expected) in [
         (500_000_000, "0.400", "filled"),
         (1_000_000_000, "1.000", "expired"),
