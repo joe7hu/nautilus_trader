@@ -9431,6 +9431,11 @@ fn test_missing_xrate_flags_instrument(
     assert!(snapshot.stale_instruments.is_empty());
     assert!(snapshot.stale_currencies.is_empty());
     assert_eq!(snapshot.unpriced_instruments, vec![instrument_audusd.id()]);
+    let (_, reporting) = portfolio
+        .build_reporting_snapshot(&account_id, Currency::EUR())
+        .unwrap();
+    assert_eq!(reporting.equity, None);
+    assert!(reporting.is_stale);
 }
 
 #[rstest]
@@ -10320,4 +10325,60 @@ fn reporting_equity_requires_conversion_for_every_nonzero_currency(
             .map(|value| Money::from_decimal(value.parse().unwrap(), Currency::USDT()).unwrap())
     );
     assert_eq!(reporting.is_stale, expected.is_none());
+}
+
+#[rstest]
+fn reporting_flat_pnl_does_not_erase_archived_closed_positions(
+    mut simple_cache: Cache,
+    clock: TestClock,
+    instrument_audusd: InstrumentAny,
+) {
+    let account_id = AccountId::new("SIM-001");
+    simple_cache
+        .add_instrument(instrument_audusd.clone())
+        .unwrap();
+    let mut portfolio = Portfolio::new(
+        Rc::new(RefCell::new(clock)),
+        Rc::new(RefCell::new(simple_cache)),
+        None,
+    );
+    portfolio.update_account(&get_cash_account(Some(account_id.as_str())));
+    let position_id = PositionId::new("P-ARCHIVED-REPORTING");
+    let mut position = Position::new(
+        &instrument_audusd,
+        make_fill_for_account(
+            &instrument_audusd,
+            account_id,
+            OrderSide::Buy,
+            Quantity::from("100000"),
+            Price::from("0.80000"),
+            position_id,
+        ),
+    );
+    position.apply(&make_fill_for_account(
+        &instrument_audusd,
+        account_id,
+        OrderSide::Sell,
+        Quantity::from("100000"),
+        Price::from("0.80100"),
+        position_id,
+    ));
+    assert!(position.is_closed());
+    assert_eq!(position.realized_pnl, Some(Money::from("100.00 USD")));
+    portfolio
+        .cache()
+        .borrow_mut()
+        .snapshot_position(&position)
+        .unwrap();
+    assert!(
+        portfolio
+            .cache()
+            .borrow()
+            .positions(None, None, None, Some(&account_id), None)
+            .is_empty()
+    );
+    let (_, reporting) = portfolio
+        .build_reporting_snapshot(&account_id, Currency::USD())
+        .unwrap();
+    assert_eq!(reporting.flat_pnl, None);
 }

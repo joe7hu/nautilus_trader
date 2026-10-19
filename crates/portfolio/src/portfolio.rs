@@ -1060,10 +1060,11 @@ impl Portfolio {
     ) -> Option<(PortfolioSnapshot, ReportingValuation)> {
         let snapshot = self.build_snapshot(account_id)?;
         let cache = self.cache.borrow();
-        let flat_pnl = cache
+        let flat_pnl = (cache
             .positions(None, None, None, Some(account_id), None)
             .is_empty()
-            .then(|| Money::zero(reporting_currency));
+            && cache.position_snapshots(None, Some(account_id)).is_empty())
+        .then(|| Money::zero(reporting_currency));
         let total = (!snapshot.is_stale).then_some(()).and_then(|()| {
             snapshot
                 .total_equity
