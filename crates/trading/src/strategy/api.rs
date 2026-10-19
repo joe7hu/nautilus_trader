@@ -843,6 +843,20 @@ impl<'a> PortfolioApi<'a> {
         self.portfolio.borrow_mut().build_snapshot(account_id)
     }
 
+    #[must_use]
+    pub fn build_reporting_snapshot(
+        &self,
+        account_id: &AccountId,
+        reporting_currency: Currency,
+    ) -> Option<(
+        PortfolioSnapshot,
+        nautilus_portfolio::portfolio::ReportingValuation,
+    )> {
+        self.portfolio
+            .borrow_mut()
+            .build_reporting_snapshot(account_id, reporting_currency)
+    }
+
     /// Returns an owned snapshot of computed portfolio performance statistics.
     ///
     /// # Panics

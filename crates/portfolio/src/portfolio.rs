@@ -50,6 +50,7 @@ use nautilus_model::{
     types::{AccountBalance, Currency, MarginBalance, Money, Price},
 };
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
 use crate::{config::PortfolioConfig, manager::AccountsManager};
 
@@ -57,6 +58,14 @@ use crate::{config::PortfolioConfig, manager::AccountsManager};
 // at per-minute cadence), long-lived live deployments should consume snapshots
 // via the message bus instead of relying on this buffer.
 const SNAPSHOT_BUFFER_CAP: usize = 1_000_000;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportingValuation {
+    pub currency: Currency,
+    pub equity: Option<Money>,
+    pub flat_pnl: Option<Money>,
+    pub is_stale: bool,
+}
 
 struct PortfolioState {
     accounts: AccountsManager,
@@ -1041,6 +1050,61 @@ impl Portfolio {
             ts_now,
             ts_now,
         ))
+    }
+
+    #[must_use]
+    pub fn build_reporting_snapshot(
+        &mut self,
+        account_id: &AccountId,
+        reporting_currency: Currency,
+    ) -> Option<(PortfolioSnapshot, ReportingValuation)> {
+        let snapshot = self.build_snapshot(account_id)?;
+        let cache = self.cache.borrow();
+        let flat_pnl = (cache
+            .positions(None, None, None, Some(account_id), None)
+            .is_empty()
+            && cache.position_snapshots(None, Some(account_id)).is_empty())
+        .then(|| Money::zero(reporting_currency));
+        let total = (!snapshot.is_stale).then_some(()).and_then(|()| {
+            snapshot
+                .total_equity
+                .iter()
+                .try_fold(Decimal::ZERO, |sum, value| {
+                    let amount = value.as_decimal();
+                    if amount.is_zero() {
+                        return Some(sum);
+                    }
+                    let price_type = if amount.is_sign_negative() {
+                        PriceType::Ask
+                    } else {
+                        PriceType::Bid
+                    };
+                    let rate = cache.get_xrate(
+                        account_id.get_issuer(),
+                        value.currency,
+                        reporting_currency,
+                        price_type,
+                    )?;
+                    if rate <= Decimal::ZERO {
+                        return None;
+                    }
+                    sum.checked_add(amount.checked_mul(rate)?)
+                })
+        });
+        let equity = total.and_then(|value| {
+            Money::from_decimal(
+                value.round_dp(u32::from(reporting_currency.precision)),
+                reporting_currency,
+            )
+            .ok()
+        });
+        let reporting = ReportingValuation {
+            currency: reporting_currency,
+            equity,
+            flat_pnl,
+            is_stale: snapshot.is_stale || equity.is_none(),
+        };
+        Some((snapshot, reporting))
     }
 
     fn has_nonzero_realized_pnl(&self, venue: Venue, account_id: AccountId) -> bool {
