@@ -2857,6 +2857,65 @@ impl OrderMatchingEngine {
         }
     }
 
+    pub fn restore_quote_only_limit_orders(
+        &mut self,
+        orders: &[OrderAny],
+        account_id: AccountId,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.core.iter_orders().next().is_none()
+                && self.book_type == BookType::L1_MBP
+                && self.account_type == AccountType::Cash
+                && self.oms_type == OmsType::Netting
+                && !self.config.queue_position
+                && !self.config.liquidity_consumption
+                && orders.len() <= 1,
+            "unsupported matching engine restoration state"
+        );
+        let mut executions = 0;
+        for order in orders {
+            anyhow::ensure!(
+                order.instrument_id() == self.instrument.id()
+                    && order.account_id() == Some(account_id)
+                    && order.order_type() == OrderType::Limit
+                    && order.time_in_force() == TimeInForce::Gtc
+                    && order.contingency_type().is_none()
+                    && !order.is_emulated()
+                    && matches!(
+                        order.status(),
+                        OrderStatus::Accepted
+                            | OrderStatus::PartiallyFilled
+                            | OrderStatus::Filled
+                            | OrderStatus::Canceled
+                    )
+                    && order.filled_qty() <= order.quantity()
+                    && order.leaves_qty() == order.quantity().saturating_sub(order.filled_qty())
+                    && order.venue_order_id().is_some()
+                    && order.quantity().precision == self.instrument.size_precision()
+                    && order
+                        .price()
+                        .is_some_and(|p| p.precision == self.instrument.price_precision()),
+                "unsupported original resting order"
+            );
+            executions += order
+                .events()
+                .iter()
+                .filter(|event| matches!(event, OrderEventAny::Filled(_)))
+                .count();
+        }
+        self.ids_generator.restore_execution_count(executions);
+        for order in orders {
+            self.account_ids.insert(order.trader_id(), account_id);
+            if order.is_open() {
+                self.cached_filled_qty
+                    .insert(order.client_order_id(), order.filled_qty());
+                self.track_post_match_order(order);
+                self.core.add_order(Self::matching_core_entry(order));
+            }
+        }
+        Ok(())
+    }
+
     /// Processes a new order submission.
     ///
     /// Validates the order against instrument precision, expiration, and contingency
@@ -2873,7 +2932,9 @@ impl OrderMatchingEngine {
 
         if self.config.gtd_expiry_before_match
             && (order.is_closed()
-                || self.order_snapshot(order.client_order_id()).is_some_and(|cached| cached.is_closed()))
+                || self
+                    .order_snapshot(order.client_order_id())
+                    .is_some_and(|cached| cached.is_closed()))
         {
             return;
         }
@@ -3934,16 +3995,23 @@ impl OrderMatchingEngine {
         if !self.config.support_gtd_orders || !self.config.gtd_expiry_before_match {
             return;
         }
-        let ids: Vec<ClientOrderId> = self.core.iter_orders()
-            .map(|order| order.client_order_id).collect();
+        let ids: Vec<ClientOrderId> = self
+            .core
+            .iter_orders()
+            .map(|order| order.client_order_id)
+            .collect();
         for id in ids {
             if !self.core.order_exists(id) {
                 continue;
             }
             let due = {
                 let cache = self.cache.borrow();
-                cache.order(&id).filter(|order| !order.is_closed()
-                    && order.expire_time().is_some_and(|at| timestamp_ns >= at))
+                cache
+                    .order(&id)
+                    .filter(|order| {
+                        !order.is_closed()
+                            && order.expire_time().is_some_and(|at| timestamp_ns >= at)
+                    })
                     .map(|order| self.order_snapshot(id).unwrap_or_else(|| order.clone()))
             };
             if let Some(order) = due {

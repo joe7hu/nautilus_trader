@@ -76,6 +76,10 @@ impl IdsGenerator {
         }
     }
 
+    pub fn restore_execution_count(&mut self, execution_count: usize) {
+        self.execution_count = execution_count;
+    }
+
     /// Resets all identifier counters.
     pub const fn reset(&mut self) {
         self.position_count = 0;

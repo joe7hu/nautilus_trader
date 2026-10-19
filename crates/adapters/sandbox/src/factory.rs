@@ -59,6 +59,31 @@ impl SandboxExecutionClientFactory {
     }
 }
 
+impl SandboxExecutionClientFactory {
+    pub fn create_restored_quote_only_cash(
+        &self,
+        trader_id: TraderId,
+        name: &str,
+        config: &SandboxExecutionClientConfig,
+        cache: Rc<RefCell<Cache>>,
+    ) -> anyhow::Result<Box<dyn ExecutionClient>> {
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(LiveClock::default()));
+        let core = ExecutionClientCore::new(
+            trader_id,
+            ClientId::from(name),
+            config.venue,
+            config.oms_type,
+            config.account_id,
+            config.account_type,
+            config.base_currency,
+            cache.clone(),
+        );
+        let mut client = SandboxExecutionClient::new(core, config.clone(), clock, cache);
+        client.restore_quote_only_cash()?;
+        Ok(Box::new(client))
+    }
+}
+
 impl SimulatedExecutionClientFactory for SandboxExecutionClientFactory {
     fn create(
         &self,

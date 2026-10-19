@@ -15,7 +15,12 @@
 
 //! Sandbox execution client implementation.
 
-use std::{cell::RefCell, collections::BinaryHeap, fmt::Debug, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::BinaryHeap,
+    fmt::Debug,
+    rc::Rc,
+};
 
 use ahash::{AHashMap, AHashSet};
 use async_trait::async_trait;
@@ -49,7 +54,7 @@ use nautilus_execution::{
 use nautilus_model::{
     accounts::AccountAny,
     data::{Bar, InstrumentClose, InstrumentStatus, OrderBookDeltas, QuoteTick, TradeTick},
-    enums::OmsType,
+    enums::{AccountType, BookType, OmsType},
     events::{
         OrderCancelRejected, OrderEventAny, OrderModifyRejected, OrderRejected, PositionEvent,
     },
@@ -79,6 +84,7 @@ pub struct SandboxExecutionClient {
     config: SandboxExecutionClientConfig,
     inner: Rc<RefCell<SandboxInner>>,
     handlers: RefCell<Option<RegisteredHandlers>>,
+    restored: Cell<bool>,
     clock: Rc<RefCell<dyn Clock>>,
     cache: Rc<RefCell<Cache>>,
 }
@@ -165,9 +171,76 @@ impl SandboxExecutionClient {
             config,
             inner,
             handlers: RefCell::new(None),
+            restored: Cell::new(false),
             clock,
             cache,
         }
+    }
+
+    pub fn restore_quote_only_cash(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.restored.get()
+                && !self.core.borrow().is_connected()
+                && self.inner.borrow().matching_engines.is_empty()
+                && self.config.account_type == AccountType::Cash
+                && self.config.oms_type == OmsType::Netting
+                && self.config.book_type == BookType::L1_MBP
+                && !self.config.bar_execution
+                && !self.config.trade_execution
+                && !self.config.queue_position
+                && !self.config.liquidity_consumption
+                && !self.config.frozen_account
+                && self.config.latency_model.is_none()
+                && self.config.fill_model.is_none(),
+            "unsupported sandbox restoration state or configuration"
+        );
+        let account_id = self.config.account_id;
+        let (account, orders, instrument) = {
+            let cache = self.cache.borrow();
+            anyhow::ensure!(
+                cache.instruments(&self.config.venue, None).len() == 1,
+                "restoration requires one original instrument engine"
+            );
+            let account = cache
+                .account_owned(&account_id)
+                .ok_or_else(|| anyhow::anyhow!("original cash account unavailable"))?;
+            anyhow::ensure!(
+                matches!(account, AccountAny::Cash(_))
+                    && account.base_currency() == self.config.base_currency,
+                "original account is not cash"
+            );
+            let orders = cache
+                .orders(Some(&self.config.venue), None, None, None, None)
+                .iter()
+                .map(|o| (*o).clone())
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                orders.len() <= 1,
+                "restoration supports one original place order"
+            );
+            let instrument = orders
+                .first()
+                .map(|order| cache.try_instrument(&order.instrument_id()).cloned())
+                .transpose()?;
+            (account, orders, instrument)
+        };
+        if let Some(instrument) = instrument {
+            let mut inner = self.inner.borrow_mut();
+            inner.ensure_matching_engine(&instrument);
+            inner
+                .matching_engines
+                .get_mut(&instrument.id())
+                .unwrap()
+                .restore_quote_only_limit_orders(&orders, account_id)?;
+        }
+        self.inner.borrow_mut().balances = account
+            .balances()
+            .into_values()
+            .map(|balance| (balance.currency.code.to_string(), balance.total))
+            .collect();
+        self.sync_cached_account_config()?;
+        self.restored.set(true);
+        Ok(())
     }
 
     /// Returns a reference to the configuration.
@@ -520,6 +593,7 @@ impl SandboxExecutionClient {
 
     /// Resets the sandbox to its initial state.
     pub fn reset(&self) {
+        self.restored.set(false);
         let mut inner = self.inner.borrow_mut();
         for engine in inner.matching_engines.values_mut() {
             engine.reset();
@@ -681,9 +755,11 @@ impl ExecutionClient for SandboxExecutionClient {
             return Ok(());
         }
 
-        let balances = self.get_account_balances();
-        let ts_event = self.clock.borrow().timestamp_ns();
-        self.generate_account_state(balances, vec![], false, ts_event, None)?;
+        if !self.restored.get() {
+            let balances = self.get_account_balances();
+            let ts_event = self.clock.borrow().timestamp_ns();
+            self.generate_account_state(balances, vec![], false, ts_event, None)?;
+        }
 
         self.core.borrow().set_connected();
         log::info!(
