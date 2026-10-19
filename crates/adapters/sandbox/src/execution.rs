@@ -152,6 +152,7 @@ impl SandboxExecutionClient {
                 inbound_queue: BinaryHeap::new(),
                 inflight_orders: InflightOrders::default(),
                 inbound_seq: 0,
+                minimum_quote_init: None,
                 client_id: core.client_id,
                 account_id: core.account_id,
                 self_weak: WeakCell::from(weak.clone()),
@@ -501,6 +502,14 @@ impl SandboxExecutionClient {
     ///
     /// Returns an error if the instrument is not found in the cache.
     pub fn process_quote_tick(&self, quote: &QuoteTick) -> anyhow::Result<()> {
+        if self
+            .inner
+            .borrow()
+            .minimum_quote_init
+            .is_some_and(|cut| quote.ts_init < cut)
+        {
+            return Ok(());
+        }
         SandboxInner::drain_inbound(&self.inner);
 
         let instrument_id = quote.instrument_id;
@@ -595,6 +604,7 @@ impl SandboxExecutionClient {
     pub fn reset(&self) {
         self.restored.set(false);
         let mut inner = self.inner.borrow_mut();
+        inner.minimum_quote_init = None;
         for engine in inner.matching_engines.values_mut() {
             engine.reset();
         }
@@ -707,6 +717,9 @@ impl ExecutionClient for SandboxExecutionClient {
             }
         }
 
+        if self.restored.get() {
+            self.inner.borrow_mut().minimum_quote_init = Some(self.clock.borrow().timestamp_ns());
+        }
         self.register_message_handlers();
         self.register_expiry_sweep_timer();
 
@@ -958,6 +971,7 @@ struct SandboxInner {
     /// Monotonic sequence providing FIFO tie-breaking for deferred commands sharing a due time, so
     /// no queued command can be overtaken by one enqueued after it.
     inbound_seq: u64,
+    minimum_quote_init: Option<UnixNanos>,
     client_id: ClientId,
     account_id: AccountId,
     self_weak: WeakCell<Self>,
@@ -1663,6 +1677,13 @@ impl SandboxInner {
     }
 
     fn on_quote_tick(inner: &Rc<RefCell<Self>>, quote: &QuoteTick) {
+        if inner
+            .borrow()
+            .minimum_quote_init
+            .is_some_and(|cut| quote.ts_init < cut)
+        {
+            return;
+        }
         Self::drain_inbound(inner);
         inner.borrow_mut().process_quote_tick(quote);
     }

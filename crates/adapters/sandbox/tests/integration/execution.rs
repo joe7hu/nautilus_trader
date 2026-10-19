@@ -69,11 +69,11 @@ use nautilus_model::{
     },
     instruments::{
         CryptoPerpetual, Instrument, InstrumentAny,
-        stubs::{binary_option, crypto_perpetual_ethusdt},
+        stubs::{binary_option, crypto_perpetual_ethusdt, currency_pair_btcusdt},
     },
     orders::{Order, OrderAny, OrderList, OrderTestBuilder, stubs::TestOrderEventStubs},
     position::Position,
-    types::{Currency, Money, Price, Quantity},
+    types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use nautilus_sandbox::{SandboxExecutionClient, SandboxExecutionClientConfig};
 #[cfg(feature = "python")]
@@ -6938,7 +6938,7 @@ fn restore_cash_context(
 #[tokio::test]
 async fn restored_quote_only_cash_preserves_partial_order_and_trade_identity(#[case] cancel: bool) {
     *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
-    let mut definition = nautilus_model::instruments::stubs::currency_pair_btcusdt();
+    let mut definition = currency_pair_btcusdt();
     definition.size_precision = 5;
     definition.size_increment = Quantity::from("0.00001");
     let instrument: InstrumentAny = definition.into();
@@ -6952,7 +6952,7 @@ async fn restored_quote_only_cash_preserves_partial_order_and_trade_identity(#[c
     let account = AccountState::new(
         AccountId::from("BINANCE-001"),
         AccountType::Cash,
-        vec![nautilus_model::types::AccountBalance::new(
+        vec![AccountBalance::new(
             Money::from("9966.92695600 USDT"),
             Money::from("49.60996000 USDT"),
             Money::from("9917.31699600 USDT"),
@@ -7072,6 +7072,27 @@ async fn restored_quote_only_cash_preserves_partial_order_and_trade_identity(#[c
     );
     assert!(rx.try_recv().is_err());
     restored.client.start().unwrap();
+    let mut stale = quote("0.00060");
+    stale.ts_init = 999_999_999.into();
+    stale.ts_event = 999_999_999.into();
+    restored.client.process_quote_tick(&stale).unwrap();
+    msgbus::publish_quote(
+        format!(
+            "data.quotes.{}.{}",
+            stale.instrument_id.venue, stale.instrument_id
+        )
+        .into(),
+        &stale,
+    );
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        restored_cache
+            .borrow()
+            .try_order_owned(&order.client_order_id())
+            .unwrap(),
+        partial
+    );
+
     if cancel {
         restored
             .client
@@ -7129,6 +7150,29 @@ async fn restored_quote_only_cash_preserves_partial_order_and_trade_identity(#[c
         assert_eq!(current.status(), OrderStatus::Filled);
     }
     restored.client.stop().unwrap();
+    restored.client.reset();
+    restored
+        .test_clock
+        .borrow_mut()
+        .set_time(500_000_000.into());
+    restored.client.start().unwrap();
+    let mut reset_quote = quote("0.00060");
+    reset_quote.ts_event = 500_000_000.into();
+    reset_quote.ts_init = 500_000_000.into();
+    restored.client.process_quote_tick(&reset_quote).unwrap();
+    let fresh = OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(TraderId::from("TESTER-001"))
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("0.00001"))
+        .price(Price::from("82600.01"))
+        .time_in_force(TimeInForce::Gtc)
+        .client_order_id(ClientOrderId::from("RESET-001"))
+        .build();
+    submit_to_client(&restored, TraderId::from("TESTER-001"), &fresh);
+    let reset_events = apply_order_events_from_channel(&restored_cache, &mut rx);
+    assert!(reset_events.iter().any(|event| matches!(event, OrderEventAny::Filled(fill) if fill.client_order_id == fresh.client_order_id())));
+    restored.client.stop().unwrap();
 }
 
 #[rstest]
@@ -7149,7 +7193,7 @@ fn quote_only_cash_restoration_rejects_unsupported_state_without_initializing(
     if challenge != 8 {
         cache
             .borrow_mut()
-            .add_instrument(nautilus_model::instruments::stubs::currency_pair_btcusdt().into())
+            .add_instrument(currency_pair_btcusdt().into())
             .unwrap();
     }
     if challenge == 7 {
@@ -7162,7 +7206,7 @@ fn quote_only_cash_restoration_rejects_unsupported_state_without_initializing(
         let event = AccountState::new(
             AccountId::from("BINANCE-001"),
             AccountType::Cash,
-            vec![nautilus_model::types::AccountBalance::new(
+            vec![AccountBalance::new(
                 Money::from("9966.92695600 USDT"),
                 Money::from("49.60996000 USDT"),
                 Money::from("9917.31699600 USDT"),
