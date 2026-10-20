@@ -6680,3 +6680,184 @@ fn test_add_venue_with_oto_full_trigger(crypto_perpetual_ethusdt: CryptoPerpetua
     engine.run(None, None, None, false).unwrap();
     assert_eq!(engine.get_result().iterations, 1);
 }
+
+#[derive(Debug)]
+struct QuotePartialLimitStrategy {
+    core: StrategyCore,
+    instrument_id: InstrumentId,
+    submitted: bool,
+    modify: bool,
+    order_id: Option<ClientOrderId>,
+    events: Rc<RefCell<Vec<OrderEventAny>>>,
+}
+
+nautilus_strategy!(QuotePartialLimitStrategy, {
+    fn on_order_event(&mut self, event: OrderEventAny) {
+        self.events.borrow_mut().push(event);
+    }
+});
+
+impl DataActor for QuotePartialLimitStrategy {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        self.subscribe_quotes(self.instrument_id, None, None);
+        Ok(())
+    }
+
+    fn on_quote(&mut self, _quote: &QuoteTick) -> anyhow::Result<()> {
+        if !self.submitted {
+            self.submitted = true;
+            let order = self.order().limit(
+                self.instrument_id,
+                OrderSide::Buy,
+                Quantity::from("1.000"),
+                Price::from(if self.modify { "999.00" } else { "1000.10" }),
+                Some(TimeInForce::Gtc),
+                None,
+                Some(false),
+                Some(false),
+                Some(false),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            self.order_id = Some(order.client_order_id());
+            self.submit_order(order, None, None, None)?;
+        } else if self.modify {
+            self.modify = false;
+            self.modify_order(
+                self.order_id.unwrap(),
+                None,
+                Some(Price::from("1000.10")),
+                None,
+                None,
+                None,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[rstest]
+#[case::direct_single(false, false, false, "0.400", 1)]
+#[case::queued_single(true, false, false, "0.400", 1)]
+#[case::direct_remainder(false, true, false, "1.000", 2)]
+#[case::queued_remainder(true, true, false, "1.000", 2)]
+#[case::direct_modify(false, false, true, "0.400", 1)]
+#[case::queued_modify(true, false, true, "0.400", 1)]
+fn test_quote_partial_fill_has_one_matching_opportunity_per_stimulus(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+    #[case] use_message_queue: bool,
+    #[case] include_remainder: bool,
+    #[case] modify: bool,
+    #[case] expected_quantity: &str,
+    #[case] expected_fills: usize,
+) {
+    let instrument_id = crypto_perpetual_ethusdt.id;
+    let mut engine = BacktestEngine::new(BacktestEngineConfig {
+        bypass_logging: true,
+        run_analysis: false,
+        ..Default::default()
+    })
+    .unwrap();
+    engine
+        .add_venue(
+            SimulatedVenueConfig::builder()
+                .venue(instrument_id.venue)
+                .oms_type(OmsType::Netting)
+                .account_type(AccountType::Margin)
+                .book_type(BookType::L1_MBP)
+                .starting_balances(vec![Money::from("10000 USDT")])
+                .use_message_queue(use_message_queue)
+                .liquidity_consumption(false)
+                .bar_execution(false)
+                .trade_execution(false)
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+    engine
+        .add_instrument(&InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt))
+        .unwrap();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    engine
+        .add_strategy(QuotePartialLimitStrategy {
+            core: StrategyCore::new(StrategyConfig {
+                strategy_id: Some(StrategyId::from("PARTIAL-001")),
+                ..Default::default()
+            }),
+            instrument_id,
+            submitted: false,
+            modify,
+            order_id: None,
+            events: events.clone(),
+        })
+        .unwrap();
+    let quotes = if modify {
+        vec![(1_000_000_000, "0.400"), (2_000_000_000, "0.400")]
+    } else if include_remainder {
+        vec![(1_000_000_000, "0.400"), (2_000_000_000, "0.600")]
+    } else {
+        vec![(1_000_000_000, "0.400")]
+    };
+    let data = quotes
+        .into_iter()
+        .map(|(ts, size)| {
+            Data::Quote(QuoteTick::new(
+                instrument_id,
+                Price::from("1000.00"),
+                Price::from("1000.10"),
+                Quantity::from(size),
+                Quantity::from(size),
+                UnixNanos::from(ts),
+                UnixNanos::from(ts),
+            ))
+        })
+        .collect();
+    engine.add_data(data, None, true, true).unwrap();
+    engine.run(None, None, None, false).unwrap();
+
+    if modify {
+        let events = events.borrow();
+        let updated = events
+            .iter()
+            .position(|e| matches!(e, OrderEventAny::Updated(_)))
+            .unwrap();
+        let fills: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                if let OrderEventAny::Filled(fill) = e {
+                    Some((i, fill))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(fills.len(), 1);
+        assert!(updated < fills[0].0);
+        assert_eq!(fills[0].1.last_qty, Quantity::from("0.400"));
+        assert_eq!(fills[0].1.last_px, Price::from("1000.10"));
+    }
+    let cache_rc = engine.kernel().cache();
+    let cache = cache_rc.borrow();
+    let orders = cache.orders(None, None, None, None, None);
+    assert_eq!(orders[0].filled_qty(), Quantity::from(expected_quantity));
+    if !include_remainder {
+        assert_eq!(orders[0].leaves_qty(), Quantity::from("0.600"));
+    }
+    drop(orders);
+    drop(cache);
+    let result = engine.get_canonical_result().unwrap();
+    assert_eq!(
+        result.as_value()["fills"].as_array().unwrap().len(),
+        expected_fills
+    );
+    assert_eq!(
+        result.as_value()["orders"][0]["Limit"]["core"]["filled_qty"],
+        expected_quantity,
+    );
+}

@@ -1942,11 +1942,6 @@ impl BacktestEngine {
             exchange.borrow().set_clock_time(ts_now);
         }
 
-        // Drain commands then iterate matching engines to fill newly added
-        // orders. Fills may enqueue further commands (e.g. hedge orders
-        // submitted from on_order_filled), so loop until quiescent.
-        // Only process and iterate venues that had pending commands each
-        // pass, to avoid extra fill-model rolls on untouched venues.
         loop {
             // Drain first so commands buffered in the trading queue (e.g. from
             // on_stop handlers) reach the venues before we check for activity.
@@ -1970,16 +1965,6 @@ impl BacktestEngine {
                 let mut exchange = self.venues[venue_id].borrow_mut();
                 exchange.process_for_scope(ts_now, settlement_scope);
             }
-            self.drain_command_queues();
-
-            for venue_id in &active_venues {
-                self.venues[venue_id]
-                    .borrow_mut()
-                    .iterate_matching_engines(ts_now);
-            }
-
-            // Drain again so fill-triggered commands (e.g. hedge orders
-            // from on_order_filled) are visible to has_pending_commands
             self.drain_command_queues();
         }
     }
