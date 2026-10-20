@@ -52,7 +52,7 @@ use nautilus_execution::{
     models::{fee::FeeModelHandle, fill::FillModelHandle, latency::LatencyModel},
 };
 use nautilus_model::{
-    accounts::AccountAny,
+    accounts::{Account, AccountAny},
     data::{Bar, InstrumentClose, InstrumentStatus, OrderBookDeltas, QuoteTick, TradeTick},
     enums::{AccountType, BookType, OmsType},
     events::{
@@ -178,12 +178,15 @@ impl SandboxExecutionClient {
         }
     }
 
-    pub fn restore_quote_only_cash(&mut self) -> anyhow::Result<()> {
+    pub fn restore_quote_only(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.restored.get()
                 && !self.core.borrow().is_connected()
                 && self.inner.borrow().matching_engines.is_empty()
-                && self.config.account_type == AccountType::Cash
+                && matches!(
+                    self.config.account_type,
+                    AccountType::Cash | AccountType::Margin
+                )
                 && self.config.oms_type == OmsType::Netting
                 && self.config.book_type == BookType::L1_MBP
                 && !self.config.bar_execution
@@ -206,9 +209,9 @@ impl SandboxExecutionClient {
                 .account_owned(&account_id)
                 .ok_or_else(|| anyhow::anyhow!("original cash account unavailable"))?;
             anyhow::ensure!(
-                matches!(account, AccountAny::Cash(_))
+                account.account_type() == self.config.account_type
                     && account.base_currency() == self.config.base_currency,
-                "original account is not cash"
+                "original account type mismatch"
             );
             let orders = cache
                 .orders(Some(&self.config.venue), None, None, None, None)
@@ -225,6 +228,16 @@ impl SandboxExecutionClient {
                 .transpose()?;
             (account, orders, instrument)
         };
+        if self.config.account_type == AccountType::Margin {
+            anyhow::ensure!(
+                self.config.default_leverage == rust_decimal::Decimal::ONE
+                    && self.config.leverages.is_empty()
+                    && self.config.base_currency == Some(nautilus_model::types::Currency::USDT())
+                    && account.balances().keys().all(|currency| *currency == nautilus_model::types::Currency::USDT())
+                    && self.cache.borrow().instruments(&self.config.venue, None).iter().all(|i| matches!(i, nautilus_model::instruments::InstrumentAny::CryptoPerpetual(p) if !p.is_inverse && p.settlement_currency == nautilus_model::types::Currency::USDT())),
+                "unsupported margin restoration profile"
+            );
+        }
         if let Some(instrument) = instrument {
             let mut inner = self.inner.borrow_mut();
             inner.ensure_matching_engine(&instrument);
@@ -502,6 +515,14 @@ impl SandboxExecutionClient {
     ///
     /// Returns an error if the instrument is not found in the cache.
     pub fn process_quote_tick(&self, quote: &QuoteTick) -> anyhow::Result<()> {
+        if !self
+            .inner
+            .borrow()
+            .execution_open(quote.instrument_id, Some(quote.ts_init.max(quote.ts_event)))
+        {
+            SandboxInner::drain_inbound(&self.inner);
+            return Ok(());
+        }
         if self
             .inner
             .borrow()
@@ -796,6 +817,10 @@ impl ExecutionClient for SandboxExecutionClient {
     }
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.inner.borrow().execution_open(cmd.instrument_id, None),
+            "sandbox execution window expired"
+        );
         let order = self.get_order(&cmd.client_order_id)?;
 
         if order.is_closed() {
@@ -817,6 +842,10 @@ impl ExecutionClient for SandboxExecutionClient {
     }
 
     fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.inner.borrow().execution_open(cmd.instrument_id, None),
+            "sandbox execution window expired"
+        );
         let ts_init = self.clock.borrow().timestamp_ns();
 
         let orders: Vec<OrderAny> = self
@@ -844,6 +873,10 @@ impl ExecutionClient for SandboxExecutionClient {
     }
 
     fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.inner.borrow().execution_open(cmd.instrument_id, None),
+            "sandbox execution window expired"
+        );
         let mut inner = self.inner.borrow_mut();
         if inner.config.latency_model.is_none() {
             inner.apply_modify_order(&cmd);
@@ -854,6 +887,10 @@ impl ExecutionClient for SandboxExecutionClient {
     }
 
     fn batch_modify_orders(&self, cmd: BatchModifyOrders) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.inner.borrow().execution_open(cmd.instrument_id, None),
+            "sandbox execution window expired"
+        );
         let mut inner = self.inner.borrow_mut();
         if inner.config.latency_model.is_none() {
             inner.apply_batch_modify_orders(&cmd);
@@ -1010,6 +1047,44 @@ impl PartialEq for DelayedCommand {
 impl Eq for DelayedCommand {}
 
 impl SandboxInner {
+    fn execution_open(&self, instrument: InstrumentId, event_ns: Option<UnixNanos>) -> bool {
+        match (
+            self.config.execution_deadline_ns,
+            self.config.expected_funding_ns,
+        ) {
+            (None, None) => true,
+            (Some(deadline), Some(_)) => {
+                self.clock.borrow().timestamp_ns() < deadline
+                    && event_ns.is_none_or(|event| event < deadline)
+                    && self
+                        .cache
+                        .borrow()
+                        .funding_rate(&instrument)
+                        .is_some_and(|funding| {
+                            funding.next_funding_ns == self.config.expected_funding_ns
+                                && funding.next_funding_ns.is_some_and(|next| next > deadline)
+                                && funding.ts_init <= self.clock.borrow().timestamp_ns()
+                                && funding.ts_event <= self.clock.borrow().timestamp_ns()
+                                && self
+                                    .clock
+                                    .borrow()
+                                    .timestamp_ns()
+                                    .as_u64()
+                                    .saturating_sub(funding.ts_init.as_u64())
+                                    <= 5_000_000_000
+                                && self
+                                    .clock
+                                    .borrow()
+                                    .timestamp_ns()
+                                    .as_u64()
+                                    .saturating_sub(funding.ts_event.as_u64())
+                                    <= 5_000_000_000
+                        })
+            }
+            _ => false,
+        }
+    }
+
     fn ensure_matching_engine(&mut self, instrument: &InstrumentAny) {
         let instrument_id = instrument.id();
 
@@ -1230,6 +1305,18 @@ impl SandboxInner {
     /// Routes a deferred [`TradingCommand`] to its venue-side apply helper.
     fn apply_trading_command(&mut self, cmd: &TradingCommand) -> anyhow::Result<()> {
         self.inflight_orders.remove(cmd);
+
+        if matches!(
+            cmd,
+            TradingCommand::SubmitOrder(_)
+                | TradingCommand::SubmitOrderList(_)
+                | TradingCommand::ModifyOrder(_)
+                | TradingCommand::ModifyOrders(_)
+        ) && !self.execution_open(cmd.instrument_id(), None)
+        {
+            self.reject_command(cmd, "Sandbox execution window expired");
+            return Ok(());
+        }
 
         // Only a deferred command can overtake the submit that would have created the engine, so
         // build it here and let the venue raise the rejection.
@@ -1457,6 +1544,10 @@ impl SandboxInner {
     }
 
     fn apply_submit_order(&mut self, cmd: &SubmitOrder) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.execution_open(cmd.instrument_id, None),
+            "sandbox execution window expired"
+        );
         let mut order = self.cache.borrow().try_order_owned(&cmd.client_order_id)?;
 
         let instrument_id = order.instrument_id();
@@ -1494,6 +1585,12 @@ impl SandboxInner {
     /// `OrderSubmitted` dispatch kept by the client handler, returning the legs that could not
     /// reach a matching engine.
     fn apply_submit_order_list(&mut self, cmd: &SubmitOrderList) -> Vec<OrderAny> {
+        if !self.execution_open(cmd.instrument_id, None) {
+            return self
+                .cache
+                .borrow()
+                .orders_for_ids(&cmd.order_list.client_order_ids, cmd);
+        }
         let orders: Vec<OrderAny> = self
             .cache
             .borrow()
@@ -1572,6 +1669,13 @@ impl SandboxInner {
     }
 
     fn apply_modify_order(&mut self, cmd: &ModifyOrder) {
+        if !self.execution_open(cmd.instrument_id, None) {
+            self.reject_command(
+                &TradingCommand::ModifyOrder(cmd.clone()),
+                "Sandbox execution window expired",
+            );
+            return;
+        }
         let account_id = self.account_id;
         if let Some(engine) = self.matching_engines.get_mut(&cmd.instrument_id) {
             engine.process_modify(cmd, account_id);
@@ -1677,6 +1781,13 @@ impl SandboxInner {
     }
 
     fn on_quote_tick(inner: &Rc<RefCell<Self>>, quote: &QuoteTick) {
+        if !inner
+            .borrow()
+            .execution_open(quote.instrument_id, Some(quote.ts_init.max(quote.ts_event)))
+        {
+            Self::drain_inbound(inner);
+            return;
+        }
         if inner
             .borrow()
             .minimum_quote_init

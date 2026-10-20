@@ -60,7 +60,7 @@ impl SandboxExecutionClientFactory {
 }
 
 impl SandboxExecutionClientFactory {
-    pub fn create_restored_quote_only_cash(
+    pub fn create_restored_quote_only(
         &self,
         trader_id: TraderId,
         name: &str,
@@ -79,7 +79,7 @@ impl SandboxExecutionClientFactory {
             cache.clone(),
         );
         let mut client = SandboxExecutionClient::new(core, config.clone(), clock, cache);
-        client.restore_quote_only_cash()?;
+        client.restore_quote_only()?;
         Ok(Box::new(client))
     }
 }

@@ -56,7 +56,7 @@ use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
     data::{Bar, BarType, Data, InstrumentClose, InstrumentStatus, QuoteTick, TradeTick},
     enums::{
-        AccountType, AggressorSide, BookType, ContingencyType, InstrumentCloseType,
+        AccountType, AggressorSide, BookType, ContingencyType, InstrumentCloseType, LiquiditySide,
         MarketStatusAction, OmsType, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
     },
     events::{
@@ -114,6 +114,8 @@ fn create_config(
 ) -> SandboxExecutionClientConfig {
     let usd = Currency::USD();
     SandboxExecutionClientConfig {
+        execution_deadline_ns: None,
+        expected_funding_ns: None,
         account_id,
         venue,
         starting_balances: vec![Money::new(100_000.0, usd)],
@@ -3080,6 +3082,8 @@ fn test_instrument_close_sync_cleanup_handles_synchronous_position_closed_reentr
 
         let usd = Currency::USD();
         let config = SandboxExecutionClientConfig {
+            execution_deadline_ns: None,
+            expected_funding_ns: None,
             account_id,
             venue,
             starting_balances: vec![Money::new(100_000.0, usd)],
@@ -4285,6 +4289,8 @@ fn test_submit_order_through_exec_engine_no_reentrant_panic(
     // Create and register the sandbox client (venue must match the instrument)
     let usd = Currency::USD();
     let config = SandboxExecutionClientConfig {
+        execution_deadline_ns: None,
+        expected_funding_ns: None,
         account_id,
         venue,
         starting_balances: vec![Money::new(100_000.0, usd)],
@@ -5980,13 +5986,10 @@ fn test_batch_reduce_only_modifies_share_pending_position_quantity(
     let position = cache
         .position_for_order(&opening.client_order_id())
         .unwrap();
-    assert_eq!(
-        fills,
-        vec![
-            (closing[0].client_order_id(), Quantity::from("0.400")),
-            (closing[1].client_order_id(), Quantity::from("0.100")),
-        ]
-    );
+    assert_eq!(fills, vec![
+        (closing[0].client_order_id(), Quantity::from("0.400")),
+        (closing[1].client_order_id(), Quantity::from("0.100")),
+    ]);
     assert_eq!(
         (position.side, position.quantity),
         (PositionSide::Flat, Quantity::from("0.000"))
@@ -6122,12 +6125,10 @@ fn test_inbound_latency_cancel_all_leaves_in_transit_submit_list_unaffected(
         INSERT_LATENCY_NS,
     );
 
-    let legs = submit_list_through_engine(
-        &harness,
-        trader_id,
-        &instrument,
-        &[("O-LIST-LEG-1", "98.00"), ("O-LIST-LEG-2", "97.00")],
-    );
+    let legs = submit_list_through_engine(&harness, trader_id, &instrument, &[
+        ("O-LIST-LEG-1", "98.00"),
+        ("O-LIST-LEG-2", "97.00"),
+    ]);
     let t0 = legs[0].ts_init();
     send_command_through_engine(
         &harness,
@@ -6825,10 +6826,10 @@ fn test_inbound_latency_contingent_change_preserves_in_transit_order(
         .iter()
         .map(|event| (order_event_kind(event), event.client_order_id()))
         .collect();
-    assert_eq!(
-        events,
-        vec![(if expiry { "expired" } else { "updated" }, parent_id)]
-    );
+    assert_eq!(events, vec![(
+        if expiry { "expired" } else { "updated" },
+        parent_id
+    )]);
     let cache = harness.cache.borrow();
     let child = cache.order(&child_id).unwrap();
     assert_eq!(child.status(), OrderStatus::Submitted);
@@ -6921,7 +6922,7 @@ fn restore_cash_context(
         config.oms_type,
         account,
         config.account_type,
-        None,
+        config.base_currency,
         cache.clone(),
     );
     let client = SandboxExecutionClient::new(core, config, clock.clone(), cache.clone());
@@ -7052,7 +7053,7 @@ async fn restored_quote_only_cash_preserves_partial_order_and_trade_identity(#[c
         )
         .unwrap();
     let mut restored = restore_cash_context(restored_cache.clone(), clock, |_| {});
-    restored.client.restore_quote_only_cash().unwrap();
+    restored.client.restore_quote_only().unwrap();
     setup_account_state_handler(restored_cache.clone());
     restored.client.connect().await.unwrap();
     assert_eq!(
@@ -7238,7 +7239,7 @@ fn quote_only_cash_restoration_rejects_unsupported_state_without_initializing(
         5 => config.book_type = BookType::L2_MBP,
         _ => {}
     });
-    assert!(context.client.restore_quote_only_cash().is_err());
+    assert!(context.client.restore_quote_only().is_err());
     assert!(!context.client.is_connected());
     assert_eq!(context.client.matching_engine_count(), 0);
     let after = cache
@@ -7248,4 +7249,370 @@ fn quote_only_cash_restoration_rejects_unsupported_state_without_initializing(
         .flat_map(|account| account.events())
         .collect::<Vec<_>>();
     assert_eq!(after, before);
+}
+
+#[rstest]
+#[case(false)]
+#[case(true)]
+#[tokio::test]
+async fn restored_quote_only_margin_preserves_partial_order_and_trade_identity(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+    #[case] cancel: bool,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    let mut definition = crypto_perpetual_ethusdt;
+    definition.margin_init = "0.1".parse().unwrap();
+    definition.margin_maint = "0.1".parse().unwrap();
+    definition.maker_fee = "0.0002".parse().unwrap();
+    definition.taker_fee = "0.0005".parse().unwrap();
+    let instrument: InstrumentAny = definition.into();
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    clock.borrow_mut().set_time(UnixNanos::from(1_000_000_000));
+    cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    let account = AccountState::new(
+        AccountId::from("BINANCE-001"),
+        AccountType::Margin,
+        vec![AccountBalance::new(
+            Money::from("9999.99200000 USDT"),
+            Money::from("5.60000000 USDT"),
+            Money::from("9994.39200000 USDT"),
+        )],
+        vec![],
+        false,
+        UUID4::new(),
+        1.into(),
+        1.into(),
+        Some(Currency::USDT()),
+    );
+    cache
+        .borrow_mut()
+        .add_account(AccountAny::from_events(&[account.clone()]).unwrap())
+        .unwrap();
+    let original_account = cache.borrow().account_owned(&account.account_id).unwrap();
+    let mut context = restore_cash_context(cache.clone(), clock.clone(), |config| {
+        config.account_type = AccountType::Margin;
+        config.base_currency = Some(Currency::USDT());
+    });
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    set_exec_event_sender(tx);
+    context.client.start().unwrap();
+    let quote = |size: &str| {
+        QuoteTick::new(
+            instrument.id(),
+            Price::from("3999.99"),
+            Price::from("4000.00"),
+            Quantity::from(size),
+            Quantity::from(size),
+            1_000_000_000.into(),
+            1_000_000_000.into(),
+        )
+    };
+    context.client.process_quote_tick(&quote("0.004")).unwrap();
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(TraderId::from("TESTER-001"))
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("0.010"))
+        .price(Price::from("4000.00"))
+        .time_in_force(TimeInForce::Gtc)
+        .client_order_id(ClientOrderId::from("ORIGINAL-001"))
+        .build();
+    submit_to_client(&context, TraderId::from("TESTER-001"), &order);
+    let first = apply_order_events_from_channel(&cache, &mut rx);
+    let first_fill = first
+        .iter()
+        .find_map(|e| {
+            if let OrderEventAny::Filled(v) = e {
+                Some(v.clone())
+            } else {
+                None
+            }
+        })
+        .expect("native positive partial fill");
+    assert_eq!(first_fill.last_px, Price::from("4000.00"));
+    assert_eq!(first_fill.liquidity_side, LiquiditySide::Taker);
+    assert_eq!(first_fill.commission, Some(Money::from("0.00800000 USDT")));
+    let partial = cache
+        .borrow()
+        .try_order_owned(&order.client_order_id())
+        .unwrap();
+    assert_eq!(partial.status(), OrderStatus::PartiallyFilled);
+    assert_eq!(partial.filled_qty(), Quantity::from("0.004"));
+    context.client.process_quote_tick(&quote("0.006")).unwrap();
+    let uninterrupted = apply_order_events_from_channel(&cache, &mut rx);
+    let uninterrupted_fill = uninterrupted
+        .iter()
+        .find_map(|e| {
+            if let OrderEventAny::Filled(v) = e {
+                Some(v.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert_eq!(uninterrupted_fill.liquidity_side, LiquiditySide::Maker);
+    assert_eq!(
+        uninterrupted_fill.commission,
+        Some(Money::from("0.00480000 USDT"))
+    );
+    context.client.stop().unwrap();
+    let restored_cache = Rc::new(RefCell::new(Cache::default()));
+    restored_cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    restored_cache
+        .borrow_mut()
+        .add_account(original_account.clone())
+        .unwrap();
+    restored_cache
+        .borrow_mut()
+        .add_order(
+            partial.clone(),
+            partial.position_id(),
+            Some(ClientId::from("SANDBOX")),
+            false,
+        )
+        .unwrap();
+    let mut restored = restore_cash_context(restored_cache.clone(), clock, |config| {
+        config.account_type = AccountType::Margin;
+        config.base_currency = Some(Currency::USDT());
+    });
+    restored.client.restore_quote_only().unwrap();
+    setup_account_state_handler(restored_cache.clone());
+    restored.client.connect().await.unwrap();
+    assert_eq!(
+        restored_cache
+            .borrow()
+            .account_owned(&account.account_id)
+            .unwrap()
+            .events(),
+        original_account.events()
+    );
+    assert_eq!(
+        restored_cache
+            .borrow()
+            .try_order_owned(&order.client_order_id())
+            .unwrap(),
+        partial
+    );
+    assert!(rx.try_recv().is_err());
+    restored.client.start().unwrap();
+    let mut stale = quote("0.006");
+    stale.ts_init = 999_999_999.into();
+    stale.ts_event = 999_999_999.into();
+    restored.client.process_quote_tick(&stale).unwrap();
+    msgbus::publish_quote(
+        format!(
+            "data.quotes.{}.{}",
+            stale.instrument_id.venue, stale.instrument_id
+        )
+        .into(),
+        &stale,
+    );
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        restored_cache
+            .borrow()
+            .try_order_owned(&order.client_order_id())
+            .unwrap(),
+        partial
+    );
+
+    if cancel {
+        restored
+            .client
+            .cancel_order(CancelOrder::new(
+                order.trader_id(),
+                Some(ClientId::from("SANDBOX")),
+                order.strategy_id(),
+                instrument.id(),
+                order.client_order_id(),
+                partial.venue_order_id(),
+                UUID4::new(),
+                1_000_000_000.into(),
+                None,
+                None,
+            ))
+            .unwrap();
+        let canceled = apply_order_events_from_channel(&restored_cache, &mut rx);
+        assert!(
+            canceled
+                .iter()
+                .any(|e| matches!(e, OrderEventAny::Canceled(_)))
+        );
+    }
+    restored.client.process_quote_tick(&quote("0.006")).unwrap();
+    let continued = apply_order_events_from_channel(&restored_cache, &mut rx);
+    let fills = continued
+        .iter()
+        .filter_map(|e| {
+            if let OrderEventAny::Filled(v) = e {
+                Some(v)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let current = restored_cache
+        .borrow()
+        .try_order_owned(&order.client_order_id())
+        .unwrap();
+    if cancel {
+        assert!(fills.is_empty());
+        assert_eq!(current.filled_qty(), Quantity::from("0.004"));
+        assert_eq!(current.status(), OrderStatus::Canceled);
+    } else {
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].last_qty, Quantity::from("0.006"));
+        assert_eq!(fills[0].last_px, Price::from("4000.00"));
+        assert_eq!(fills[0].liquidity_side, LiquiditySide::Maker);
+        assert_eq!(fills[0].commission, Some(Money::from("0.00480000 USDT")));
+        assert_eq!(fills[0].trade_id, uninterrupted_fill.trade_id);
+        assert_ne!(fills[0].trade_id, first_fill.trade_id);
+        assert_eq!(current.filled_qty(), Quantity::from("0.010"));
+        assert_eq!(current.status(), OrderStatus::Filled);
+    }
+    restored.client.stop().unwrap();
+    restored.client.reset();
+    restored
+        .test_clock
+        .borrow_mut()
+        .set_time(500_000_000.into());
+    restored.client.start().unwrap();
+    let mut reset_quote = quote("0.006");
+    reset_quote.ts_event = 500_000_000.into();
+    reset_quote.ts_init = 500_000_000.into();
+    restored.client.process_quote_tick(&reset_quote).unwrap();
+    let fresh = OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(TraderId::from("TESTER-001"))
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("0.001"))
+        .price(Price::from("4000.00"))
+        .time_in_force(TimeInForce::Gtc)
+        .client_order_id(ClientOrderId::from("RESET-001"))
+        .build();
+    submit_to_client(&restored, TraderId::from("TESTER-001"), &fresh);
+    let reset_events = apply_order_events_from_channel(&restored_cache, &mut rx);
+    assert!(reset_events.iter().any(|event| matches!(event, OrderEventAny::Filled(fill) if fill.client_order_id == fresh.client_order_id())));
+    restored.client.stop().unwrap();
+}
+
+#[rstest]
+#[case::expiry(0)]
+#[case::changed_funding(1)]
+#[case::stale_funding(2)]
+#[case::queued_expiry(3)]
+#[tokio::test]
+async fn perpetual_execution_window_guards_matching_and_queued_invocation(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+    #[case] challenge: u8,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    let instrument: InstrumentAny = crypto_perpetual_ethusdt.into();
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    clock.borrow_mut().set_time(1_000_000_000.into());
+    let funding = nautilus_model::data::FundingRateUpdate::new(
+        instrument.id(),
+        "0.0001".parse().unwrap(),
+        None,
+        Some(100_000_000_000.into()),
+        1_000_000_000.into(),
+        1_000_000_000.into(),
+    );
+    cache.borrow_mut().add_funding_rate(funding).unwrap();
+    let mut context = restore_cash_context(cache.clone(), clock.clone(), |config| {
+        config.account_type = AccountType::Margin;
+        config.base_currency = Some(Currency::USDT());
+        config.execution_deadline_ns = Some(20_000_000_000.into());
+        config.expected_funding_ns = Some(100_000_000_000.into());
+        if challenge == 3 {
+            config.latency_model = Some(static_latency_model(30_000_000_000, 0, 0));
+        }
+    });
+    setup_account_state_handler(cache.clone());
+    context.client.connect().await.unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    set_exec_event_sender(tx);
+    context.client.start().unwrap();
+    let quote = |ts: u64, ask: &str| {
+        QuoteTick::new(
+            instrument.id(),
+            Price::from("3999.99"),
+            Price::from(ask),
+            Quantity::from("0.100"),
+            Quantity::from("0.100"),
+            ts.into(),
+            ts.into(),
+        )
+    };
+    context
+        .client
+        .process_quote_tick(&quote(1_000_000_000, "4001.00"))
+        .unwrap();
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(TraderId::from("TESTER-001"))
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("0.010"))
+        .price(Price::from("4000.00"))
+        .time_in_force(TimeInForce::Gtc)
+        .client_order_id(ClientOrderId::from("WINDOW-001"))
+        .build();
+    submit_to_client(&context, TraderId::from("TESTER-001"), &order);
+    let initial = apply_order_events_from_channel(&cache, &mut rx);
+    assert!(
+        initial
+            .iter()
+            .any(|event| matches!(event, OrderEventAny::Submitted(_)))
+    );
+    assert!(
+        !initial
+            .iter()
+            .any(|event| matches!(event, OrderEventAny::Filled(_)))
+    );
+    match challenge {
+        0 | 3 => clock.borrow_mut().set_time(40_000_000_000.into()),
+        1 => {
+            let mut changed = funding;
+            changed.next_funding_ns = Some(10_000_000_000.into());
+            cache.borrow_mut().add_funding_rate(changed).unwrap();
+        }
+        2 => clock.borrow_mut().set_time(7_000_000_000.into()),
+        _ => unreachable!(),
+    }
+    let now = clock.borrow().timestamp_ns().as_u64();
+    context
+        .client
+        .process_quote_tick(&quote(now, "4000.00"))
+        .unwrap();
+    let events = apply_order_events_from_channel(&cache, &mut rx);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, OrderEventAny::Filled(_)))
+    );
+    if challenge == 3 {
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, OrderEventAny::Rejected(_)))
+        );
+    }
+    let current = cache
+        .borrow()
+        .try_order_owned(&order.client_order_id())
+        .unwrap();
+    assert_eq!(current.filled_qty(), Quantity::from("0.000"));
+    context.client.stop().unwrap();
 }
