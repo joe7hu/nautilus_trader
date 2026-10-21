@@ -16595,6 +16595,119 @@ fn test_deferred_marketable_modify_partial_fills(
 }
 
 #[rstest]
+fn test_partially_filled_reprice_preserves_pending_taker_then_resting_maker(
+    instrument_eth_usdt: InstrumentAny,
+    account_id: AccountId,
+) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let _handler = order_event_handler_with_cache(cache.clone());
+    let mut engine = OrderMatchingEngine::new(
+        instrument_eth_usdt.clone(),
+        1,
+        FillModelHandle::default(),
+        FeeModelAny::default().into(),
+        BookType::L2_MBP,
+        OmsType::Netting,
+        AccountType::Margin,
+        Rc::new(RefCell::new(TestClock::new())),
+        cache.clone(),
+        OrderMatchingEngineConfig {
+            liquidity_consumption: true,
+            ..Default::default()
+        },
+    );
+    let delta = |price: &str, quantity: &str, id| {
+        OrderBookDeltaTestBuilder::new(instrument_eth_usdt.id())
+            .book_action(BookAction::Add)
+            .book_order(BookOrder::new(
+                OrderSide::Sell,
+                Price::from(price),
+                Quantity::from(quantity),
+                id,
+            ))
+            .build()
+    };
+    engine
+        .process_order_book_delta(&delta("99.00", "0.200", 1))
+        .unwrap();
+    let id = ClientOrderId::from("PARTIAL-REPRICE");
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Buy)
+        .price(Price::from("100.00"))
+        .quantity(Quantity::from("1.000"))
+        .client_order_id(id)
+        .submit(true)
+        .build();
+    engine.process_order(&mut order, account_id);
+    assert_eq!(
+        cache.borrow().order(&id).unwrap().filled_qty(),
+        Quantity::from("0.200")
+    );
+    engine
+        .process_order_book_delta(&delta("101.00", "0.400", 2))
+        .unwrap();
+    let pending = Rc::new(RefCell::new(Vec::new()));
+    let events = pending.clone();
+    engine.set_event_handler(Rc::new(move |event| events.borrow_mut().push(event)));
+    engine.process_modify(
+        &ModifyOrder::new(
+            order.trader_id(),
+            None,
+            order.strategy_id(),
+            order.instrument_id(),
+            id,
+            None,
+            None,
+            Some(Price::from("103.00")),
+            None,
+            UUID4::new(),
+            UnixNanos::from(1),
+            None,
+            None,
+        ),
+        account_id,
+    );
+    assert_eq!(pending.borrow().len(), 2);
+    cache
+        .borrow_mut()
+        .update_order(&pending.borrow()[0])
+        .unwrap();
+    engine
+        .process_order_book_delta(&delta("102.00", "0.100", 3))
+        .unwrap();
+    engine.iterate(UnixNanos::from(2), AggressorSide::NoAggressor);
+    assert_eq!(pending.borrow().len(), 3);
+    for event in pending.borrow().iter().skip(1) {
+        let OrderEventAny::Filled(fill) = event else {
+            panic!("Expected fill")
+        };
+        assert_eq!(fill.liquidity_side, LiquiditySide::Taker);
+        cache.borrow_mut().update_order(event).unwrap();
+    }
+    assert_eq!(
+        cache.borrow().order(&id).unwrap().filled_qty(),
+        Quantity::from("0.700")
+    );
+    engine
+        .process_order_book_delta(&delta("103.00", "0.300", 4))
+        .unwrap();
+    engine.iterate(UnixNanos::from(3), AggressorSide::NoAggressor);
+    assert_eq!(pending.borrow().len(), 4);
+    let events = pending.borrow();
+    let OrderEventAny::Filled(fill) = &events[3] else {
+        panic!("Expected fill")
+    };
+    assert_eq!(fill.liquidity_side, LiquiditySide::Maker);
+    assert_eq!(fill.last_qty, Quantity::from("0.300"));
+    cache.borrow_mut().update_order(&events[3]).unwrap();
+    assert_eq!(
+        cache.borrow().order(&id).unwrap().status(),
+        OrderStatus::Filled
+    );
+}
+
+#[rstest]
 fn test_deferred_stop_limit_modify_preserves_prices_when_triggered(
     instrument_eth_usdt: InstrumentAny,
     account_id: AccountId,

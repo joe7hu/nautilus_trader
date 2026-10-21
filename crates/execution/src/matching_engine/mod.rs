@@ -2857,6 +2857,12 @@ impl OrderMatchingEngine {
         }
     }
 
+    /// Restores the complete original limit-order history into an empty quote-only engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the engine profile is unsupported, its matching core is nonempty,
+    /// or the original orders have incompatible identities, states or precision.
     pub fn restore_quote_only_limit_orders(
         &mut self,
         orders: &[OrderAny],
@@ -2865,7 +2871,7 @@ impl OrderMatchingEngine {
         anyhow::ensure!(
             self.core.iter_orders().next().is_none()
                 && self.book_type == BookType::L1_MBP
-                && self.account_type == AccountType::Cash
+                && matches!(self.account_type, AccountType::Cash | AccountType::Margin)
                 && self.oms_type == OmsType::Netting
                 && !self.config.queue_position
                 && !self.config.liquidity_consumption
@@ -4212,13 +4218,24 @@ impl OrderMatchingEngine {
     }
 
     fn fill_resting_limit_order(&mut self, client_order_id: ClientOrderId) {
-        // A market-to-limit remainder rests as maker after its initial taker fill
-        if self
-            .core
-            .get_order(client_order_id)
-            .is_some_and(|order| order.order_type == OrderType::MarketToLimit)
-            && let Some(mut order) = self.cache.borrow_mut().order_mut(&client_order_id)
-        {
+        let resting = self.core.get_order(client_order_id).is_some_and(|order| {
+            order.order_type == OrderType::MarketToLimit
+                || (order.order_type == OrderType::Limit
+                    && !self
+                        .pending_order_updates
+                        .borrow()
+                        .contains_key(&client_order_id)
+                    && self
+                        .cache
+                        .borrow()
+                        .order(&client_order_id)
+                        .is_some_and(|cached| {
+                            cached.filled_qty().is_positive()
+                                && self.cached_filled_qty.get(&client_order_id)
+                                    == Some(&cached.filled_qty())
+                        }))
+        });
+        if resting && let Some(mut order) = self.cache.borrow_mut().order_mut(&client_order_id) {
             order.set_liquidity_side(LiquiditySide::Maker);
         }
         self.fill_limit_order(client_order_id);
