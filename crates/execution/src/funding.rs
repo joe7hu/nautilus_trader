@@ -127,6 +127,16 @@ pub enum FundingProgress {
     Uncertain,
 }
 
+/// Immutable execution limits for a finite native funding simulation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FundingWindow {
+    /// Original first settlement selected for this simulation.
+    pub first_boundary: UnixNanos,
+    /// Exclusive cutoff for new matching and later settlements.
+    pub deadline: UnixNanos,
+}
+
 /// A coherent native funding cut, restorable only against its original native state.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -134,10 +144,38 @@ pub struct FundingCheckpoint {
     version: u32,
     venue: Venue,
     frozen_account: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    window: Option<FundingWindow>,
     account: AccountAny,
     positions: Vec<Position>,
     pending: Vec<FundingRateUpdate>,
     receipts: Vec<FundingReceipt>,
+}
+
+impl FundingCheckpoint {
+    /// Returns the original native account identity.
+    #[must_use]
+    pub fn account_id(&self) -> AccountId {
+        self.account.id()
+    }
+
+    /// Returns immutable native execution limits, if this is a finite simulation.
+    #[must_use]
+    pub const fn window(&self) -> Option<FundingWindow> {
+        self.window
+    }
+
+    /// Returns original pending native observations.
+    #[must_use]
+    pub fn pending(&self) -> &[FundingRateUpdate] {
+        &self.pending
+    }
+
+    /// Returns original consumed boundary receipts.
+    #[must_use]
+    pub fn receipts(&self) -> &[FundingReceipt] {
+        &self.receipts
+    }
 }
 
 /// Retains original native results for a consumed settlement boundary.
@@ -166,6 +204,7 @@ pub struct FundingOwner {
     clock: Rc<RefCell<dyn Clock>>,
     cache: Rc<RefCell<Cache>>,
     frozen_account: bool,
+    window: Option<FundingWindow>,
     pending: BTreeMap<(UnixNanos, InstrumentId), FundingRateUpdate>,
     applied: BTreeMap<(UnixNanos, InstrumentId), FundingReceipt>,
     poisoned: Option<String>,
@@ -194,12 +233,72 @@ impl FundingOwner {
             clock,
             cache,
             frozen_account,
+            window: None,
             pending: BTreeMap::new(),
             applied: BTreeMap::new(),
             poisoned: None,
             sealed: BTreeSet::new(),
         }
     }
+    /// Binds immutable finite execution limits before any lifecycle state is installed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid limits or an already initialized owner.
+    pub fn bind_window(&mut self, window: Option<FundingWindow>) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.pending.is_empty()
+                && self.applied.is_empty()
+                && self.sealed.is_empty()
+                && self.poisoned.is_none(),
+            "funding window requires an uninitialized owner"
+        );
+        anyhow::ensure!(
+            window.is_none_or(|window| !window.first_boundary.is_zero()
+                && window.first_boundary < window.deadline),
+            "invalid native funding window"
+        );
+        self.window = window;
+        Ok(())
+    }
+
+    /// Returns the bound immutable execution limits.
+    #[must_use]
+    pub const fn window(&self) -> Option<FundingWindow> {
+        self.window
+    }
+
+    /// Checks a matching ingress against original pending input and native clock limits.
+    #[must_use]
+    pub fn matching_ready(
+        &self,
+        instrument: InstrumentId,
+        now: UnixNanos,
+        event: Option<UnixNanos>,
+    ) -> bool {
+        if self.blocks_execution(now) {
+            return false;
+        }
+        let Some(((boundary, _), rate)) =
+            self.pending.iter().find(|((_, id), _)| *id == instrument)
+        else {
+            return false;
+        };
+        event.is_none_or(|event| event < *boundary)
+            && self.window.is_none_or(|window| {
+                now < window.deadline
+                    && event.is_none_or(|event| event < window.deadline)
+                    && Self::observation_fresh(rate.ts_event, rate.ts_init, now)
+            })
+    }
+
+    fn observation_fresh(ts_event: UnixNanos, ts_init: UnixNanos, cut: UnixNanos) -> bool {
+        ts_event <= cut
+            && ts_init <= cut
+            && cut.as_u64().saturating_sub(ts_event.as_u64()) <= 5_000_000_000
+            && cut.as_u64().saturating_sub(ts_init.as_u64()) <= 5_000_000_000
+    }
+
     /// Queues an original rate update without repeating a consumed boundary.
     pub fn queue(&mut self, update: FundingRateUpdate) -> Option<UnixNanos> {
         let boundary = Self::boundary(&update)?;
@@ -709,6 +808,37 @@ impl FundingOwner {
         let boundary = Self::boundary(&update)
             .ok_or_else(|| anyhow::anyhow!("funding boundary unavailable"))?;
         let key = (boundary, update.instrument_id);
+        if let Some(window) = self.window {
+            if boundary < window.first_boundary {
+                self.poisoned = Some("funding_window_schedule_changed".into());
+                anyhow::bail!("funding boundary precedes the immutable first settlement");
+            }
+            let consumed = self
+                .applied
+                .contains_key(&(window.first_boundary, update.instrument_id));
+            if !consumed
+                && boundary != window.first_boundary
+                && (update.ts_event < window.first_boundary
+                    || !self
+                        .pending
+                        .contains_key(&(window.first_boundary, update.instrument_id)))
+            {
+                self.poisoned = Some("funding_window_schedule_changed".into());
+                anyhow::bail!("original first native funding boundary changed");
+            }
+
+            if boundary == window.first_boundary
+                && now >= boundary
+                && (update.ts_event > boundary || update.ts_init > boundary)
+                && let Some(original) = self.pending.get(&key)
+            {
+                if original.rate != update.rate || original.interval != update.interval {
+                    self.poisoned = Some("funding_consumed_input_conflict".into());
+                    anyhow::bail!("late first-period funding input changed");
+                }
+                return Ok(None);
+            }
+        }
         let original = self
             .applied
             .get(&key)
@@ -737,7 +867,15 @@ impl FundingOwner {
 
     /// Seals all due input identities before a FIFO execution-channel barrier is queued.
     pub fn seal_due(&mut self, now: UnixNanos) -> Vec<(UnixNanos, InstrumentId)> {
-        let due = self.due(now);
+        let due: Vec<_> = self
+            .due(now)
+            .into_iter()
+            .filter(|(boundary, _)| {
+                self.window.is_none_or(|window| {
+                    *boundary >= window.first_boundary && *boundary < window.deadline
+                })
+            })
+            .collect();
         self.sealed.extend(due.iter().copied());
         due
     }
@@ -761,6 +899,20 @@ impl FundingOwner {
         let Some(rate) = self.pending.get(&key).copied() else {
             return FundingProgress::Deferred;
         };
+
+        if self.window.is_some_and(|window| {
+            boundary < window.first_boundary
+                || boundary >= window.deadline
+                || !Self::observation_fresh(rate.ts_event, rate.ts_init, boundary)
+        }) {
+            return FundingProgress::Deferred;
+        }
+
+        if self.window.is_some()
+            && !matches!(&price, Some(FundingPriceCut::Mark(mark)) if Self::observation_fresh(mark.ts_event, mark.ts_init, boundary))
+        {
+            return FundingProgress::Deferred;
+        }
 
         if !self.sealed.contains(&key) || self.clock.borrow().timestamp_ns() < boundary {
             return FundingProgress::Deferred;
@@ -853,6 +1005,7 @@ impl FundingOwner {
             version: 1,
             venue: self.venue,
             frozen_account: self.frozen_account,
+            window: self.window,
             account,
             positions,
             pending: self.pending.values().copied().collect(),
@@ -881,6 +1034,7 @@ impl FundingOwner {
             checkpoint.version == 1
                 && checkpoint.venue == self.venue
                 && checkpoint.frozen_account == self.frozen_account
+                && checkpoint.window == self.window
                 && checkpoint.account.id() == account_id,
             "foreign funding checkpoint"
         );
@@ -924,6 +1078,26 @@ impl FundingOwner {
                     && !pending.contains_key(&key),
                 "invalid consumed funding identity"
             );
+
+            if let Some(window) = self.window {
+                anyhow::ensure!(
+                    key.0 >= window.first_boundary
+                        && key.0 < window.deadline
+                        && Self::observation_fresh(
+                            receipt.original_rate.ts_event,
+                            receipt.original_rate.ts_init,
+                            key.0
+                        ),
+                    "consumed funding lies outside its original supported window"
+                );
+
+                if receipt.progress == FundingProgress::Applied {
+                    anyhow::ensure!(
+                        matches!(&receipt.price_cut, Some(FundingPriceCut::Mark(mark)) if mark.instrument_id == key.1 && Self::observation_fresh(mark.ts_event, mark.ts_init, key.0)),
+                        "bounded funding requires its original fresh mark"
+                    );
+                }
+            }
 
             match receipt.progress {
                 FundingProgress::Empty => anyhow::ensure!(
@@ -1004,6 +1178,19 @@ impl FundingOwner {
                     "original funding adjustment has no consumed boundary receipt"
                 );
             }
+        }
+
+        if let Some(window) = self.window {
+            anyhow::ensure!(
+                pending
+                    .keys()
+                    .chain(applied.keys())
+                    .all(|(boundary, instrument)| *boundary >= window.first_boundary
+                        && (*boundary == window.first_boundary
+                            || applied.contains_key(&(window.first_boundary, *instrument))
+                            || pending.contains_key(&(window.first_boundary, *instrument)))),
+                "original first funding boundary is missing"
+            );
         }
         self.pending = pending;
         self.applied = applied;

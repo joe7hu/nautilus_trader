@@ -26,6 +26,7 @@ use nautilus_common::{
 };
 use nautilus_execution::{client::core::ExecutionClientCore, funding::FundingCheckpoint};
 use nautilus_model::{
+    data::FundingRateUpdate,
     enums::BookType,
     identifiers::{ClientId, TraderId},
 };
@@ -81,6 +82,7 @@ impl SandboxExecutionClientFactory {
         config: &SandboxExecutionClientConfig,
         cache: Rc<RefCell<Cache>>,
         checkpoint: Option<FundingCheckpoint>,
+        original_funding: Option<FundingRateUpdate>,
     ) -> anyhow::Result<(Box<dyn ExecutionClient>, SandboxFundingHandle)> {
         anyhow::ensure!(
             config.book_type == BookType::L1_MBP
@@ -103,12 +105,38 @@ impl SandboxExecutionClientFactory {
             config.base_currency,
             cache.clone(),
         );
-        let mut client = SandboxExecutionClient::new(core, config.clone(), clock, cache);
+        let mut client = SandboxExecutionClient::new(core, config.clone(), clock.clone(), cache);
+        anyhow::ensure!(
+            checkpoint.is_none() || original_funding.is_none(),
+            "restoration cannot replace original native funding input"
+        );
+        anyhow::ensure!(
+            checkpoint.is_some()
+                || config.expected_funding_ns.is_none()
+                || original_funding.is_some(),
+            "bounded native funding requires its original selected update"
+        );
+
         if let Some(checkpoint) = checkpoint {
             client.restore_funding(checkpoint)?;
             client.restore_quote_only()?;
         } else {
             client.enable_funding()?;
+
+            if let Some(update) = original_funding {
+                let now = clock.borrow().timestamp_ns();
+                anyhow::ensure!(
+                    config.expected_funding_ns.is_none()
+                        || (update.ts_event <= now
+                            && update.ts_init <= now
+                            && now.as_u64().saturating_sub(update.ts_event.as_u64())
+                                <= 5_000_000_000
+                            && now.as_u64().saturating_sub(update.ts_init.as_u64())
+                                <= 5_000_000_000),
+                    "bounded original funding observation is stale or future"
+                );
+                client.process_funding_rate(update)?;
+            }
         }
         let handle = client
             .funding_handle()

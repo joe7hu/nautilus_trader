@@ -51,6 +51,7 @@ use nautilus_execution::{
     client::core::ExecutionClientCore,
     funding::{
         FundingAccountPublisher, FundingCheckpoint, FundingOwner, FundingPriceCut, FundingProgress,
+        FundingWindow,
     },
     matching_engine::{OrderMatchingEngine, inflight::InflightOrders},
     models::{fee::FeeModelHandle, fill::FillModelHandle, latency::LatencyModel},
@@ -380,11 +381,31 @@ impl SandboxExecutionClient {
             !self.core.borrow().is_started()
                 && self.config.account_type == AccountType::Margin
                 && !self.config.frozen_account
-                && self.config.execution_deadline_ns.is_none()
-                && self.config.expected_funding_ns.is_none(),
+                && matches!(
+                    (
+                        self.config.execution_deadline_ns,
+                        self.config.expected_funding_ns
+                    ),
+                    (None, None) | (Some(_), Some(_))
+                ),
             "unsupported native funding profile"
         );
-        self.inner.borrow().funding.enabled.set(true);
+        let window = self
+            .config
+            .execution_deadline_ns
+            .zip(self.config.expected_funding_ns)
+            .map(|(deadline, first_boundary)| FundingWindow {
+                first_boundary,
+                deadline,
+            });
+        let now = self.clock.borrow().timestamp_ns();
+        anyhow::ensure!(
+            window.is_none_or(|window| now < window.first_boundary
+                && window.deadline.as_u64().saturating_sub(now.as_u64()) <= 300_000_000_000),
+            "native funding window is expired or exceeds five minutes"
+        );
+        funding.owner.borrow_mut().bind_window(window)?;
+        funding.enabled.set(true);
         Ok(())
     }
 
@@ -433,11 +454,25 @@ impl SandboxExecutionClient {
                 && !self.core.borrow().is_connected()
                 && self.config.account_type == AccountType::Margin
                 && !self.config.frozen_account
-                && self.config.execution_deadline_ns.is_none()
-                && self.config.expected_funding_ns.is_none(),
+                && matches!(
+                    (
+                        self.config.execution_deadline_ns,
+                        self.config.expected_funding_ns
+                    ),
+                    (None, None) | (Some(_), Some(_))
+                ),
             "unsupported native funding restoration profile"
         );
         let funding = self.inner.borrow().funding.clone();
+        let window = self
+            .config
+            .execution_deadline_ns
+            .zip(self.config.expected_funding_ns)
+            .map(|(deadline, first_boundary)| FundingWindow {
+                first_boundary,
+                deadline,
+            });
+        funding.owner.borrow_mut().bind_window(window)?;
         funding
             .owner
             .borrow_mut()
@@ -770,7 +805,7 @@ impl SandboxExecutionClient {
             && !self
                 .inner
                 .borrow()
-                .execution_open(trade.instrument_id, None)
+                .execution_open(trade.instrument_id, Some(trade.ts_event.max(trade.ts_init)))
         {
             return Ok(());
         }
@@ -803,10 +838,10 @@ impl SandboxExecutionClient {
     pub fn process_bar(&self, bar: &Bar) -> anyhow::Result<()> {
         SandboxFunding::schedule(&self.inner);
         if self.inner.borrow().funding.enabled.get()
-            && !self
-                .inner
-                .borrow()
-                .execution_open(bar.bar_type.instrument_id(), None)
+            && !self.inner.borrow().execution_open(
+                bar.bar_type.instrument_id(),
+                Some(bar.ts_event.max(bar.ts_init)),
+            )
         {
             return Ok(());
         }
@@ -839,10 +874,10 @@ impl SandboxExecutionClient {
     pub fn process_order_book_deltas(&self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
         SandboxFunding::schedule(&self.inner);
         if self.inner.borrow().funding.enabled.get()
-            && !self
-                .inner
-                .borrow()
-                .execution_open(deltas.instrument_id, None)
+            && !self.inner.borrow().execution_open(
+                deltas.instrument_id,
+                Some(deltas.ts_event.max(deltas.ts_init)),
+            )
         {
             return Ok(());
         }
@@ -981,6 +1016,23 @@ impl ExecutionClient for SandboxExecutionClient {
         }
 
         let funding = self.inner.borrow().funding.clone();
+        let now = self.clock.borrow().timestamp_ns();
+        if funding.enabled.get() {
+            let owner = funding.owner.borrow();
+            anyhow::ensure!(
+                owner.window().is_none_or(|window| now < window.deadline
+                    && (if self.restored.get() {
+                        owner
+                            .due(now)
+                            .iter()
+                            .all(|(boundary, _)| *boundary >= window.deadline)
+                    } else {
+                        now < window.first_boundary
+                            && owner.next_boundary() == Some(window.first_boundary)
+                    })),
+                "expired or unresolved restored native funding window"
+            );
+        }
         anyhow::ensure!(
             !funding.enabled.get() || try_get_exec_event_sender().is_some(),
             "funding requires the native execution FIFO channel"
@@ -1424,6 +1476,15 @@ impl SandboxFunding {
         let Some(next) = funding.owner.borrow().next_boundary() else {
             return;
         };
+
+        if funding
+            .owner
+            .borrow()
+            .window()
+            .is_some_and(|window| next >= window.deadline)
+        {
+            return;
+        }
         let now = funding.publisher.clock.borrow().timestamp_ns();
         if next <= now {
             return;
@@ -1515,18 +1576,12 @@ impl Eq for DelayedCommand {}
 
 impl SandboxInner {
     fn execution_open(&self, instrument: InstrumentId, event_ns: Option<UnixNanos>) -> bool {
-        if self.funding.enabled.get()
-            && (!self.funding.owner.try_borrow().is_ok_and(|owner| {
-                owner
-                    .next_boundary()
-                    .is_some_and(|boundary| event_ns.is_none_or(|event| event < boundary))
-            }) || !self.funding.active.get()
-                || self.funding.in_flight.get()
-                || self.funding.owner.try_borrow().map_or(true, |owner| {
-                    owner.blocks_execution(self.clock.borrow().timestamp_ns())
-                }))
-        {
-            return false;
+        if self.funding.enabled.get() {
+            return self.funding.active.get()
+                && !self.funding.in_flight.get()
+                && self.funding.owner.try_borrow().is_ok_and(|owner| {
+                    owner.matching_ready(instrument, self.clock.borrow().timestamp_ns(), event_ns)
+                });
         }
 
         match (
@@ -1621,7 +1676,9 @@ impl SandboxInner {
     }
 
     fn process_trade_tick(&mut self, trade: &TradeTick) {
-        if self.funding.enabled.get() && !self.execution_open(trade.instrument_id, None) {
+        if self.funding.enabled.get()
+            && !self.execution_open(trade.instrument_id, Some(trade.ts_event.max(trade.ts_init)))
+        {
             return;
         }
 
@@ -1646,7 +1703,12 @@ impl SandboxInner {
     }
 
     fn process_bar(&mut self, bar: &Bar) {
-        if self.funding.enabled.get() && !self.execution_open(bar.bar_type.instrument_id(), None) {
+        if self.funding.enabled.get()
+            && !self.execution_open(
+                bar.bar_type.instrument_id(),
+                Some(bar.ts_event.max(bar.ts_init)),
+            )
+        {
             return;
         }
 
@@ -1671,7 +1733,12 @@ impl SandboxInner {
     }
 
     fn process_order_book_deltas(&mut self, deltas: &OrderBookDeltas) {
-        if self.funding.enabled.get() && !self.execution_open(deltas.instrument_id, None) {
+        if self.funding.enabled.get()
+            && !self.execution_open(
+                deltas.instrument_id,
+                Some(deltas.ts_event.max(deltas.ts_init)),
+            )
+        {
             return;
         }
         let instrument_id = deltas.instrument_id;
@@ -1689,7 +1756,12 @@ impl SandboxInner {
     }
 
     fn process_instrument_status(&mut self, status: &InstrumentStatus) {
-        if self.funding.enabled.get() && !self.execution_open(status.instrument_id, None) {
+        if self.funding.enabled.get()
+            && !self.execution_open(
+                status.instrument_id,
+                Some(status.ts_event.max(status.ts_init)),
+            )
+        {
             return;
         }
         let instrument_id = status.instrument_id;
@@ -1714,7 +1786,9 @@ impl SandboxInner {
     }
 
     fn process_instrument_close(&mut self, close: &InstrumentClose) {
-        if self.funding.enabled.get() && !self.execution_open(close.instrument_id, None) {
+        if self.funding.enabled.get()
+            && !self.execution_open(close.instrument_id, Some(close.ts_event.max(close.ts_init)))
+        {
             return;
         }
         let instrument_id = close.instrument_id;
@@ -1804,13 +1878,15 @@ impl SandboxInner {
     fn apply_trading_command(&mut self, cmd: &TradingCommand) -> anyhow::Result<()> {
         self.inflight_orders.remove(cmd);
 
-        if matches!(
-            cmd,
-            TradingCommand::SubmitOrder(_)
-                | TradingCommand::SubmitOrderList(_)
-                | TradingCommand::ModifyOrder(_)
-                | TradingCommand::ModifyOrders(_)
-        ) && !self.execution_open(cmd.instrument_id(), None)
+        if (self.funding.enabled.get()
+            || matches!(
+                cmd,
+                TradingCommand::SubmitOrder(_)
+                    | TradingCommand::SubmitOrderList(_)
+                    | TradingCommand::ModifyOrder(_)
+                    | TradingCommand::ModifyOrders(_)
+            ))
+            && !self.execution_open(cmd.instrument_id(), None)
         {
             self.reject_command(cmd, "Sandbox execution window expired");
             return Ok(());
