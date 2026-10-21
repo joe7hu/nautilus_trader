@@ -21,6 +21,15 @@ paper trading and strategy testing in real-time without actual order execution o
 - Account balance and position tracking.
 - Support for both cash and margin account types.
 
+Quote-only restoration preserves one original account and instrument, with original orders and
+matching identifiers. The bounded margin profiles support linear USDT collateral and BTC/USD
+inverse contracts with a 100 USD multiplier and BTC collateral at 1x leverage. Other restoration
+settings remain subject to the quote-only profile guards. Restoration does not initialize another
+balance or authorize a new order. Inverse funding and maintenance modes are not enabled by this
+restoration support. Inverse quotes must have positive, ordered bid/ask prices on the original
+instrument grid and within its price bounds before matching. Consumers must also qualify mark
+valuation, source eligibility and their own exposure limits.
+
 ## NautilusTrader
 
 [NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native

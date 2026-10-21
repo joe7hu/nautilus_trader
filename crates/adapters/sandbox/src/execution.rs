@@ -78,7 +78,7 @@ use nautilus_model::{
     orders::{Order, OrderAny},
     position::Position,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, Currency, MarginBalance, Money},
+    types::{AccountBalance, Currency, MarginBalance, Money, Quantity},
 };
 use rust_decimal::Decimal;
 use ustr::Ustr;
@@ -486,9 +486,11 @@ impl SandboxExecutionClient {
             anyhow::ensure!(
                 self.config.default_leverage == rust_decimal::Decimal::ONE
                     && self.config.leverages.is_empty()
-                    && self.config.base_currency == Some(Currency::USDT())
-                    && account.balances().keys().all(|currency| *currency == Currency::USDT())
-                    && self.cache.borrow().instruments(&self.config.venue, None).iter().all(|i| matches!(i, InstrumentAny::CryptoPerpetual(p) if !p.is_inverse && p.settlement_currency == Currency::USDT())),
+                    && account.balances().keys().all(|currency| Some(*currency) == self.config.base_currency)
+                    && self.cache.borrow().instruments(&self.config.venue, None).iter().all(|i| matches!(i, InstrumentAny::CryptoPerpetual(p) if
+                        (self.config.base_currency == Some(Currency::USDT()) && !p.is_inverse && p.settlement_currency == Currency::USDT())
+                        || (self.config.base_currency == Some(Currency::BTC()) && p.is_inverse && p.base_currency == Currency::BTC() && p.quote_currency == Currency::USD() && p.settlement_currency == Currency::BTC() && p.multiplier == Quantity::from("100"))
+                    )),
                 "unsupported margin restoration profile"
             );
         }
@@ -3312,12 +3314,21 @@ fn inbound_alert_name(client_id: ClientId) -> String {
 }
 
 fn check_quote_or_drop(context: &str, quote: &QuoteTick, instrument: &InstrumentAny) -> bool {
-    if quote_matches_instrument_precision(quote, instrument) {
+    let price_domain = !instrument.is_inverse()
+        || (quote.bid_price <= quote.ask_price
+            && [quote.bid_price, quote.ask_price].into_iter().all(|price| {
+                instrument.try_normalize_price(price).is_ok()
+                    && price.raw() > 0
+                    && instrument.min_price().is_none_or(|min| price >= min)
+                    && instrument.max_price().is_none_or(|max| price <= max)
+            }));
+
+    if quote_matches_instrument_precision(quote, instrument) && price_domain {
         return true;
     }
 
     log::warn!(
-        "Dropping {context} for {} due to precision mismatch \
+        "Dropping {context} for {} due to invalid precision or inverse price domain \
          (bid_px={}, ask_px={}, bid_sz={}, ask_sz={}, expected_price={}, expected_size={})",
         instrument.id(),
         quote.bid_price.precision,
