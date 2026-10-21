@@ -43,18 +43,25 @@ use nautilus_common::{
         self, MStr, MessagingSwitchboard, Pattern, TypedHandler,
         typed_handler::ShareableMessageHandler,
     },
+    runner::TimeEventMessage,
     timer::{TimeEvent, TimeEventCallback},
 };
 use nautilus_core::{DurationNanos, Params, UUID4, UnixNanos, WeakCell};
 use nautilus_execution::{
     client::core::ExecutionClientCore,
+    funding::{
+        FundingAccountPublisher, FundingCheckpoint, FundingOwner, FundingPriceCut, FundingProgress,
+    },
     matching_engine::{OrderMatchingEngine, inflight::InflightOrders},
     models::{fee::FeeModelHandle, fill::FillModelHandle, latency::LatencyModel},
 };
 use nautilus_model::{
     accounts::{Account, AccountAny},
-    data::{Bar, InstrumentClose, InstrumentStatus, OrderBookDeltas, QuoteTick, TradeTick},
-    enums::{AccountType, BookType, OmsType},
+    data::{
+        Bar, FundingRateUpdate, InstrumentClose, InstrumentStatus, OrderBookDeltas, QuoteTick,
+        TradeTick,
+    },
+    enums::{AccountType, BookType, OmsType, PositionAdjustmentType},
     events::{
         OrderCancelRejected, OrderEventAny, OrderModifyRejected, OrderRejected, PositionEvent,
     },
@@ -89,6 +96,42 @@ pub struct SandboxExecutionClient {
     cache: Rc<RefCell<Cache>>,
 }
 
+/// Read-only access to the funding cut of one registered native sandbox client.
+///
+/// This handle stays on the client's native owner thread and cannot publish or settle events.
+#[derive(Clone)]
+pub struct SandboxFundingHandle {
+    funding: Rc<SandboxFunding>,
+    account_id: AccountId,
+}
+
+impl Debug for SandboxFundingHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(SandboxFundingHandle))
+            .field("account_id", &self.account_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SandboxFundingHandle {
+    /// Captures the original funding lifecycle against its current native account and positions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error while a boundary, account application or owner borrow is unresolved.
+    pub fn checkpoint(&self) -> anyhow::Result<FundingCheckpoint> {
+        anyhow::ensure!(
+            self.funding.enabled.get() && !self.funding.in_flight.get(),
+            "native funding capture is unavailable"
+        );
+        self.funding
+            .owner
+            .try_borrow()
+            .map_err(|_| anyhow::anyhow!("native funding owner is borrowed"))?
+            .checkpoint(self.account_id)
+    }
+}
+
 struct RegisteredHandlers {
     deltas_pattern: MStr<Pattern>,
     deltas_handler: TypedHandler<OrderBookDeltas>,
@@ -102,6 +145,8 @@ struct RegisteredHandlers {
     status_handler: ShareableMessageHandler,
     close_pattern: MStr<Pattern>,
     close_handler: ShareableMessageHandler,
+    funding_pattern: MStr<Pattern>,
+    funding_handler: TypedHandler<FundingRateUpdate>,
     position_pattern: MStr<Pattern>,
     position_handler: TypedHandler<PositionEvent>,
 }
@@ -134,6 +179,29 @@ impl SandboxExecutionClient {
             balances.insert(money.currency.code.to_string(), *money);
         }
 
+        let funding = Rc::new(SandboxFunding {
+            owner: RefCell::new(FundingOwner::new(
+                config.venue,
+                clock.clone(),
+                cache.clone(),
+                config.frozen_account,
+            )),
+            publisher: SandboxFundingPublisher {
+                factory: OrderEventFactory::new(
+                    core.trader_id,
+                    core.account_id,
+                    core.account_type,
+                    core.base_currency,
+                ),
+                venue: config.venue,
+                clock: clock.clone(),
+            },
+            initialized: Cell::new(false),
+            enabled: Cell::new(false),
+            active: Cell::new(false),
+            in_flight: Cell::new(false),
+            generation: Cell::new(0),
+        });
         let fill_model = config
             .fill_model
             .clone()
@@ -145,6 +213,7 @@ impl SandboxExecutionClient {
                 cache: cache.clone(),
                 config: config.clone(),
                 fill_model,
+                funding: funding.clone(),
                 matching_engines: AHashMap::new(),
                 next_engine_raw_id: 0,
                 balances,
@@ -238,7 +307,28 @@ impl SandboxExecutionClient {
                 .transpose()?;
             (account, orders, instrument)
         };
+
         if self.config.account_type == AccountType::Margin {
+            let has_funding = self
+                .cache
+                .borrow()
+                .positions(
+                    Some(&self.config.venue),
+                    None,
+                    None,
+                    Some(&account_id),
+                    None,
+                )
+                .iter()
+                .any(|position| {
+                    position.adjustments.iter().any(|adjustment| {
+                        adjustment.adjustment_type == PositionAdjustmentType::Funding
+                    })
+                });
+            anyhow::ensure!(
+                !has_funding || self.funding_checkpoint()?.is_some(),
+                "original funding checkpoint required for funded positions"
+            );
             anyhow::ensure!(
                 self.config.default_leverage == rust_decimal::Decimal::ONE
                     && self.config.leverages.is_empty()
@@ -264,6 +354,95 @@ impl SandboxExecutionClient {
             .collect();
         self.sync_cached_account_config()?;
         self.restored.set(true);
+        Ok(())
+    }
+
+    /// Enables native funding settlement before the client starts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an active, frozen, cash or before-funding-only profile.
+    pub fn enable_funding(&self) -> anyhow::Result<()> {
+        let funding = self.inner.borrow().funding.clone();
+        if funding.enabled.get() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !self.core.borrow().is_connected()
+                && self
+                    .cache
+                    .borrow()
+                    .account(&self.config.account_id)
+                    .is_none(),
+            "an existing native funded account requires its original checkpoint"
+        );
+        anyhow::ensure!(
+            !self.core.borrow().is_started()
+                && self.config.account_type == AccountType::Margin
+                && !self.config.frozen_account
+                && self.config.execution_deadline_ns.is_none()
+                && self.config.expected_funding_ns.is_none(),
+            "unsupported native funding profile"
+        );
+        self.inner.borrow().funding.enabled.set(true);
+        Ok(())
+    }
+
+    /// Queues an original native funding update on an explicitly enabled client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for disabled funding or conflicting original input.
+    pub fn process_funding_rate(&self, update: FundingRateUpdate) -> anyhow::Result<()> {
+        let funding = self.inner.borrow().funding.clone();
+        anyhow::ensure!(funding.enabled.get(), "native funding is disabled");
+        funding.owner.borrow_mut().queue_live(update)?;
+        SandboxFunding::schedule(&self.inner);
+        Ok(())
+    }
+
+    /// Captures the complete original native funding state at a coherent financial cut.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error while settlement or account application is unresolved.
+    pub fn funding_checkpoint(&self) -> anyhow::Result<Option<FundingCheckpoint>> {
+        self.funding_handle()
+            .map(|handle| handle.checkpoint())
+            .transpose()
+    }
+
+    /// Returns a read-only funding capture handle for an explicitly enabled client.
+    #[must_use]
+    pub fn funding_handle(&self) -> Option<SandboxFundingHandle> {
+        let funding = self.inner.borrow().funding.clone();
+        funding.enabled.get().then_some(SandboxFundingHandle {
+            funding,
+            account_id: self.config.account_id,
+        })
+    }
+
+    /// Restores funding against original cached native account and positions without arming work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an active client or a mismatched native financial cut.
+    pub fn restore_funding(&self, checkpoint: FundingCheckpoint) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.core.borrow().is_started()
+                && !self.core.borrow().is_connected()
+                && self.config.account_type == AccountType::Margin
+                && !self.config.frozen_account
+                && self.config.execution_deadline_ns.is_none()
+                && self.config.expected_funding_ns.is_none(),
+            "unsupported native funding restoration profile"
+        );
+        let funding = self.inner.borrow().funding.clone();
+        funding
+            .owner
+            .borrow_mut()
+            .restore(checkpoint, self.config.account_id)?;
+        funding.enabled.set(true);
         Ok(())
     }
 
@@ -360,6 +539,22 @@ impl SandboxExecutionClient {
             })
         };
 
+        let funding_handler = {
+            let inner = inner_weak.clone();
+            TypedHandler::from(move |update: &FundingRateUpdate| {
+                if update.instrument_id.venue == venue
+                    && let Some(inner) = inner.upgrade()
+                {
+                    let funding = inner.borrow().funding.clone();
+                    if funding.enabled.get() && funding.active.get() {
+                        if let Err(e) = funding.owner.borrow_mut().queue_live(*update) {
+                            log::error!("Native funding update rejected: {e}");
+                        }
+                        SandboxFunding::schedule(&inner);
+                    }
+                }
+            })
+        };
         let position_handler = {
             TypedHandler::from(move |event: &PositionEvent| {
                 let PositionEvent::PositionClosed(position_closed) = event else {
@@ -391,6 +586,7 @@ impl SandboxExecutionClient {
         let status_pattern: MStr<Pattern> = format!("data.status.{venue}.*").into();
         let close_pattern: MStr<Pattern> = format!("data.close.{venue}.*").into();
         let position_pattern: MStr<Pattern> = "events.position.*".into();
+        let funding_pattern: MStr<Pattern> = format!("data.funding_rates.{venue}.*").into();
 
         msgbus::subscribe_book_deltas(deltas_pattern, deltas_handler.clone(), Some(10));
         msgbus::subscribe_quotes(quote_pattern, quote_handler.clone(), Some(10));
@@ -399,6 +595,7 @@ impl SandboxExecutionClient {
         msgbus::subscribe_any(status_pattern, status_handler.clone(), Some(10));
         msgbus::subscribe_instrument_close(close_pattern, close_handler.clone(), Some(10));
         msgbus::subscribe_position_events(position_pattern, position_handler.clone(), Some(10));
+        msgbus::subscribe_funding_rates(funding_pattern, funding_handler.clone(), Some(10));
 
         *self.handlers.borrow_mut() = Some(RegisteredHandlers {
             deltas_pattern,
@@ -413,6 +610,8 @@ impl SandboxExecutionClient {
             status_handler,
             close_pattern,
             close_handler,
+            funding_pattern,
+            funding_handler,
             position_pattern,
             position_handler,
         });
@@ -431,6 +630,7 @@ impl SandboxExecutionClient {
             msgbus::unsubscribe_bars(handlers.bar_pattern, &handlers.bar_handler);
             msgbus::unsubscribe_any(handlers.status_pattern, &handlers.status_handler);
             msgbus::unsubscribe_instrument_close(handlers.close_pattern, &handlers.close_handler);
+            msgbus::unsubscribe_funding_rates(handlers.funding_pattern, &handlers.funding_handler);
             msgbus::unsubscribe_position_events(
                 handlers.position_pattern,
                 &handlers.position_handler,
@@ -525,6 +725,7 @@ impl SandboxExecutionClient {
     ///
     /// Returns an error if the instrument is not found in the cache.
     pub fn process_quote_tick(&self, quote: &QuoteTick) -> anyhow::Result<()> {
+        SandboxFunding::schedule(&self.inner);
         if !self
             .inner
             .borrow()
@@ -564,6 +765,15 @@ impl SandboxExecutionClient {
     ///
     /// Returns an error if the instrument is not found in the cache.
     pub fn process_trade_tick(&self, trade: &TradeTick) -> anyhow::Result<()> {
+        SandboxFunding::schedule(&self.inner);
+        if self.inner.borrow().funding.enabled.get()
+            && !self
+                .inner
+                .borrow()
+                .execution_open(trade.instrument_id, None)
+        {
+            return Ok(());
+        }
         SandboxInner::drain_inbound(&self.inner);
 
         if !self.config.trade_execution {
@@ -591,6 +801,15 @@ impl SandboxExecutionClient {
     ///
     /// Returns an error if the instrument is not found in the cache.
     pub fn process_bar(&self, bar: &Bar) -> anyhow::Result<()> {
+        SandboxFunding::schedule(&self.inner);
+        if self.inner.borrow().funding.enabled.get()
+            && !self
+                .inner
+                .borrow()
+                .execution_open(bar.bar_type.instrument_id(), None)
+        {
+            return Ok(());
+        }
         SandboxInner::drain_inbound(&self.inner);
 
         if !self.config.bar_execution {
@@ -618,6 +837,15 @@ impl SandboxExecutionClient {
     ///
     /// Returns an error if the instrument is not found in the cache.
     pub fn process_order_book_deltas(&self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
+        SandboxFunding::schedule(&self.inner);
+        if self.inner.borrow().funding.enabled.get()
+            && !self
+                .inner
+                .borrow()
+                .execution_open(deltas.instrument_id, None)
+        {
+            return Ok(());
+        }
         SandboxInner::drain_inbound(&self.inner);
 
         let instrument_id = deltas.instrument_id;
@@ -633,9 +861,19 @@ impl SandboxExecutionClient {
 
     /// Resets the sandbox to its initial state.
     pub fn reset(&self) {
+        if self.inner.borrow().funding.enabled.get() {
+            log::error!("Funded sandbox reset requires a new isolated account and owner");
+            return;
+        }
         self.restored.set(false);
         let mut inner = self.inner.borrow_mut();
         inner.minimum_quote_init = None;
+        inner.funding.owner.borrow_mut().reset();
+        inner.funding.in_flight.set(false);
+        inner
+            .funding
+            .generation
+            .set(inner.funding.generation.get().wrapping_add(1));
         for engine in inner.matching_engines.values_mut() {
             engine.reset();
         }
@@ -649,6 +887,9 @@ impl SandboxExecutionClient {
 
         inner.clear_inbound_queue();
         self.cancel_inbound_alert();
+        self.clock
+            .borrow_mut()
+            .cancel_timer(&funding_timer_name(self.config.account_id));
 
         log::info!(
             "Sandbox execution client reset: venue={}",
@@ -708,6 +949,10 @@ impl ExecutionClient for SandboxExecutionClient {
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.inner.borrow().funding.enabled.get(),
+            "cannot reset a retained native funding owner"
+        );
         Self::reset(self);
         Ok(())
     }
@@ -735,6 +980,13 @@ impl ExecutionClient for SandboxExecutionClient {
             return Ok(());
         }
 
+        let funding = self.inner.borrow().funding.clone();
+        anyhow::ensure!(
+            !funding.enabled.get() || try_get_exec_event_sender().is_some(),
+            "funding requires the native execution FIFO channel"
+        );
+        funding.active.set(true);
+
         if let Some(sender) = try_get_exec_event_sender() {
             let handler: Rc<dyn Fn(OrderEventAny)> = Rc::new(move |event: OrderEventAny| {
                 if let Err(e) = sender.send(ExecutionEvent::Order(event)) {
@@ -753,6 +1005,7 @@ impl ExecutionClient for SandboxExecutionClient {
         }
         self.register_message_handlers();
         self.register_expiry_sweep_timer();
+        SandboxFunding::schedule(&self.inner);
 
         self.core.borrow().set_started();
         let core = self.core.borrow();
@@ -771,6 +1024,16 @@ impl ExecutionClient for SandboxExecutionClient {
             return Ok(());
         }
 
+        let funding = self.inner.borrow().funding.clone();
+        funding.active.set(false);
+        funding
+            .generation
+            .set(funding.generation.get().wrapping_add(1));
+        funding.in_flight.set(false);
+        funding.owner.borrow_mut().cancel_barrier();
+        self.clock
+            .borrow_mut()
+            .cancel_timer(&funding_timer_name(self.config.account_id));
         self.deregister_message_handlers();
         self.cancel_expiry_sweep_timer();
         self.cancel_inbound_alert();
@@ -799,11 +1062,33 @@ impl ExecutionClient for SandboxExecutionClient {
             return Ok(());
         }
 
-        if !self.restored.get() {
+        let funding = self.inner.borrow().funding.clone();
+        let publish_initial =
+            !self.restored.get() && (!funding.enabled.get() || !funding.initialized.get());
+        if publish_initial {
+            if funding.enabled.get() {
+                anyhow::ensure!(
+                    self.cache
+                        .borrow()
+                        .account(&self.config.account_id)
+                        .is_none(),
+                    "native funded account already exists"
+                );
+                funding.initialized.set(true);
+            }
             let balances = self.get_account_balances();
             let ts_event = self.clock.borrow().timestamp_ns();
             self.generate_account_state(balances, vec![], false, ts_event, None)?;
         }
+        anyhow::ensure!(
+            !funding.enabled.get()
+                || self
+                    .cache
+                    .borrow()
+                    .account(&self.config.account_id)
+                    .is_some(),
+            "original native funding initialization unavailable"
+        );
 
         self.core.borrow().set_connected();
         log::info!(
@@ -912,7 +1197,7 @@ impl ExecutionClient for SandboxExecutionClient {
 
     fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
         let mut inner = self.inner.borrow_mut();
-        if inner.config.latency_model.is_none() {
+        if inner.config.latency_model.is_none() && !inner.funding.enabled.get() {
             inner.apply_cancel_order(&cmd);
         } else {
             inner.defer_or_apply(TradingCommand::CancelOrder(cmd));
@@ -922,7 +1207,7 @@ impl ExecutionClient for SandboxExecutionClient {
 
     fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
         let mut inner = self.inner.borrow_mut();
-        if inner.config.latency_model.is_none() {
+        if inner.config.latency_model.is_none() && !inner.funding.enabled.get() {
             inner.apply_cancel_all_orders(&cmd);
         } else {
             inner.defer_or_apply(TradingCommand::CancelAllOrders(cmd));
@@ -932,7 +1217,7 @@ impl ExecutionClient for SandboxExecutionClient {
 
     fn batch_cancel_orders(&self, cmd: BatchCancelOrders) -> anyhow::Result<()> {
         let mut inner = self.inner.borrow_mut();
-        if inner.config.latency_model.is_none() {
+        if inner.config.latency_model.is_none() && !inner.funding.enabled.get() {
             inner.apply_batch_cancel_orders(&cmd);
         } else {
             inner.defer_or_apply(TradingCommand::CancelOrders(cmd));
@@ -941,6 +1226,17 @@ impl ExecutionClient for SandboxExecutionClient {
     }
 
     fn query_account(&self, _cmd: QueryAccount) -> anyhow::Result<()> {
+        if self.inner.borrow().funding.enabled.get() {
+            let state = self
+                .get_account()
+                .and_then(|account| account.last_event())
+                .ok_or_else(|| anyhow::anyhow!("native funded account unavailable"))?;
+            msgbus::publish_account_state(
+                format!("events.account.{}", state.account_id).into(),
+                &state,
+            );
+            return Ok(());
+        }
         let balances = self.get_current_account_balances();
         let ts_event = self.clock.borrow().timestamp_ns();
         self.generate_account_state(balances, vec![], false, ts_event, None)?;
@@ -1000,12 +1296,173 @@ impl ExecutionClient for SandboxExecutionClient {
     }
 }
 
+struct SandboxFundingPublisher {
+    factory: OrderEventFactory,
+    venue: Venue,
+    clock: Rc<RefCell<dyn Clock>>,
+}
+
+impl FundingAccountPublisher for SandboxFundingPublisher {
+    fn account_id(&self) -> AccountId {
+        self.factory.account_id()
+    }
+    fn venue(&self) -> Venue {
+        self.venue
+    }
+    fn publish(
+        &self,
+        balances: Vec<AccountBalance>,
+        margins: Vec<MarginBalance>,
+        ts_event: UnixNanos,
+    ) -> anyhow::Result<()> {
+        let state = self.factory.generate_account_state(
+            balances,
+            margins,
+            true,
+            ts_event,
+            self.clock.borrow().timestamp_ns(),
+            None,
+        );
+        msgbus::send_account_state(MessagingSwitchboard::portfolio_update_account(), &state);
+        Ok(())
+    }
+}
+
+struct SandboxFunding {
+    owner: RefCell<FundingOwner>,
+    publisher: SandboxFundingPublisher,
+    initialized: Cell<bool>,
+    enabled: Cell<bool>,
+    active: Cell<bool>,
+    in_flight: Cell<bool>,
+    generation: Cell<u64>,
+}
+
+impl SandboxFunding {
+    fn schedule(inner: &Rc<RefCell<SandboxInner>>) {
+        let funding = inner.borrow().funding.clone();
+        if !funding.enabled.get() || !funding.active.get() || funding.in_flight.get() {
+            return;
+        }
+        let now = funding.publisher.clock.borrow().timestamp_ns();
+        let due = funding.owner.borrow_mut().seal_due(now);
+        if due.is_empty() {
+            Self::arm_next(inner);
+            return;
+        }
+        let cuts: Vec<_> = {
+            let this = inner.borrow();
+            let cache = this.cache.borrow();
+            due.into_iter()
+                .map(|(boundary, instrument)| {
+                    let price = cache
+                        .mark_price(&instrument)
+                        .copied()
+                        .map(FundingPriceCut::Mark)
+                        .or_else(|| {
+                            let engine = this.matching_engines.get(&instrument)?;
+                            Some(FundingPriceCut::Midpoint {
+                                bid: engine.best_bid_price()?,
+                                ask: engine.best_ask_price()?,
+                                observed_ns: now,
+                            })
+                        });
+                    (boundary, instrument, price)
+                })
+                .collect()
+        };
+        funding.in_flight.set(true);
+        let generation = funding.generation.get();
+        let weak = Rc::downgrade(inner);
+        let callback: Rc<dyn Fn(TimeEvent)> = Rc::new(move |_| {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            let funding = inner.borrow().funding.clone();
+            if !funding.active.get() || funding.generation.get() != generation {
+                return;
+            }
+
+            for (boundary, instrument, price) in &cuts {
+                let progress = funding.owner.borrow_mut().process_live(
+                    *instrument,
+                    *boundary,
+                    price.clone(),
+                    &funding.publisher,
+                );
+
+                if !matches!(progress, FundingProgress::Applied | FundingProgress::Empty) {
+                    break;
+                }
+            }
+            funding.in_flight.set(false);
+            Self::arm_next(&inner);
+        });
+        let event = TimeEvent::new(
+            funding_timer_name(funding.publisher.account_id()).into(),
+            UUID4::new(),
+            now,
+            now,
+        );
+        let message = ExecutionEvent::FundingBoundary(TimeEventMessage::new(
+            event,
+            TimeEventCallback::from(callback),
+        ));
+
+        if let Some(sender) = try_get_exec_event_sender()
+            && let Err(e) = sender.send(message)
+        {
+            log::error!("Native funding barrier unavailable: {e}");
+        }
+    }
+
+    fn arm_next(inner: &Rc<RefCell<SandboxInner>>) {
+        let funding = inner.borrow().funding.clone();
+        if !funding.active.get() || funding.in_flight.get() {
+            return;
+        }
+        let Some(next) = funding.owner.borrow().next_boundary() else {
+            return;
+        };
+        let now = funding.publisher.clock.borrow().timestamp_ns();
+        if next <= now {
+            return;
+        }
+        let clock = funding.publisher.clock.clone();
+        let name = funding_timer_name(funding.publisher.account_id());
+        if clock.borrow().next_time_ns(&name) == Some(next) {
+            return;
+        }
+        clock.borrow_mut().cancel_timer(&name);
+        let weak = Rc::downgrade(inner);
+        let callback: Rc<dyn Fn(TimeEvent)> = Rc::new(move |_| {
+            if let Some(inner) = weak.upgrade() {
+                Self::schedule(&inner);
+            }
+        });
+
+        if let Err(e) = clock.borrow_mut().set_time_alert_ns(
+            &name,
+            next,
+            Some(TimeEventCallback::from(callback)),
+            Some(true),
+        ) {
+            log::error!("Native funding timer unavailable: {e}");
+        }
+    }
+}
+
+fn funding_timer_name(account: AccountId) -> String {
+    format!("{account}-sandbox-funding")
+}
+
 // Wrapped in `Rc<RefCell<>>` so message handlers can hold weak references
 struct SandboxInner {
     clock: Rc<RefCell<dyn Clock>>,
     cache: Rc<RefCell<Cache>>,
     config: SandboxExecutionClientConfig,
     fill_model: FillModelHandle,
+    funding: Rc<SandboxFunding>,
     matching_engines: AHashMap<InstrumentId, OrderMatchingEngine>,
     next_engine_raw_id: u32,
     balances: AHashMap<String, Money>,
@@ -1058,6 +1515,20 @@ impl Eq for DelayedCommand {}
 
 impl SandboxInner {
     fn execution_open(&self, instrument: InstrumentId, event_ns: Option<UnixNanos>) -> bool {
+        if self.funding.enabled.get()
+            && (!self.funding.owner.try_borrow().is_ok_and(|owner| {
+                owner
+                    .next_boundary()
+                    .is_some_and(|boundary| event_ns.is_none_or(|event| event < boundary))
+            }) || !self.funding.active.get()
+                || self.funding.in_flight.get()
+                || self.funding.owner.try_borrow().map_or(true, |owner| {
+                    owner.blocks_execution(self.clock.borrow().timestamp_ns())
+                }))
+        {
+            return false;
+        }
+
         match (
             self.config.execution_deadline_ns,
             self.config.expected_funding_ns,
@@ -1150,6 +1621,10 @@ impl SandboxInner {
     }
 
     fn process_trade_tick(&mut self, trade: &TradeTick) {
+        if self.funding.enabled.get() && !self.execution_open(trade.instrument_id, None) {
+            return;
+        }
+
         if !self.config.trade_execution {
             return;
         }
@@ -1171,6 +1646,10 @@ impl SandboxInner {
     }
 
     fn process_bar(&mut self, bar: &Bar) {
+        if self.funding.enabled.get() && !self.execution_open(bar.bar_type.instrument_id(), None) {
+            return;
+        }
+
         if !self.config.bar_execution {
             return;
         }
@@ -1192,6 +1671,9 @@ impl SandboxInner {
     }
 
     fn process_order_book_deltas(&mut self, deltas: &OrderBookDeltas) {
+        if self.funding.enabled.get() && !self.execution_open(deltas.instrument_id, None) {
+            return;
+        }
         let instrument_id = deltas.instrument_id;
 
         let instrument = self.cache.borrow().instrument(&instrument_id).cloned();
@@ -1207,6 +1689,9 @@ impl SandboxInner {
     }
 
     fn process_instrument_status(&mut self, status: &InstrumentStatus) {
+        if self.funding.enabled.get() && !self.execution_open(status.instrument_id, None) {
+            return;
+        }
         let instrument_id = status.instrument_id;
 
         if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
@@ -1229,6 +1714,9 @@ impl SandboxInner {
     }
 
     fn process_instrument_close(&mut self, close: &InstrumentClose) {
+        if self.funding.enabled.get() && !self.execution_open(close.instrument_id, None) {
+            return;
+        }
         let instrument_id = close.instrument_id;
 
         // A delayed close belongs to an existing exposure lifecycle. Unlike an
@@ -1746,6 +2234,10 @@ impl SandboxInner {
     /// A zero-leg command is still queued behind a head already due, so the two apply in
     /// `(due_ns, seq)` order.
     fn defer_or_apply(&mut self, command: TradingCommand) {
+        if self.funding.enabled.get() && !self.execution_open(command.instrument_id(), None) {
+            self.reject_command(&command, "Native funding boundary is unresolved");
+            return;
+        }
         let now_ns = self.clock.borrow().timestamp_ns();
         let head_is_due = self
             .inbound_queue
@@ -1791,6 +2283,7 @@ impl SandboxInner {
     }
 
     fn on_quote_tick(inner: &Rc<RefCell<Self>>, quote: &QuoteTick) {
+        SandboxFunding::schedule(inner);
         if !inner
             .borrow()
             .execution_open(quote.instrument_id, Some(quote.ts_init.max(quote.ts_event)))
@@ -1810,26 +2303,31 @@ impl SandboxInner {
     }
 
     fn on_trade_tick(inner: &Rc<RefCell<Self>>, trade: &TradeTick) {
+        SandboxFunding::schedule(inner);
         Self::drain_inbound(inner);
         inner.borrow_mut().process_trade_tick(trade);
     }
 
     fn on_bar(inner: &Rc<RefCell<Self>>, bar: &Bar) {
+        SandboxFunding::schedule(inner);
         Self::drain_inbound(inner);
         inner.borrow_mut().process_bar(bar);
     }
 
     fn on_order_book_deltas(inner: &Rc<RefCell<Self>>, deltas: &OrderBookDeltas) {
+        SandboxFunding::schedule(inner);
         Self::drain_inbound(inner);
         inner.borrow_mut().process_order_book_deltas(deltas);
     }
 
     fn on_instrument_status(inner: &Rc<RefCell<Self>>, status: &InstrumentStatus) {
+        SandboxFunding::schedule(inner);
         Self::drain_inbound(inner);
         inner.borrow_mut().process_instrument_status(status);
     }
 
     fn on_instrument_close(inner: &Rc<RefCell<Self>>, close: &InstrumentClose) {
+        SandboxFunding::schedule(inner);
         Self::drain_inbound(inner);
         inner.borrow_mut().process_instrument_close(close);
     }
@@ -1841,12 +2339,24 @@ impl SandboxInner {
     /// before a tick is processed is applied before that tick, and by the alert when no data is
     /// flowing.
     fn drain_inbound(inner: &Rc<RefCell<Self>>) {
+        SandboxFunding::schedule(inner);
         // The alert fires on the runner task, where a nested msgbus dispatch may already hold the
         // borrow; the next data tick or public `process_*` call releases the queue instead.
         let Ok(mut this) = inner.try_borrow_mut() else {
             log::debug!("Skipping sandbox inbound drain due to active borrow");
             return;
         };
+
+        if this.funding.enabled.get()
+            && (this.funding.in_flight.get()
+                || this
+                    .funding
+                    .owner
+                    .borrow()
+                    .blocks_execution(this.clock.borrow().timestamp_ns()))
+        {
+            return;
+        }
 
         if this.config.latency_model.is_none() {
             return;
