@@ -55,7 +55,7 @@ pub use error::{
 use index::CacheIndex;
 use indexmap::IndexMap;
 use nautilus_core::{
-    DurationNanos, SharedCell, UnixNanos,
+    DurationNanos, SharedCell, UUID4, UnixNanos,
     correctness::{
         check_key_not_in_map, check_predicate_false, check_slice_not_empty,
         check_valid_string_ascii,
@@ -2187,6 +2187,14 @@ where
     intersect_filter_sources(sources)
 }
 
+#[derive(Clone, Debug)]
+struct PositionAccountApplication {
+    account: AccountId,
+    last_fill: Option<UUID4>,
+    last_adjustment: Option<UUID4>,
+    account_event: UUID4,
+}
+
 /// A common in-memory `Cache` for market and execution related data.
 #[cfg_attr(
     feature = "python",
@@ -2219,6 +2227,8 @@ pub struct Cache {
     orders: AHashMap<ClientOrderId, SharedCell<OrderAny>>,
     order_lists: AHashMap<OrderListId, OrderList>,
     positions: AHashMap<PositionId, SharedCell<Position>>,
+    position_account_applications: AHashMap<PositionId, PositionAccountApplication>,
+    order_account_applications: AHashMap<ClientOrderId, (AccountId, OrderEventAny, UUID4)>,
     position_snapshots: AHashMap<PositionId, Vec<PositionSnapshotFrame>>,
     position_snapshot_revisions: AHashMap<PositionId, u64>,
     #[cfg(feature = "defi")]
@@ -2321,6 +2331,8 @@ impl Cache {
             orders: AHashMap::new(),
             order_lists: AHashMap::new(),
             positions: AHashMap::new(),
+            position_account_applications: AHashMap::new(),
+            order_account_applications: AHashMap::new(),
             position_snapshots: AHashMap::new(),
             position_snapshot_revisions: AHashMap::new(),
             #[cfg(feature = "defi")]
@@ -2988,6 +3000,125 @@ impl Cache {
             .collect()
     }
 
+    /// Records actual native `Portfolio` account application for the current original order event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the exact order event or generated account state has not applied.
+    pub fn record_order_account_application(
+        &mut self,
+        event: &OrderEventAny,
+        state: &AccountState,
+    ) -> anyhow::Result<()> {
+        let order = self.try_order_owned(&event.client_order_id())?;
+        let account = self
+            .account_owned(&state.account_id)
+            .ok_or_else(|| anyhow::anyhow!("native order application account missing"))?;
+        anyhow::ensure!(
+            order.account_id() == Some(state.account_id)
+                && order.last_event() == event
+                && account.events().iter().any(|applied| applied == state),
+            "native post-order account state is not applied"
+        );
+        self.order_account_applications.insert(
+            order.client_order_id(),
+            (state.account_id, event.clone(), state.event_id),
+        );
+        Ok(())
+    }
+
+    /// Confirms the original current order event has an actual account application.
+    pub fn order_account_applied(&self, order: &OrderAny, previous: Option<&AccountAny>) -> bool {
+        self.order_account_applications
+            .get(&order.client_order_id())
+            .is_some_and(|(account, order_event, account_event)| {
+                order.account_id() == Some(*account)
+                    && order.last_event() == order_event
+                    && previous.is_none_or(|previous| {
+                        !previous
+                            .events()
+                            .iter()
+                            .any(|event| event.event_id == *account_event)
+                    })
+                    && self.account_owned(account).is_some_and(|account| {
+                        account
+                            .events()
+                            .iter()
+                            .any(|event| event.event_id == *account_event)
+                    })
+            })
+    }
+
+    /// Records the actual post-position native `Portfolio` account application.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the original position or already applied `AccountState` is absent.
+    pub fn record_position_account_application(
+        &mut self,
+        position_id: PositionId,
+        state: &AccountState,
+    ) -> anyhow::Result<()> {
+        let position = self
+            .position(&position_id)
+            .ok_or_else(|| anyhow::anyhow!("native application position missing"))?
+            .cloned();
+        let account = self
+            .account_owned(&state.account_id)
+            .ok_or_else(|| anyhow::anyhow!("native application account missing"))?;
+        anyhow::ensure!(
+            position.account_id == state.account_id
+                && account.events().iter().any(|event| event == state),
+            "native post-position account state is not applied"
+        );
+        self.position_account_applications.insert(
+            position_id,
+            PositionAccountApplication {
+                account: position.account_id,
+                last_fill: position.last_event().map(|fill| fill.event_id),
+                last_adjustment: position
+                    .adjustments
+                    .last()
+                    .map(|adjustment| adjustment.event_id),
+                account_event: state.event_id,
+            },
+        );
+        Ok(())
+    }
+
+    /// Confirms this exact native position has a coherent application newer than an optional prior cut.
+    pub fn position_account_applied(
+        &self,
+        position: &Position,
+        previous: Option<&AccountAny>,
+    ) -> bool {
+        self.position_account_applications
+            .get(&position.id)
+            .is_some_and(|applied| {
+                applied.account == position.account_id
+                    && applied.last_fill == position.last_event().map(|fill| fill.event_id)
+                    && applied.last_adjustment
+                        == position
+                            .adjustments
+                            .last()
+                            .map(|adjustment| adjustment.event_id)
+                    && previous.is_none_or(|previous| {
+                        !previous
+                            .events()
+                            .iter()
+                            .any(|event| event.event_id == applied.account_event)
+                    })
+                    && self
+                        .account_owned(&position.account_id)
+                        .is_some_and(|account| {
+                            account
+                                .events()
+                                .iter()
+                                .any(|event| event.event_id == applied.account_event)
+                        })
+            })
+    }
+
     // Calculate the unrealized profit and loss (PnL) for `position`.
     #[must_use]
     pub fn calculate_unrealized_pnl(&self, position: &Position) -> Option<Money> {
@@ -3583,6 +3714,7 @@ impl Cache {
 
         if order_details.is_some() {
             self.orders.remove(&client_order_id);
+            self.order_account_applications.remove(&client_order_id);
         } else {
             log::warn!("Order {client_order_id} not found when purging");
         }
@@ -3799,6 +3931,7 @@ impl Cache {
         // If position exists in cache, remove it and clean up position-specific indices
         if let Some(ref pos) = position {
             self.positions.remove(&position_id);
+            self.position_account_applications.remove(&position_id);
 
             // Remove from venue positions index
             if let Some(venue_positions) =
@@ -4063,6 +4196,8 @@ impl Cache {
         self.orders.clear();
         self.order_lists.clear();
         self.positions.clear();
+        self.position_account_applications.clear();
+        self.order_account_applications.clear();
         self.position_snapshots.clear();
         self.position_snapshot_revisions.clear();
         self.greeks.clear();

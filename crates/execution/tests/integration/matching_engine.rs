@@ -27,6 +27,8 @@ use nautilus_common::{
 };
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_execution::{
+    engine::ExecutionEngine,
+    maintenance::{MaintenanceOutcome, MaintenanceOwner},
     matching_engine::{OrderMatchingEngine, config::OrderMatchingEngineConfig},
     models::{
         fee::{CappedOptionFeeModel, FeeModelAny, FixedFeeModel},
@@ -34,6 +36,7 @@ use nautilus_execution::{
     },
 };
 use nautilus_model::{
+    accounts::{Account, AccountAny, MarginAccount},
     data::{
         Bar, BarType, BookOrder, DEPTH10_LEN, IndexPriceUpdate, InstrumentClose, OptionGreeks,
         OrderBookDelta, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
@@ -46,7 +49,8 @@ use nautilus_model::{
         TriggerType,
     },
     events::{
-        OrderEmulated, OrderEventAny, OrderEventType, OrderFilled, OrderRejected, OrderReleased,
+        AccountState, OrderAccepted, OrderEmulated, OrderEventAny, OrderEventType, OrderFilled,
+        OrderRejected, OrderReleased, OrderSubmitted,
         order::spec::{OrderEmulatedSpec, OrderFilledSpec, OrderRejectedSpec, OrderReleasedSpec},
     },
     identifiers::{
@@ -65,7 +69,7 @@ use nautilus_model::{
     },
     position::Position,
     stubs::TestDefault,
-    types::{Currency, Money, Price, Quantity},
+    types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity, price::PRICE_UNDEF},
 };
 use rstest::{fixture, rstest};
 use rust_decimal_macros::dec;
@@ -17718,4 +17722,502 @@ impl FillModel for SyntheticLimitFillModel {
     ) -> anyhow::Result<Option<OrderBook>> {
         Ok(Some(self.book.clone()))
     }
+}
+
+#[rstest]
+#[case(false)]
+#[case(true)]
+fn maintenance_zero_fill_ioc_cancels_original_and_retains_native_no_execution(
+    #[case] headroom: bool,
+) {
+    let quantity = Quantity::from(if headroom { "0.257" } else { "0.010" });
+    let balance = Money::from(if headroom {
+        "9999.48600000 USDT"
+    } else {
+        "9.98000000 USDT"
+    });
+    let maintenance = Money::from(if headroom {
+        "102.80000000 USDT"
+    } else {
+        "4.00000000 USDT"
+    });
+    let free = balance.checked_sub(maintenance).unwrap();
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+    let account_id = AccountId::from("BINANCE-001");
+    let position_id = PositionId::from("MAINTENANCE-ZERO-FILL");
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    let now = UnixNanos::from(1_700_000_000_000_000_000_u64);
+    clock.borrow_mut().set_time(now);
+    let original_account = AccountAny::Margin(MarginAccount::new(
+        AccountState::new(
+            account_id,
+            AccountType::Margin,
+            vec![AccountBalance::new(balance, maintenance, free)],
+            vec![MarginBalance::new(
+                Money::zero(Currency::USDT()),
+                maintenance,
+                Some(instrument.id()),
+            )],
+            false,
+            UUID4::new(),
+            now,
+            now,
+            Some(Currency::USDT()),
+        ),
+        true,
+    ));
+    cache
+        .borrow_mut()
+        .add_account(original_account.clone())
+        .unwrap();
+    cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    let opening = OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(TraderId::from("TESTER-001"))
+        .strategy_id(StrategyId::from("S-001"))
+        .instrument_id(instrument.id())
+        .side(OrderSide::Sell)
+        .quantity(quantity)
+        .price(Price::from("4000.00"))
+        .client_order_id(ClientOrderId::from("MAINTENANCE-ZERO-OPEN"))
+        .build();
+    let fill = build_order_filled(
+        opening.trader_id(),
+        opening.strategy_id(),
+        instrument.id(),
+        opening.client_order_id(),
+        VenueOrderId::from("BINANCE-1-1"),
+        account_id,
+        TradeId::from("MAINTENANCE-ZERO-OPEN-FILL"),
+        OrderSide::Sell,
+        OrderType::Limit,
+        quantity,
+        Price::from("4000.00"),
+        Currency::USDT(),
+        LiquiditySide::Taker,
+        Some(position_id),
+        Some(Money::from(if headroom {
+            "0.51400000 USDT"
+        } else {
+            "0.02000000 USDT"
+        })),
+    );
+    cache
+        .borrow_mut()
+        .add_order(opening.clone(), Some(position_id), None, false)
+        .unwrap();
+    let execution = Rc::new(RefCell::new(ExecutionEngine::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    execution
+        .borrow_mut()
+        .process(&OrderEventAny::Submitted(OrderSubmitted::new(
+            opening.trader_id(),
+            opening.strategy_id(),
+            instrument.id(),
+            opening.client_order_id(),
+            account_id,
+            UUID4::new(),
+            now,
+            now,
+        )));
+    execution
+        .borrow_mut()
+        .process(&OrderEventAny::Accepted(OrderAccepted::new(
+            opening.trader_id(),
+            opening.strategy_id(),
+            instrument.id(),
+            opening.client_order_id(),
+            VenueOrderId::from("BINANCE-1-1"),
+            account_id,
+            UUID4::new(),
+            now,
+            now,
+            false,
+        )));
+    execution.borrow_mut().process(&OrderEventAny::Filled(fill));
+    let position = cache.borrow().position(&position_id).unwrap().cloned();
+    assert_eq!(position.quantity, quantity);
+    assert_eq!(
+        cache
+            .borrow()
+            .orders(None, None, None, Some(&account_id), None)
+            .len(),
+        1
+    );
+    let mut matcher = get_order_matching_engine(
+        instrument.clone(),
+        Some(clock),
+        Some(cache.clone()),
+        Some(AccountType::Margin),
+        Some(OrderMatchingEngineConfig {
+            price_protection_points: Some(1),
+            ..Default::default()
+        }),
+    );
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let retained = events.clone();
+    matcher.set_event_handler(Rc::new(move |event| {
+        execution.borrow_mut().process(&event);
+        retained.borrow_mut().push(event);
+    }));
+    let quote = QuoteTick::new(
+        instrument.id(),
+        Price::from(if headroom { "49999.99" } else { "4597.99" }),
+        Price::from(if headroom { "50000.00" } else { "4598.00" }),
+        Quantity::from("0.100"),
+        Quantity::from("0.100"),
+        now,
+        now,
+    );
+    cache.borrow_mut().add_quote(quote).unwrap();
+    matcher.process_quote_tick(&quote);
+    assert_eq!(
+        matcher.get_core().ask,
+        Some(quote.ask_price),
+        "installed book lacks native matching-core prerequisite"
+    );
+    let mut protected_book = OrderBook::new(instrument.id(), BookType::L1_MBP);
+    protected_book.add(
+        BookOrder::new(
+            OrderSide::Sell,
+            Price::from("6000.00"),
+            Quantity::from("0.100"),
+            1,
+        ),
+        0,
+        1,
+        now,
+    );
+
+    if !headroom {
+        let mut query = MaintenanceOwner::new(account_id, cache.clone(), dec!(1), 2).unwrap();
+        query.observe_quote(quote).unwrap();
+        let before = serde_json::to_value(query.checkpoint()).unwrap();
+        assert_eq!(
+            query.threshold(&instrument).unwrap().unwrap().price,
+            Some(Price::from("4598.00"))
+        );
+        let InstrumentAny::CryptoPerpetual(mut bounded) = instrument.clone() else {
+            panic!("linear perpetual required")
+        };
+        bounded.min_price = Some(Price::from("4598.01"));
+        assert_eq!(
+            query
+                .threshold(&InstrumentAny::CryptoPerpetual(bounded.clone()))
+                .unwrap()
+                .unwrap()
+                .price,
+            Some(Price::from("4598.01"))
+        );
+        bounded.min_price = Some(Price::from("1.00"));
+        bounded.max_price = Some(Price::from("4597.99"));
+        assert!(
+            query
+                .threshold(&InstrumentAny::CryptoPerpetual(bounded.clone()))
+                .unwrap()
+                .unwrap()
+                .price
+                .is_none()
+        );
+        bounded.max_price = Some(Price::from("4598.00"));
+        assert_eq!(
+            query
+                .threshold(&InstrumentAny::CryptoPerpetual(bounded.clone()))
+                .unwrap()
+                .unwrap()
+                .price,
+            Some(Price::from("4598.00"))
+        );
+        bounded.min_price = Some(Price::from("4597.991"));
+        bounded.max_price = Some(Price::from("4597.999"));
+        assert!(
+            query
+                .threshold(&InstrumentAny::CryptoPerpetual(bounded.clone()))
+                .unwrap_err()
+                .to_string()
+                .contains("empty native threshold domain")
+        );
+        bounded.min_price = Some(Price::from("1.00"));
+        bounded.max_price = Some(Price::from("15000.00"));
+        bounded.price_increment = Price::from_raw(PRICE_UNDEF, 0);
+        assert!(
+            query
+                .threshold(&InstrumentAny::CryptoPerpetual(bounded.clone()))
+                .is_err()
+        );
+        bounded.price_increment = Price::from("0.01");
+        bounded.is_inverse = true;
+        assert!(
+            query
+                .threshold(&InstrumentAny::CryptoPerpetual(bounded.clone()))
+                .unwrap_err()
+                .to_string()
+                .contains("inverse threshold")
+        );
+        bounded.is_inverse = false;
+        bounded.min_price = Some(Price::from("-1.00"));
+        assert!(
+            query
+                .threshold(&InstrumentAny::CryptoPerpetual(bounded))
+                .unwrap_err()
+                .to_string()
+                .contains("domain")
+        );
+        let mut overflow =
+            MaintenanceOwner::new(account_id, cache.clone(), rust_decimal::Decimal::MAX, 2)
+                .unwrap();
+        overflow.observe_quote(quote).unwrap();
+        assert!(
+            overflow
+                .threshold(&instrument)
+                .unwrap_err()
+                .to_string()
+                .contains("threshold overflow")
+        );
+        assert_eq!(serde_json::to_value(query.checkpoint()).unwrap(), before);
+    }
+    matcher.set_fill_model(FillModelHandle::new(SyntheticLimitFillModel {
+        book: protected_book,
+    }));
+    let mut owner = MaintenanceOwner::new(account_id, cache.clone(), dec!(1), 2).unwrap();
+    owner.observe_quote(quote).unwrap();
+    if headroom {
+        let before = serde_json::to_value(owner.checkpoint()).unwrap();
+        let counters = serde_json::to_value(matcher.ids_checkpoint()).unwrap();
+        assert!(
+            owner
+                .process(now, Currency::USDT(), true, [&mut matcher])
+                .unwrap_err()
+                .to_string()
+                .contains("fill headroom")
+        );
+        assert_eq!(serde_json::to_value(owner.checkpoint()).unwrap(), before);
+        assert_eq!(
+            serde_json::to_value(matcher.ids_checkpoint()).unwrap(),
+            counters
+        );
+        assert!(events.borrow().is_empty());
+        assert_eq!(
+            cache
+                .borrow()
+                .orders(None, None, None, Some(&account_id), None)
+                .len(),
+            1
+        );
+        assert_eq!(
+            serde_json::to_value(cache.borrow().position(&position_id).unwrap().cloned()).unwrap(),
+            serde_json::to_value(position).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(cache.borrow().account_owned(&account_id).unwrap()).unwrap(),
+            serde_json::to_value(original_account).unwrap()
+        );
+        return;
+    }
+    assert!(
+        owner
+            .process(now, Currency::USDT(), true, [&mut matcher])
+            .unwrap()
+    );
+    eprintln!(
+        "native_no_fill_census {}",
+        serde_json::json!({
+            "submitted":events.borrow().iter().filter(|e| matches!(e, OrderEventAny::Submitted(_))).count(),
+            "accepted":events.borrow().iter().filter(|e| matches!(e, OrderEventAny::Accepted(_))).count(),
+            "filled":events.borrow().iter().filter(|e| matches!(e, OrderEventAny::Filled(_))).count(),
+            "canceled":events.borrow().iter().filter(|e| matches!(e, OrderEventAny::Canceled(_))).count(),
+            "book_ask":matcher.best_ask_price(),"core_ask":matcher.get_core().ask,
+        })
+    );
+    owner.complete().unwrap();
+    let checkpoint = owner.checkpoint();
+    assert_eq!(checkpoint.receipts().len(), 1);
+    let receipt = &checkpoint.receipts()[0];
+    assert_eq!(receipt.outcome, MaintenanceOutcome::NoExecution);
+    assert_eq!(receipt.orders.len(), 1);
+    let close = &receipt.orders[0];
+    assert_eq!(close.order_type(), OrderType::Market);
+    assert_eq!(close.time_in_force(), TimeInForce::Ioc);
+    assert_eq!(close.status(), OrderStatus::Canceled);
+    assert_eq!(close.filled_qty(), Quantity::from("0.000"));
+    assert!(close.is_reduce_only());
+    assert_eq!(
+        cache.borrow().position_id(&close.client_order_id()),
+        Some(&position_id)
+    );
+    assert_eq!(
+        serde_json::to_value(&receipt.account).unwrap(),
+        serde_json::to_value(original_account).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&receipt.positions).unwrap(),
+        serde_json::to_value(vec![position]).unwrap()
+    );
+    let events = events.borrow();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, OrderEventAny::Accepted(_)))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, OrderEventAny::Canceled(_)))
+    );
+    assert!(!events.iter().any(|e| matches!(e, OrderEventAny::Filled(_))));
+    assert_eq!(
+        cache
+            .borrow()
+            .orders(None, None, None, Some(&account_id), None)
+            .len(),
+        2
+    );
+    assert_eq!(
+        receipt.account.balance_total(Some(Currency::USDT())),
+        Some(Money::from("9.98000000 USDT"))
+    );
+    assert!(
+        owner
+            .process(now, Currency::USDT(), true, [&mut matcher])
+            .is_err()
+    );
+    assert_eq!(
+        cache
+            .borrow()
+            .orders(None, None, None, Some(&account_id), None)
+            .len(),
+        2
+    );
+}
+
+#[rstest]
+fn maintenance_threshold_preserves_native_money_plateaus_and_refuses_multiple_positions() {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let mut perpetual = crypto_perpetual_ethusdt();
+    perpetual.size_precision = 9;
+    perpetual.size_increment = Quantity::from("0.000000001");
+    perpetual.min_price = Some(Price::from("0.01"));
+    perpetual.max_price = Some(Price::from("20.00"));
+    let instrument = InstrumentAny::CryptoPerpetual(perpetual);
+    let account_id = AccountId::from("BINANCE-001");
+    let now = UnixNanos::from(1_700_000_000_000_000_000_u64);
+    let account = AccountAny::Margin(MarginAccount::new(
+        AccountState::new(
+            account_id,
+            AccountType::Margin,
+            vec![AccountBalance::new(
+                Money::from("1.00000001 USDT"),
+                Money::from("1.00000000 USDT"),
+                Money::from("0.00000001 USDT"),
+            )],
+            vec![MarginBalance::new(
+                Money::zero(Currency::USDT()),
+                Money::from("1.00000000 USDT"),
+                Some(instrument.id()),
+            )],
+            false,
+            UUID4::new(),
+            now,
+            now,
+            Some(Currency::USDT()),
+        ),
+        true,
+    ));
+    cache.borrow_mut().add_account(account).unwrap();
+    cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    let first_fill = build_order_filled(
+        TraderId::from("TESTER-001"),
+        StrategyId::from("S-001"),
+        instrument.id(),
+        ClientOrderId::from("PLATEAU-OPEN"),
+        VenueOrderId::from("PLATEAU-1"),
+        account_id,
+        TradeId::from("PLATEAU-FILL-1"),
+        OrderSide::Sell,
+        OrderType::Limit,
+        Quantity::from("0.000000001"),
+        Price::from("0.01"),
+        Currency::USDT(),
+        LiquiditySide::Taker,
+        Some(PositionId::from("PLATEAU-1")),
+        Some(Money::zero(Currency::USDT())),
+    );
+    let position = Position::new(&instrument, first_fill);
+    cache
+        .borrow_mut()
+        .add_position_without_order(&position, OmsType::Netting)
+        .unwrap();
+    let quote = QuoteTick::new(
+        instrument.id(),
+        Price::from("4.99"),
+        Price::from("5.00"),
+        Quantity::from("0.000000001"),
+        Quantity::from("0.000000001"),
+        now,
+        now,
+    );
+    cache.borrow_mut().add_quote(quote).unwrap();
+    let mut owner = MaintenanceOwner::new(account_id, cache.clone(), dec!(1), 2).unwrap();
+    owner.observe_quote(quote).unwrap();
+    let before = serde_json::to_value(owner.checkpoint()).unwrap();
+    assert_eq!(
+        position.try_unrealized_pnl(Price::from("4.99")).unwrap(),
+        Money::zero(Currency::USDT())
+    );
+    assert_eq!(
+        position.try_unrealized_pnl(Price::from("5.00")).unwrap(),
+        Money::zero(Currency::USDT())
+    );
+    assert_eq!(
+        position.try_unrealized_pnl(Price::from("5.01")).unwrap(),
+        Money::from("-0.00000001 USDT")
+    );
+    assert_eq!(
+        position.try_unrealized_pnl(Price::from("5.02")).unwrap(),
+        Money::from("-0.00000001 USDT")
+    );
+    assert_eq!(
+        owner.threshold(&instrument).unwrap().unwrap().price,
+        Some(Price::from("5.01"))
+    );
+    assert_eq!(serde_json::to_value(owner.checkpoint()).unwrap(), before);
+    let second_fill = build_order_filled(
+        TraderId::from("TESTER-001"),
+        StrategyId::from("S-002"),
+        instrument.id(),
+        ClientOrderId::from("PLATEAU-OTHER"),
+        VenueOrderId::from("PLATEAU-2"),
+        account_id,
+        TradeId::from("PLATEAU-FILL-2"),
+        OrderSide::Sell,
+        OrderType::Limit,
+        Quantity::from("0.000000001"),
+        Price::from("0.01"),
+        Currency::USDT(),
+        LiquiditySide::Taker,
+        Some(PositionId::from("PLATEAU-2")),
+        Some(Money::zero(Currency::USDT())),
+    );
+    cache
+        .borrow_mut()
+        .add_position_without_order(&Position::new(&instrument, second_fill), OmsType::Netting)
+        .unwrap();
+    let mut multiple = MaintenanceOwner::new(account_id, cache, dec!(1), 2).unwrap();
+    multiple.observe_quote(quote).unwrap();
+    assert!(
+        multiple
+            .threshold(&instrument)
+            .unwrap_err()
+            .to_string()
+            .contains("one native position")
+    );
 }

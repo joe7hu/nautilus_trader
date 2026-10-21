@@ -21,15 +21,76 @@ use nautilus_common::cache::{Cache, VenueOrderIdOwnershipError};
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     enums::OmsType,
-    identifiers::{PositionId, TradeId, Venue, VenueOrderId},
+    identifiers::{
+        AccountId, ClientOrderId, InstrumentId, PositionId, TradeId, Venue, VenueOrderId,
+    },
     orders::{Order, OrderAny},
 };
+use serde::{Deserialize, Serialize};
 
 // FNV-1a 64-bit constants (see http://www.isthe.com/chongo/tech/comp/fnv/).
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0100_0000_01b3;
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 const TRADE_ID_COUNTER_START: usize = 19;
+
+/// Original native identifier state for deterministic same-engine continuation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdsCheckpoint {
+    venue: Venue,
+    raw_id: u32,
+    oms_type: OmsType,
+    use_random_ids: bool,
+    use_position_ids: bool,
+    position_count: usize,
+    order_count: usize,
+    execution_count: usize,
+}
+
+impl IdsCheckpoint {
+    /// Validates original deterministic venue allocations against their complete order history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if original generator counters or venue IDs are incomplete or altered.
+    pub fn validate_history(&self, orders: &[OrderAny]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.use_random_ids && self.oms_type == OmsType::Netting && self.position_count == 0,
+            "original native generator profile mismatch"
+        );
+        let prefix = format!("{}-{}-", self.venue, self.raw_id);
+        let mut allocations = Vec::new();
+
+        for order in orders {
+            let id = order
+                .venue_order_id()
+                .ok_or_else(|| anyhow::anyhow!("original native venue allocation missing"))?;
+            let index = id
+                .as_str()
+                .strip_prefix(&prefix)
+                .ok_or_else(|| anyhow::anyhow!("foreign original native venue allocation"))?
+                .parse::<usize>()?;
+            anyhow::ensure!(
+                index > 0 && index <= self.order_count,
+                "original native venue allocation exceeds counter"
+            );
+            allocations.push(index);
+        }
+        allocations.sort_unstable();
+        allocations.dedup();
+        anyhow::ensure!(
+            allocations.len() == orders.len()
+                && allocations.last().copied().unwrap_or(0) == self.order_count,
+            "original native generator history mismatch"
+        );
+        Ok(())
+    }
+
+    /// Returns the original number of native trade identities allocated.
+    pub fn execution_count(&self) -> usize {
+        self.execution_count
+    }
+}
 
 /// Generates venue order, position, and trade identifiers.
 pub struct IdsGenerator {
@@ -74,6 +135,63 @@ impl IdsGenerator {
             order_count: 0,
             execution_count: 0,
         }
+    }
+
+    /// Returns the exact original native generator state without allocating an ID.
+    pub fn checkpoint(&self) -> IdsCheckpoint {
+        IdsCheckpoint {
+            venue: self.venue,
+            raw_id: self.raw_id,
+            oms_type: self.oms_type,
+            use_random_ids: self.use_random_ids,
+            use_position_ids: self.use_position_ids,
+            position_count: self.position_count,
+            order_count: self.order_count,
+            execution_count: self.execution_count,
+        }
+    }
+
+    /// Restores original counters into the same empty native generator profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a changed generator identity/profile or a nonempty destination.
+    pub fn restore(&mut self, original: &IdsCheckpoint) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.position_count == 0
+                && self.order_count == 0
+                && self.execution_count == 0
+                && self.venue == original.venue
+                && self.raw_id == original.raw_id
+                && self.oms_type == original.oms_type
+                && self.use_random_ids == original.use_random_ids
+                && self.use_position_ids == original.use_position_ids,
+            "native ID generator restoration mismatch"
+        );
+        self.position_count = original.position_count;
+        self.order_count = original.order_count;
+        self.execution_count = original.execution_count;
+        Ok(())
+    }
+
+    pub(super) fn liquidation_client_order_id(
+        &self,
+        account: AccountId,
+        instrument: InstrumentId,
+    ) -> anyhow::Result<ClientOrderId> {
+        let suffix = if self.use_random_ids {
+            UUID4::new().to_string()
+        } else {
+            self.order_count
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("native liquidation counter exhausted"))?
+                .to_string()
+        };
+        ClientOrderId::new_checked(format!(
+            "LIQUIDATION-{}-{}-{account}-{instrument}-{suffix}",
+            self.venue, self.raw_id
+        ))
+        .map_err(Into::into)
     }
 
     pub fn restore_execution_count(&mut self, execution_count: usize) {
@@ -306,7 +424,7 @@ mod tests {
         enums::{OmsType, OrderSide, OrderType},
         events::{OrderFilled, order::spec::OrderFilledSpec},
         identifiers::{
-            AccountId, ClientOrderId, PositionId, StrategyId, Venue, VenueOrderId,
+            AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, Venue, VenueOrderId,
             stubs::account_id,
         },
         instruments::{
@@ -569,11 +687,11 @@ mod tests {
         let mut ids_generator = get_ids_generator(Rc::clone(&cache), true, OmsType::Netting);
         ids_generator.order_count = usize::MAX;
 
-        let error = ids_generator
+        let e = ids_generator
             .get_venue_order_id(&market_order_buy)
             .unwrap_err();
 
-        assert!(error.to_string().contains("counter exhausted"));
+        assert!(e.to_string().contains("counter exhausted"));
         assert_eq!(
             cache
                 .borrow()
@@ -650,6 +768,39 @@ mod tests {
             first, second,
             "same ts_init and reset execution_count must reproduce the same id"
         );
+    }
+
+    #[rstest]
+    fn original_counter_checkpoint_continues_fixed_clock_ids_after_two_closes() {
+        let mut uninterrupted = build_ids_generator(Venue::from("BINANCE"), 0);
+        let clock = UnixNanos::from(1_700_000_000_000_000_000_u64);
+
+        for _ in 0..3 {
+            uninterrupted.generate_venue_order_id();
+            uninterrupted.generate_trade_id(clock);
+        }
+        let original = uninterrupted.checkpoint();
+        let mut restored = build_ids_generator(Venue::from("BINANCE"), 0);
+        restored.restore(&original).unwrap();
+        let account = AccountId::from("BINANCE-001");
+        let instrument = InstrumentId::from("ETHUSDT-PERP.BINANCE");
+        assert_eq!(
+            restored
+                .liquidation_client_order_id(account, instrument)
+                .unwrap(),
+            uninterrupted
+                .liquidation_client_order_id(account, instrument)
+                .unwrap()
+        );
+        assert_eq!(
+            restored.generate_venue_order_id(),
+            uninterrupted.generate_venue_order_id()
+        );
+        assert_eq!(
+            restored.generate_trade_id(clock),
+            uninterrupted.generate_trade_id(clock)
+        );
+        assert_eq!(restored.checkpoint(), uninterrupted.checkpoint());
     }
 
     #[rstest]
