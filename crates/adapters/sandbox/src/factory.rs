@@ -24,10 +24,16 @@ use nautilus_common::{
     factories::{ClientConfig, SimulatedExecutionClientFactory},
     live::clock::LiveClock,
 };
-use nautilus_execution::client::core::ExecutionClientCore;
-use nautilus_model::identifiers::{ClientId, TraderId};
+use nautilus_execution::{client::core::ExecutionClientCore, funding::FundingCheckpoint};
+use nautilus_model::{
+    enums::BookType,
+    identifiers::{ClientId, TraderId},
+};
 
-use crate::{config::SandboxExecutionClientConfig, execution::SandboxExecutionClient};
+use crate::{
+    config::SandboxExecutionClientConfig,
+    execution::{SandboxExecutionClient, SandboxFundingHandle},
+};
 
 impl ClientConfig for SandboxExecutionClientConfig {
     fn as_any(&self) -> &dyn Any {
@@ -60,6 +66,56 @@ impl SandboxExecutionClientFactory {
 }
 
 impl SandboxExecutionClientFactory {
+    /// Creates an opt-in funded quote-only client and its read-only native capture handle.
+    ///
+    /// An original checkpoint restores the same native account without startup funding.
+    /// Starting or connecting the returned client remains a separate owner operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsupported profile or a mismatched original financial cut.
+    pub fn create_funded_quote_only(
+        &self,
+        trader_id: TraderId,
+        name: &str,
+        config: &SandboxExecutionClientConfig,
+        cache: Rc<RefCell<Cache>>,
+        checkpoint: Option<FundingCheckpoint>,
+    ) -> anyhow::Result<(Box<dyn ExecutionClient>, SandboxFundingHandle)> {
+        anyhow::ensure!(
+            config.book_type == BookType::L1_MBP
+                && !config.bar_execution
+                && !config.trade_execution
+                && !config.queue_position
+                && !config.liquidity_consumption
+                && config.latency_model.is_none()
+                && config.fill_model.is_none(),
+            "unsupported funded quote-only profile"
+        );
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(LiveClock::default()));
+        let core = ExecutionClientCore::new(
+            trader_id,
+            ClientId::from(name),
+            config.venue,
+            config.oms_type,
+            config.account_id,
+            config.account_type,
+            config.base_currency,
+            cache.clone(),
+        );
+        let mut client = SandboxExecutionClient::new(core, config.clone(), clock, cache);
+        if let Some(checkpoint) = checkpoint {
+            client.restore_funding(checkpoint)?;
+            client.restore_quote_only()?;
+        } else {
+            client.enable_funding()?;
+        }
+        let handle = client
+            .funding_handle()
+            .ok_or_else(|| anyhow::anyhow!("native funding capture unavailable"))?;
+        Ok((Box::new(client), handle))
+    }
+
     /// Creates a sandbox client using its original quote-only account state.
     ///
     /// # Errors

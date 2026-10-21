@@ -2518,7 +2518,7 @@ impl LiveNode {
                     close_ids.push(client_order_id);
                 }
             }
-            ExecutionEvent::Account(_) => {}
+            ExecutionEvent::Account(_) | ExecutionEvent::FundingBoundary(_) => {}
         }
 
         Some(close_ids)
@@ -3021,6 +3021,13 @@ fn flush_all_pending(
 
     while let Ok(evt) = exec_evt_rx.try_recv() {
         match evt {
+            ExecutionEvent::FundingBoundary(message) => {
+                pending.funding_barriers.push((
+                    pending.exec_reports.len(),
+                    pending.order_evts.len(),
+                    message,
+                ));
+            }
             ExecutionEvent::Account(_) => {
                 AsyncRunner::handle_exec_event(evt);
             }
@@ -3097,7 +3104,10 @@ async fn drive_with_event_buffering<F: std::future::Future>(
                 // Order events need ExecEngine borrow_mut which may conflict
                 // with the borrow held by the driven future.
                 match evt {
-                    ExecutionEvent::Account(_) => {
+                    ExecutionEvent::FundingBoundary(message) => {
+                pending.funding_barriers.push((pending.exec_reports.len(), pending.order_evts.len(), message));
+            }
+            ExecutionEvent::Account(_) => {
                         AsyncRunner::handle_exec_event(evt);
                     }
                     ExecutionEvent::Report(report) => {
@@ -3142,6 +3152,7 @@ struct PendingEvents {
     system_commands: Vec<SystemCommand>,
     data_evts: Vec<DataEvent>,
     data_cmds: Vec<DataCommand>,
+    funding_barriers: Vec<(usize, usize, TimeEventMessage)>,
     exec_reports: Vec<ExecutionReport>,
     order_evts: Vec<OrderEventAny>,
     exec_cmds: Vec<TradingCommandMessage>,
@@ -3153,6 +3164,7 @@ impl PendingEvents {
             && self.system_commands.is_empty()
             && self.data_evts.is_empty()
             && self.data_cmds.is_empty()
+            && self.funding_barriers.is_empty()
             && self.exec_reports.is_empty()
             && self.order_evts.is_empty()
             && self.exec_cmds.is_empty()
@@ -3212,12 +3224,29 @@ impl PendingEvents {
             AsyncRunner::handle_data_command(cmd);
         }
 
-        for report in self.exec_reports.drain(..) {
+        let mut reports = self.exec_reports.drain(..).enumerate().peekable();
+        let mut orders = self.order_evts.drain(..).enumerate().peekable();
+        for (report_cut, order_cut, message) in self.funding_barriers.drain(..) {
+            while reports.peek().is_some_and(|(index, _)| *index < report_cut) {
+                if let Some((_, report)) = reports.next() {
+                    AsyncRunner::handle_exec_event(ExecutionEvent::Report(report));
+                }
+            }
+
+            while orders.peek().is_some_and(|(index, _)| *index < order_cut) {
+                if let Some((_, order)) = orders.next() {
+                    AsyncRunner::handle_exec_event(ExecutionEvent::Order(order));
+                }
+            }
+            AsyncRunner::handle_exec_event(ExecutionEvent::FundingBoundary(message));
+        }
+
+        for (_, report) in reports {
             AsyncRunner::handle_exec_event(ExecutionEvent::Report(report));
         }
 
-        for evt in self.order_evts.drain(..) {
-            AsyncRunner::handle_exec_event(ExecutionEvent::Order(evt));
+        for (_, order) in orders {
+            AsyncRunner::handle_exec_event(ExecutionEvent::Order(order));
         }
 
         for cmd in self.exec_cmds.drain(..) {
@@ -7987,6 +8016,50 @@ mod tests {
     }
 
     #[rstest]
+    fn test_startup_funding_barrier_runs_after_prior_order_events_and_before_later_ones() {
+        use nautilus_common::{
+            msgbus::typed_handler::TypedIntoHandler,
+            timer::{TimeEvent, TimeEventCallback},
+        };
+        use std::{cell::RefCell, rc::Rc};
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let sink = observed.clone();
+        msgbus::register_order_event_endpoint(
+            MessagingSwitchboard::exec_engine_process(),
+            TypedIntoHandler::from(move |_: OrderEventAny| sink.borrow_mut().push("order")),
+        );
+        let mut pending = PendingEvents::default();
+        let ExecutionEvent::OrderCanceledBatch(first) = stub_canceled_batch_event() else {
+            panic!("expected batch")
+        };
+
+        for event in first {
+            pending.order_evts.push(OrderEventAny::Canceled(event));
+        }
+        let sink = observed.clone();
+        let callback: Rc<dyn Fn(TimeEvent)> = Rc::new(move |_| sink.borrow_mut().push("funding"));
+        let event = TimeEvent::new("funding-barrier".into(), UUID4::new(), 1.into(), 1.into());
+        pending.funding_barriers.push((
+            0,
+            pending.order_evts.len(),
+            TimeEventMessage::new(event, TimeEventCallback::from(callback)),
+        ));
+        let ExecutionEvent::OrderCanceledBatch(last) = stub_canceled_batch_event() else {
+            panic!("expected batch")
+        };
+
+        for event in last {
+            pending.order_evts.push(OrderEventAny::Canceled(event));
+        }
+        pending.drain();
+        assert_eq!(
+            *observed.borrow(),
+            ["order", "order", "funding", "order", "order"]
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[rstest]
     fn test_flush_all_pending_expands_batch_into_order_evts_before_drain() {
         use nautilus_model::identifiers::ClientOrderId;
 
@@ -8000,6 +8073,13 @@ mod tests {
         // Manually replicate what flush_all_pending does before drain
         while let Ok(evt) = exec_evt_rx.try_recv() {
             match evt {
+                ExecutionEvent::FundingBoundary(message) => {
+                    pending.funding_barriers.push((
+                        pending.exec_reports.len(),
+                        pending.order_evts.len(),
+                        message,
+                    ));
+                }
                 ExecutionEvent::Account(_) => {
                     AsyncRunner::handle_exec_event(evt);
                 }

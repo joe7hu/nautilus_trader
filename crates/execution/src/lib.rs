@@ -141,6 +141,7 @@
 
 pub mod client;
 pub mod engine;
+pub mod funding;
 pub mod matching_core;
 pub mod matching_engine;
 pub mod models;
