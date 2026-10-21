@@ -17,7 +17,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeSet, BinaryHeap, VecDeque},
+    collections::{BTreeSet, BinaryHeap, VecDeque, hash_map::Entry},
     fmt::Debug,
     rc::Rc,
 };
@@ -37,6 +37,7 @@ use nautilus_core::{
 };
 use nautilus_execution::{
     funding::FundingOwner,
+    maintenance::MaintenanceOwner,
     matching_core::RestingOrder,
     matching_engine::{
         OrderMatchingEngine, config::OrderMatchingEngineConfig, inflight::InflightOrders,
@@ -59,7 +60,6 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny},
     orderbook::OrderBook,
     orders::{Order, OrderAny},
-    position::Position,
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
@@ -163,6 +163,7 @@ pub struct SimulatedExchange {
     matching_engines: IndexMap<InstrumentId, OrderMatchingEngine>,
     last_raw_id: u32,
     funding: FundingOwner,
+    maintenance: AHashMap<(AccountId, Currency), MaintenanceOwner>,
     leverages: AHashMap<InstrumentId, Decimal>,
     margin_model: Option<MarginModelHandle>,
     modules: Vec<SimulationModuleHandle>,
@@ -251,6 +252,7 @@ impl SimulatedExchange {
             latency_model: config.latency_model,
             instruments: AHashMap::new(),
             matching_engines: IndexMap::new(),
+            maintenance: AHashMap::new(),
             last_raw_id: 0,
             funding: FundingOwner::new(
                 config.venue,
@@ -362,6 +364,7 @@ impl SimulatedExchange {
 
     fn pre_process_modules(&mut self, data: &Data) -> anyhow::Result<()> {
         self.check_module_error()?;
+        self.initialize_maintenance_owners()?;
 
         for module_index in 0..self.modules.len() {
             if let Err(e) = self.modules[module_index].pre_process(data) {
@@ -401,10 +404,18 @@ impl SimulatedExchange {
 
     pub fn initialize_account(&mut self) {
         self.generate_fresh_account_state();
+
+        if let Err(e) = self.initialize_maintenance_owners() {
+            self.module_error = Some(e.to_string());
+        }
     }
 
     /// Loads non-emulated open orders from the cache into matching engines.
     pub fn load_open_orders(&mut self) {
+        if let Err(e) = self.initialize_maintenance_owners() {
+            self.module_error = Some(e.to_string());
+            return;
+        }
         let mut open_orders: Vec<(OrderAny, AccountId)> = {
             let cache = self.cache.as_ref().borrow();
             cache
@@ -1434,6 +1445,7 @@ impl SimulatedExchange {
         }
 
         self.funding.reset();
+        self.maintenance.clear();
         self.message_queue.clear();
         self.inflight_queue.clear();
         self.inflight_orders.clear();
@@ -1469,109 +1481,87 @@ impl SimulatedExchange {
     /// > **Note**: A future `cross_margin_mode` venue configuration could extend this to
     /// > liquidate all positions across all settlement currencies simultaneously.
     pub fn process_liquidations(&mut self, ts_now: UnixNanos) {
-        if !self.liquidation_enabled {
+        if let Err(e) = self.initialize_maintenance_owners() {
+            self.module_error = Some(e.to_string());
             return;
         }
 
-        if self.frozen_account {
+        if !self.liquidation_enabled || self.frozen_account {
             return;
         }
-
-        let account = {
-            let cache = self.cache.borrow();
-            cache.account_for_venue_owned(&self.id)
-        };
-        let Some(account) = account else { return };
-        let AccountAny::Margin(margin_account) = &account else {
+        let account = self.cache.borrow().account_for_venue_owned(&self.id);
+        let Some(AccountAny::Margin(account)) = account else {
             return;
         };
-        let account_id = margin_account.id();
 
-        let currencies: Vec<Currency> = margin_account.currencies();
-
-        let open_positions: Vec<Position> = {
-            let cache = self.cache.borrow();
-            cache
-                .positions_open(Some(&self.id), None, None, None, None)
-                .into_iter()
-                .map(|p| p.cloned())
-                .collect()
-        };
-
-        // Pre-bucket position indices by settlement currency to avoid repeated full scans.
-        let mut positions_by_currency: AHashMap<Currency, Vec<usize>> = AHashMap::new();
-        for (i, p) in open_positions.iter().enumerate() {
-            positions_by_currency
-                .entry(p.settlement_currency)
-                .or_default()
-                .push(i);
-        }
-
-        for currency in currencies {
-            let Some(balance) = margin_account.balance(Some(currency)) else {
-                continue;
-            };
-            let balance_f64 = balance.total.as_f64();
-
-            let Some(indices) = positions_by_currency.get(&currency) else {
-                continue;
+        for currency in account.currencies() {
+            let key = (account.id(), currency);
+            let Some(owner) = self.maintenance.get_mut(&key) else {
+                self.module_error = Some("native maintenance baseline missing".into());
+                return;
             };
 
-            let (upnl_f64, all_priced) = {
-                let cache = self.cache.borrow();
-                let mut upnl = 0.0_f64;
-                let mut all_priced = true;
-
-                for &i in indices {
-                    let p = &open_positions[i];
-                    if let Some(pnl) = cache.calculate_unrealized_pnl(p) {
-                        upnl += pnl.as_f64();
-                    } else {
-                        all_priced = false;
-                        break;
-                    }
-                }
-                (upnl, all_priced)
-            };
-
-            if !all_priced {
-                continue; // defer until all positions are priced
-            }
-
-            let equity = balance_f64 + upnl_f64;
-            let maintenance = margin_account.total_maintenance_margin(currency).as_f64();
-
-            if maintenance == 0.0 {
-                continue;
-            }
-
-            let threshold = maintenance * self.liquidation_trigger_ratio;
-
-            if equity > threshold {
-                continue;
-            }
-
-            log::warn!(
-                "LIQUIDATION triggered for account {} currency {}: equity={:.4} <= threshold={:.4} (maintenance={:.4} x ratio={})",
-                account_id,
+            if let Err(e) = owner.process(
+                ts_now,
                 currency,
-                equity,
-                threshold,
-                maintenance,
-                self.liquidation_trigger_ratio
-            );
+                self.liquidation_cancel_open_orders,
+                self.matching_engines.values_mut(),
+            ) {
+                if owner.can_capture() && !owner.pending() {
+                    log::warn!("Native maintenance deferred: {e}");
+                } else {
+                    self.module_error = Some(e.to_string());
+                    return;
+                }
+            }
+        }
+    }
 
-            for matching_engine in self.matching_engines.values_mut() {
-                matching_engine.liquidate_open_positions(
-                    ts_now,
-                    self.liquidation_cancel_open_orders,
-                    currency,
-                );
+    fn initialize_maintenance_owners(&mut self) -> anyhow::Result<()> {
+        if !self.liquidation_enabled || self.frozen_account {
+            return Ok(());
+        }
+        let account = self.cache.borrow().account_for_venue_owned(&self.id);
+        let Some(account) = account else {
+            anyhow::bail!("native maintenance account missing")
+        };
+        let AccountAny::Margin(account) = account else {
+            return Ok(());
+        };
+        let ratio = Decimal::from_f64_retain(self.liquidation_trigger_ratio)
+            .ok_or_else(|| anyhow::anyhow!("invalid native maintenance trigger ratio"))?;
+
+        for currency in account.currencies() {
+            if let Entry::Vacant(entry) = self.maintenance.entry((account.id(), currency)) {
+                entry.insert(MaintenanceOwner::new(
+                    account.id(),
+                    self.cache.clone(),
+                    ratio,
+                    usize::MAX,
+                )?);
+            }
+        }
+        Ok(())
+    }
+
+    /// Confirms original liquidation application after native settlement and retains its cut.
+    pub fn complete_liquidations(&mut self) {
+        for owner in self.maintenance.values_mut() {
+            if let Err(e) = owner
+                .complete()
+                .and_then(|()| owner.acknowledge(owner.completed()))
+            {
+                self.module_error = Some(e.to_string());
+                return;
             }
         }
     }
 
     fn process_trading_command(&mut self, command: TradingCommand) {
+        if let Err(e) = self.initialize_maintenance_owners() {
+            self.module_error = Some(e.to_string());
+            return;
+        }
         self.inflight_orders.remove(&command);
         let instrument_id = command.instrument_id();
         assert!(

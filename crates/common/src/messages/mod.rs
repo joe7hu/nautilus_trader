@@ -79,6 +79,9 @@ pub enum ExecutionEvent {
     /// Runs a native funding callback after preceding execution events in this FIFO channel.
     #[strum(to_string = "FundingBoundary")]
     FundingBoundary(crate::runner::TimeEventMessage),
+    /// Runs a native simulation callback behind preceding execution events.
+    #[strum(to_string = "SimulationBoundary")]
+    SimulationBoundary(crate::runner::TimeEventMessage),
     #[strum(transparent)]
     Order(OrderEventAny),
     #[strum(transparent)]

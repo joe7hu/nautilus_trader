@@ -499,7 +499,8 @@ impl AsyncRunner {
     #[inline]
     pub fn handle_exec_event(event: ExecutionEvent) {
         match event {
-            ExecutionEvent::FundingBoundary(message) => {
+            ExecutionEvent::FundingBoundary(message)
+            | ExecutionEvent::SimulationBoundary(message) => {
                 message.dispatch();
             }
             ExecutionEvent::Order(order_event) => {

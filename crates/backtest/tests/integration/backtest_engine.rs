@@ -33,6 +33,7 @@ use nautilus_common::{
     actor::{
         DataActor, DataActorCore, data_actor::DataActorConfig, registry::try_get_actor_unchecked,
     },
+    cache::Cache,
     component::Component,
     enums::ComponentState,
     msgbus::{self, MessagingSwitchboard, TypedHandler},
@@ -59,7 +60,7 @@ use nautilus_model::{
         OrderStatus, PositionAdjustmentType, PriceType, TimeInForce, TrailingOffsetType,
         TriggerType,
     },
-    events::{AccountState, OrderEventAny, OrderFilled},
+    events::{AccountState, OrderEventAny, OrderFilled, PositionEvent},
     identifiers::{
         AccountId, ActorId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, PositionId,
         StrategyId, Symbol, TradeId, Venue,
@@ -6983,4 +6984,140 @@ fn test_quote_partial_fill_has_one_matching_opportunity_per_stimulus(
         result.as_value()["orders"][0]["Limit"]["core"]["filled_qty"],
         expected_quantity,
     );
+}
+
+#[derive(Debug)]
+struct OpeningApplicationFault {
+    cache: Rc<RefCell<Cache>>,
+    events: Rc<RefCell<Vec<PositionEvent>>>,
+    armed: Cell<bool>,
+}
+
+impl SimulationModule for OpeningApplicationFault {
+    fn pre_process(&self, data: &Data) -> anyhow::Result<()> {
+        if matches!(data, Data::Quote(_)) && !self.armed.replace(true) {
+            let cache = self.cache.clone();
+            let events = self.events.clone();
+            msgbus::subscribe_position_events(
+                "events.position.*".into(),
+                TypedHandler::from(move |event: &PositionEvent| {
+                    events.borrow_mut().push(event.clone());
+                    let mut account = cache.borrow().account_owned(&event.account_id()).unwrap();
+                    account.set_calculate_account_state(false);
+                    cache.borrow_mut().update_account_owned(account).unwrap();
+                }),
+                Some(11),
+            );
+        }
+        Ok(())
+    }
+    fn process(
+        &self,
+        _ts_now: UnixNanos,
+        _ctx: &ExchangeContext,
+    ) -> anyhow::Result<SimulationModuleResult> {
+        Ok(SimulationModuleResult::NotReady)
+    }
+    fn acknowledge(&self, _outcomes: &[AccountAdjustmentOutcome]) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn log_diagnostics(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn reset(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[rstest]
+#[case(false)]
+#[case(true)]
+fn first_timestamp_maintenance_requires_actual_opening_account_application(#[case] suppress: bool) {
+    let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let venue = SimulatedVenueConfig::builder()
+        .venue(Venue::from("BINANCE"))
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Margin)
+        .book_type(BookType::L1_MBP)
+        .starting_balances(vec![Money::from("10000 USDT")])
+        .default_leverage(Decimal::ONE)
+        .liquidation_enabled(true)
+        .modules(if suppress {
+            vec![SimulationModuleHandle::new(OpeningApplicationFault {
+                cache: engine.kernel().cache.clone(),
+                events: events.clone(),
+                armed: std::cell::Cell::new(false),
+            })]
+        } else {
+            Vec::new()
+        })
+        .build()
+        .unwrap();
+    engine.add_venue(venue).unwrap();
+    let mut original = crypto_perpetual_ethusdt();
+    original.taker_fee = "0.0005".parse().unwrap();
+    original.margin_maint = "0.1".parse().unwrap();
+    let instrument = InstrumentAny::CryptoPerpetual(original);
+    let instrument_id = instrument.id();
+    engine.add_instrument(&instrument).unwrap();
+    let mut first_quote = SnapshotNettingFlip::new(instrument_id, Quantity::from("0.010"));
+    first_quote.tick_count = 1;
+    engine.add_strategy(first_quote).unwrap();
+    engine
+        .add_data(
+            vec![
+                quote(instrument_id, "3999.99", "4000.00", 1_000_000_000),
+                quote(instrument_id, "3999.99", "4000.00", 2_000_000_000),
+            ],
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+    let result = engine.run(None, None, None, false);
+    {
+        let cache = engine.kernel().cache.borrow();
+        let position =
+            cache.positions_open(None, Some(&instrument_id), None, None, None)[0].cloned();
+        let account = cache.account_owned(&position.account_id).unwrap();
+        eprintln!(
+            "first_timestamp_census {}",
+            serde_json::json!({"suppressed":suppress,"run_error":result.as_ref().err().map(ToString::to_string),"observed_native_positions":events.borrow().len(),"account":account.id(),"balance":account.balance_total(Some(Currency::USDT())),"position_account":position.account_id,"position_qty":position.quantity,"actual_application":cache.position_account_applied(&position,None)})
+        );
+    }
+
+    if suppress {
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("actual post-position native account application missing")
+        );
+        assert_eq!(
+            engine.run(None, None, None, false).unwrap_err().to_string(),
+            error.to_string()
+        );
+        assert!(!events.borrow().is_empty());
+        assert!(engine.kernel().trader.borrow().is_stopped());
+    } else {
+        result.unwrap();
+    }
+    let cache = engine.kernel().cache.borrow();
+    let position = cache.positions_open(None, Some(&instrument_id), None, None, None)[0].cloned();
+    assert_eq!(position.quantity, Quantity::from("0.010"));
+    assert_eq!(cache.orders(None, None, None, None, None).len(), 1);
+    let account = cache.account_owned(&position.account_id).unwrap();
+    assert_eq!(
+        account.balance_total(Some(Currency::USDT())),
+        Some(Money::from("9999.98 USDT"))
+    );
+    let AccountAny::Margin(margin) = account else {
+        panic!("native margin account required")
+    };
+    assert_eq!(
+        margin.total_maintenance_margin(Currency::USDT()),
+        Money::from(if suppress { "0 USDT" } else { "4 USDT" })
+    );
+    assert_eq!(cache.position_account_applied(&position, None), !suppress);
 }

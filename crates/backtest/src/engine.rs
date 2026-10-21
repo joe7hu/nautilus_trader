@@ -113,7 +113,6 @@ pub struct BacktestEngine {
     force_stop: bool,
     last_ns: UnixNanos,
     last_module_ns: Option<UnixNanos>,
-    last_liquidation_ns: Option<UnixNanos>,
     end_ns: UnixNanos,
     run_started: Option<UnixNanos>,
     run_finished: Option<UnixNanos>,
@@ -182,7 +181,6 @@ impl BacktestEngine {
             force_stop: false,
             last_ns: UnixNanos::default(),
             last_module_ns: None,
-            last_liquidation_ns: None,
             end_ns: UnixNanos::default(),
             run_started: None,
             run_finished: None,
@@ -1141,7 +1139,6 @@ impl BacktestEngine {
         self.force_stop = false;
         self.last_ns = UnixNanos::default();
         self.last_module_ns = None;
-        self.last_liquidation_ns = None;
         self.end_ns = UnixNanos::default();
         self.has_book_processed.clear();
 
@@ -2001,12 +1998,7 @@ impl BacktestEngine {
         Ok(())
     }
 
-    fn run_venue_liquidations(&mut self, ts_now: UnixNanos, settlement_scope: SettlementScope) {
-        if self.last_liquidation_ns == Some(ts_now) {
-            return;
-        }
-        self.last_liquidation_ns = Some(ts_now);
-
+    fn run_venue_liquidations(&self, ts_now: UnixNanos, settlement_scope: SettlementScope) {
         if self
             .venues
             .values()
@@ -2021,6 +2013,10 @@ impl BacktestEngine {
 
         self.drain_command_queues();
         self.settle_venues(ts_now, settlement_scope);
+
+        for exchange in self.venues.values() {
+            exchange.borrow_mut().complete_liquidations();
+        }
     }
 
     fn drain_exec_client_events(&self) {

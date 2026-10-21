@@ -227,9 +227,9 @@ impl Portfolio {
         }
     }
 
-    /// Creates a shallow clone of the Portfolio that shares the same internal state.
+    /// Creates a shallow clone of the `Portfolio` that shares the same internal state.
     ///
-    /// This is useful when multiple components need to reference the same Portfolio
+    /// This is useful when multiple components need to reference the same `Portfolio`
     /// without creating duplicate msgbus handler registrations.
     #[must_use]
     pub fn clone_shallow(&self) -> Self {
@@ -3740,6 +3740,14 @@ fn update_order(
                 &account_state,
             );
         }
+
+        if !is_fill
+            && let Err(e) = cache
+                .borrow_mut()
+                .record_order_account_application(event, &account_state)
+        {
+            log::error!("Native post-order application unavailable: {e}");
+        }
     } else {
         log::debug!("Added pending calculation for {}", instrument.id());
         inner.borrow_mut().pending_calcs.insert(instrument.id());
@@ -3897,10 +3905,22 @@ fn update_position(
             None => AccountPeek::Missing,
         }
     };
+    let mut coherent_position_account = false;
+    let position_id = match event {
+        PositionEvent::PositionOpened(value) => value.position_id,
+        PositionEvent::PositionChanged(value) => value.position_id,
+        PositionEvent::PositionClosed(value) => value.position_id,
+        PositionEvent::PositionAdjusted(value) => value.position_id,
+    };
     let account_state_to_publish = match peek {
-        AccountPeek::MarginRecompute => {
-            recompute_margin_account(cache, clock, inner, account_id, &instrument_id)
-        }
+        AccountPeek::MarginRecompute => recompute_margin_account(
+            cache,
+            clock,
+            inner,
+            account_id,
+            &instrument_id,
+            &mut coherent_position_account,
+        ),
         AccountPeek::LastEvent(last_event) => *last_event,
         AccountPeek::Missing => {
             log::error!(
@@ -3916,6 +3936,14 @@ fn update_position(
             format!("events.account.{account_id}").into(),
             &account_state,
         );
+
+        if coherent_position_account
+            && let Err(e) = cache
+                .borrow_mut()
+                .record_position_account_application(position_id, &account_state)
+        {
+            log::error!("Native post-position application unavailable: {e}");
+        }
     }
 }
 
@@ -3929,6 +3957,7 @@ fn recompute_margin_account(
     inner: &Rc<RefCell<PortfolioState>>,
     account_id: AccountId,
     instrument_id: &InstrumentId,
+    coherent: &mut bool,
 ) -> Option<AccountState> {
     let instrument = { cache.borrow().instrument(instrument_id).cloned() };
     let Some(instrument) = instrument else {
@@ -3963,6 +3992,7 @@ fn recompute_margin_account(
     match recomputed {
         Some(account_state) => {
             cache.borrow_mut().update_account_owned(account).unwrap();
+            *coherent = true;
             Some(account_state)
         }
         None => restore_cached_account(cache, account),
