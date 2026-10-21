@@ -26,7 +26,8 @@ use nautilus_common::{
     },
     msgbus::{self, MessageBus, MessagingSwitchboard, TypedHandler},
 };
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::{DurationNanos, UUID4, UnixNanos};
+use nautilus_execution::models::latency::{LatencyModelAny, StaticLatencyModel};
 use nautilus_execution::{
     client::core::ExecutionClientCore, engine::ExecutionEngine, funding::FundingCheckpoint,
 };
@@ -49,7 +50,24 @@ use rstest::rstest;
 use rust_decimal::Decimal;
 
 fn make_client(clock: Rc<RefCell<dyn Clock>>, cache: Rc<RefCell<Cache>>) -> SandboxExecutionClient {
-    let config = SandboxExecutionClientConfig::builder()
+    make_window_client(clock, cache, None)
+}
+
+fn make_window_client(
+    clock: Rc<RefCell<dyn Clock>>,
+    cache: Rc<RefCell<Cache>>,
+    window: Option<(u64, u64)>,
+) -> SandboxExecutionClient {
+    make_latency_client(clock, cache, window, None)
+}
+
+fn make_latency_client(
+    clock: Rc<RefCell<dyn Clock>>,
+    cache: Rc<RefCell<Cache>>,
+    window: Option<(u64, u64)>,
+    latency: Option<LatencyModelAny>,
+) -> SandboxExecutionClient {
+    let mut config = SandboxExecutionClientConfig::builder()
         .account_id(AccountId::from("BINANCE-001"))
         .venue(Venue::from("BINANCE"))
         .starting_balances(vec![Money::from("10000 USDT")])
@@ -60,6 +78,12 @@ fn make_client(clock: Rc<RefCell<dyn Clock>>, cache: Rc<RefCell<Cache>>) -> Sand
         .bar_execution(false)
         .trade_execution(false)
         .build();
+
+    if let Some((first, deadline)) = window {
+        config.expected_funding_ns = Some(first.into());
+        config.execution_deadline_ns = Some(deadline.into());
+    }
+    config.latency_model = latency;
     let core = ExecutionClientCore::new(
         TraderId::from("TESTER-001"),
         ClientId::from("SANDBOX"),
@@ -73,8 +97,13 @@ fn make_client(clock: Rc<RefCell<dyn Clock>>, cache: Rc<RefCell<Cache>>) -> Sand
     SandboxExecutionClient::new(core, config, clock, cache)
 }
 
+#[rstest]
+#[case::generic(false)]
+#[case::bounded(true)]
 #[tokio::test(flavor = "current_thread")]
-async fn live_funding_barrier_observes_queued_fill_and_restores_original_receipt() {
+async fn live_funding_barrier_observes_queued_fill_and_restores_original_receipt(
+    #[case] bounded: bool,
+) {
     *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
     let (time_tx, mut time_rx) = tokio::sync::mpsc::unbounded_channel();
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(LiveClock::new(Some(Arc::new(
@@ -100,12 +129,11 @@ async fn live_funding_barrier_observes_queued_fill_and_restores_original_receipt
     ExecutionEngine::register_msgbus_handlers(&engine);
     let (exec_tx, mut exec_rx) = tokio::sync::mpsc::unbounded_channel();
     set_exec_event_sender(exec_tx);
-    let mut client = make_client(clock.clone(), cache.clone());
-    client.enable_funding().unwrap();
-    client.connect().await.unwrap();
-    client.start().unwrap();
     let now = clock.borrow().timestamp_ns();
     let boundary = UnixNanos::from(now.as_u64() + 500_000_000);
+    let window = bounded.then_some((boundary.as_u64(), now.as_u64() + 10_000_000_000));
+    let mut client = make_window_client(clock.clone(), cache.clone(), window);
+    client.enable_funding().unwrap();
     let update = FundingRateUpdate::new(
         instrument.id(),
         Decimal::new(1, 4),
@@ -115,6 +143,8 @@ async fn live_funding_barrier_observes_queued_fill_and_restores_original_receipt
         now,
     );
     client.process_funding_rate(update).unwrap();
+    client.connect().await.unwrap();
+    client.start().unwrap();
     let mark = MarkPriceUpdate::new(instrument.id(), Price::from("4000.00"), now, now);
     cache.borrow_mut().add_mark_price(mark).unwrap();
     let quote = QuoteTick::new(
@@ -251,7 +281,7 @@ async fn live_funding_barrier_observes_queued_fill_and_restores_original_receipt
         .unwrap();
     let restored_checkpoint: FundingCheckpoint =
         serde_json::from_value(original_json.clone()).unwrap();
-    let mut restored = make_client(clock.clone(), restored_cache.clone());
+    let mut restored = make_window_client(clock.clone(), restored_cache.clone(), window);
     restored.restore_funding(restored_checkpoint).unwrap();
     restored.restore_quote_only().unwrap();
     assert_eq!(
@@ -293,6 +323,14 @@ struct FundingHarness {
 
 impl FundingHarness {
     async fn new() -> Self {
+        Self::with_window(None).await
+    }
+
+    async fn with_window(window: Option<(u64, u64)>) -> Self {
+        Self::with_latency(window, None).await
+    }
+
+    async fn with_latency(window: Option<(u64, u64)>, latency: Option<LatencyModelAny>) -> Self {
         *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
         let clock = Rc::new(RefCell::new(TestClock::new()));
         clock.borrow_mut().set_time(1_000_000_000.into());
@@ -316,20 +354,26 @@ impl FundingHarness {
         ExecutionEngine::register_msgbus_handlers(&engine);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         nautilus_common::live::runner::replace_exec_event_sender(tx);
-        let mut client = make_client(clock.clone(), cache.clone());
+        let mut client = make_latency_client(clock.clone(), cache.clone(), window, latency);
         client.enable_funding().unwrap();
-        client.connect().await.unwrap();
-        client.start().unwrap();
+        if window.is_none() {
+            client.connect().await.unwrap();
+            client.start().unwrap();
+        }
         client
             .process_funding_rate(FundingRateUpdate::new(
                 instrument.id(),
                 Decimal::new(1, 4),
                 Some(480),
-                Some(3_000_000_000.into()),
+                Some(window.map_or(3_000_000_000, |(first, _)| first).into()),
                 1_000_000_000.into(),
                 1_000_000_000.into(),
             ))
             .unwrap();
+        if window.is_some() {
+            client.connect().await.unwrap();
+            client.start().unwrap();
+        }
         Self {
             client,
             clock,
@@ -894,6 +938,7 @@ async fn funded_factory_capture_handle_survives_boxing_and_retains_original_stat
             &native_config,
             harness.cache.clone(),
             Some(checkpoint),
+            None,
         )
         .unwrap();
     assert_eq!(
@@ -930,4 +975,596 @@ async fn funded_connect_cannot_republish_unapplied_initialization() {
             .is_none()
     );
     assert!(client.funding_checkpoint().is_err());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bounded_funding_settles_original_input_and_closes_at_deadline() {
+    let mut harness = FundingHarness::with_window(Some((3_000_000_000, 5_000_000_000))).await;
+    harness.open(OrderSide::Buy, "0.010");
+    harness.mark();
+    harness.clock.borrow_mut().set_time(3_000_000_000.into());
+    let mut next = harness.rate(Decimal::new(2, 4), 10_000_000_000);
+    next.ts_event = 3_000_000_000.into();
+    next.ts_init = 3_000_000_000.into();
+    harness.client.process_funding_rate(next).unwrap();
+    harness.drain();
+    let checkpoint = harness.client.funding_checkpoint().unwrap().unwrap();
+    assert_eq!(checkpoint.account_id(), AccountId::from("BINANCE-001"));
+    assert_eq!(
+        checkpoint.window().unwrap().first_boundary,
+        UnixNanos::from(3_000_000_000_u64)
+    );
+    assert_eq!(
+        checkpoint.window().unwrap().deadline,
+        UnixNanos::from(5_000_000_000_u64)
+    );
+    assert_eq!(checkpoint.pending(), &[next]);
+    assert_eq!(checkpoint.receipts().len(), 1);
+    assert_eq!(
+        checkpoint.receipts()[0].original_rate.rate,
+        Decimal::new(1, 4)
+    );
+    assert_eq!(
+        harness
+            .cache
+            .borrow()
+            .account(&checkpoint.account_id())
+            .unwrap()
+            .balance_total(Some(Currency::USDT())),
+        Some(Money::from("9999.97600000 USDT"))
+    );
+    let original = serde_json::to_value(&checkpoint).unwrap();
+    harness.clock.borrow_mut().set_time(5_000_000_000.into());
+    let now = harness.clock.borrow().timestamp_ns();
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .trader_id(TraderId::from("TESTER-001"))
+        .instrument_id(harness.instrument.id())
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("0.010"))
+        .client_order_id("DEADLINE-001".into())
+        .ts_init(now)
+        .build();
+    assert!(
+        harness
+            .client
+            .submit_order(SubmitOrder::from_order(
+                &order,
+                TraderId::from("TESTER-001"),
+                Some(harness.client.client_id()),
+                None,
+                UUID4::new(),
+                now
+            ))
+            .is_err()
+    );
+    harness.clock.borrow_mut().set_time(10_000_000_000.into());
+    harness.client.process_funding_rate(next).unwrap();
+    harness.drain();
+    assert_eq!(harness.checkpoint_json(), original);
+    harness.client.stop().unwrap();
+}
+
+#[rstest]
+#[case::earlier(2_000_000_000)]
+#[case::later(4_000_000_000)]
+#[tokio::test(flavor = "current_thread")]
+async fn bounded_funding_changed_first_schedule_stops_without_effects(#[case] boundary: u64) {
+    let mut harness = FundingHarness::with_window(Some((3_000_000_000, 5_000_000_000))).await;
+    harness.open(OrderSide::Buy, "0.010");
+    harness.mark();
+    let original = harness.checkpoint_json();
+    assert!(
+        harness
+            .client
+            .process_funding_rate(harness.rate(Decimal::new(1, 4), boundary))
+            .is_err()
+    );
+    harness.clock.borrow_mut().set_time(3_000_000_000.into());
+    assert!(
+        harness
+            .client
+            .process_funding_rate(harness.rate(Decimal::new(1, 4), 3_000_000_000))
+            .is_err()
+    );
+    harness.drain();
+    assert!(harness.client.funding_checkpoint().is_err());
+    assert_eq!(
+        serde_json::to_value(
+            harness
+                .cache
+                .borrow()
+                .account_owned(&AccountId::from("BINANCE-001"))
+                .unwrap()
+        )
+        .unwrap(),
+        original["account"]
+    );
+    assert!(
+        harness
+            .cache
+            .borrow()
+            .positions_open(None, None, None, None, None)[0]
+            .adjustments
+            .is_empty()
+    );
+    harness.client.stop().unwrap();
+}
+
+#[rstest]
+#[case::stale_rate(1_000_000_000, Some(7_000_000_000), false)]
+#[case::missing_mark(7_000_000_000, None, false)]
+#[case::stale_mark(7_000_000_000, Some(2_000_000_000), false)]
+#[case::future_mark(7_000_000_000, Some(9_000_000_000), false)]
+#[case::inclusive_freshness_edge(3_000_000_000, Some(3_000_000_000), true)]
+#[case::fresh(7_000_000_000, Some(7_000_000_000), true)]
+#[tokio::test(flavor = "current_thread")]
+async fn bounded_funding_requires_original_fresh_rate_and_mark(
+    #[case] rate_clock: u64,
+    #[case] mark_clock: Option<u64>,
+    #[case] applies: bool,
+) {
+    let mut harness = FundingHarness::with_window(Some((8_000_000_000, 10_000_000_000))).await;
+    harness.open(OrderSide::Buy, "0.010");
+    let original = harness.checkpoint_json();
+    if let Some(mark_clock) = mark_clock {
+        harness
+            .cache
+            .borrow_mut()
+            .add_mark_price(MarkPriceUpdate::new(
+                harness.instrument.id(),
+                Price::from("4000.00"),
+                mark_clock.into(),
+                mark_clock.into(),
+            ))
+            .unwrap();
+    }
+    harness.clock.borrow_mut().set_time(8_000_000_000.into());
+    let mut rate = harness.rate(Decimal::new(1, 4), 8_000_000_000);
+    rate.ts_event = rate_clock.into();
+    rate.ts_init = rate_clock.into();
+    harness.client.process_funding_rate(rate).unwrap();
+    harness.drain();
+    let position = harness
+        .cache
+        .borrow()
+        .positions_open(None, None, None, None, None)[0]
+        .cloned();
+
+    if applies {
+        assert_eq!(position.adjustments.len(), 1);
+        assert_eq!(position.realized_pnl, Some(Money::from("-0.02400000 USDT")));
+        assert_eq!(
+            harness
+                .client
+                .funding_checkpoint()
+                .unwrap()
+                .unwrap()
+                .receipts()[0]
+                .original_rate,
+            rate
+        );
+    } else {
+        assert!(position.adjustments.is_empty());
+        assert!(harness.client.funding_checkpoint().is_err());
+        assert_eq!(
+            serde_json::to_value(
+                harness
+                    .cache
+                    .borrow()
+                    .account_owned(&AccountId::from("BINANCE-001"))
+                    .unwrap()
+            )
+            .unwrap(),
+            original["account"]
+        );
+    }
+    harness.client.stop().unwrap();
+}
+
+#[rstest]
+#[case::pending(false, false)]
+#[case::applied(true, true)]
+#[case::empty(true, false)]
+#[tokio::test(flavor = "current_thread")]
+async fn bounded_funding_original_checkpoint_restores_without_recharge(
+    #[case] settle: bool,
+    #[case] position: bool,
+) {
+    let window = Some((3_000_000_000, 5_000_000_000));
+    let mut harness = FundingHarness::with_window(window).await;
+    if position {
+        harness.open(OrderSide::Buy, "0.010");
+    }
+    harness.mark();
+    if settle {
+        harness.clock.borrow_mut().set_time(3_000_000_000.into());
+        harness
+            .client
+            .process_funding_rate(harness.rate(Decimal::new(1, 4), 3_000_000_000))
+            .unwrap();
+        harness.drain();
+    }
+    let original = harness.checkpoint_json();
+    harness.client.stop().unwrap();
+
+    for changed in [
+        Some((3_000_000_000, 6_000_000_000)),
+        Some((2_000_000_000, 5_000_000_000)),
+        None,
+    ] {
+        let restored = make_window_client(harness.clock.clone(), harness.cache.clone(), changed);
+        assert!(
+            restored
+                .restore_funding(serde_json::from_value(original.clone()).unwrap())
+                .is_err()
+        );
+        assert!(harness.rx.try_recv().is_err());
+    }
+    let mut restored = make_window_client(harness.clock.clone(), harness.cache.clone(), window);
+    restored
+        .restore_funding(serde_json::from_value(original.clone()).unwrap())
+        .unwrap();
+    restored.restore_quote_only().unwrap();
+    restored.connect().await.unwrap();
+    restored.start().unwrap();
+    assert_eq!(
+        serde_json::to_value(restored.funding_checkpoint().unwrap().unwrap()).unwrap(),
+        original
+    );
+    restored.stop().unwrap();
+    harness.clock.borrow_mut().set_time(3_000_000_000.into());
+    let mut after_boundary =
+        make_window_client(harness.clock.clone(), harness.cache.clone(), window);
+    after_boundary
+        .restore_funding(serde_json::from_value(original.clone()).unwrap())
+        .unwrap();
+    after_boundary.restore_quote_only().unwrap();
+    after_boundary.connect().await.unwrap();
+    assert_eq!(after_boundary.start().is_ok(), settle);
+    harness.drain();
+    assert_eq!(
+        serde_json::to_value(after_boundary.funding_checkpoint().unwrap().unwrap()).unwrap(),
+        original
+    );
+
+    if settle {
+        after_boundary.stop().unwrap();
+    }
+    harness.clock.borrow_mut().set_time(5_000_000_000.into());
+    let mut expired = make_window_client(harness.clock.clone(), harness.cache.clone(), window);
+    expired
+        .restore_funding(serde_json::from_value(original.clone()).unwrap())
+        .unwrap();
+    expired.restore_quote_only().unwrap();
+    expired.connect().await.unwrap();
+    assert!(expired.start().is_err());
+    assert!(harness.rx.try_recv().is_err());
+    assert_eq!(
+        serde_json::to_value(expired.funding_checkpoint().unwrap().unwrap()).unwrap(),
+        original
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bounded_funding_queued_order_cannot_execute_after_deadline() {
+    let latency = LatencyModelAny::Static(StaticLatencyModel::new(
+        DurationNanos::ZERO,
+        DurationNanos::new(4_000_000_000),
+        DurationNanos::ZERO,
+        DurationNanos::ZERO,
+    ));
+    let mut harness =
+        FundingHarness::with_latency(Some((3_000_000_000, 5_000_000_000)), Some(latency)).await;
+    harness.open(OrderSide::Buy, "0.010");
+    assert!(
+        harness
+            .cache
+            .borrow()
+            .positions_open(None, None, None, None, None)
+            .is_empty()
+    );
+    harness.mark();
+    let events = harness
+        .clock
+        .borrow_mut()
+        .advance_time(3_000_000_000.into(), true);
+    let handlers = harness.clock.borrow().match_handlers(events);
+    for handler in handlers {
+        handler.run();
+    }
+    harness.drain();
+    let mut next = harness.rate(Decimal::new(1, 4), 10_000_000_000);
+    next.ts_event = 3_000_000_000.into();
+    next.ts_init = 3_000_000_000.into();
+    harness.client.process_funding_rate(next).unwrap();
+    let events = harness
+        .clock
+        .borrow_mut()
+        .advance_time(5_000_000_000.into(), true);
+    let handlers = harness.clock.borrow().match_handlers(events);
+    for handler in handlers {
+        handler.run();
+    }
+    harness.drain();
+    assert_eq!(
+        harness
+            .cache
+            .borrow()
+            .order(&"FUNDING-SIGN-001".into())
+            .unwrap()
+            .status(),
+        OrderStatus::Rejected
+    );
+    assert!(
+        harness
+            .cache
+            .borrow()
+            .positions_open(None, None, None, None, None)
+            .is_empty()
+    );
+    let checkpoint = harness.client.funding_checkpoint().unwrap().unwrap();
+    assert_eq!(checkpoint.receipts().len(), 1);
+    assert!(checkpoint.receipts()[0].settlement.is_none());
+    assert_eq!(
+        harness
+            .cache
+            .borrow()
+            .account(&checkpoint.account_id())
+            .unwrap()
+            .balance_total(Some(Currency::USDT())),
+        Some(Money::from("10000 USDT"))
+    );
+    harness.client.stop().unwrap();
+}
+
+#[rstest]
+#[case::after_applied(true)]
+#[case::after_empty(false)]
+#[tokio::test(flavor = "current_thread")]
+async fn bounded_funding_consumed_first_cannot_admit_earlier_boundary(#[case] position: bool) {
+    let mut harness = FundingHarness::with_window(Some((3_000_000_000, 5_000_000_000))).await;
+    if position {
+        harness.open(OrderSide::Buy, "0.010");
+    }
+    harness.mark();
+    harness.clock.borrow_mut().set_time(3_000_000_000.into());
+    harness
+        .client
+        .process_funding_rate(harness.rate(Decimal::new(1, 4), 3_000_000_000))
+        .unwrap();
+    harness.drain();
+    let original = harness.checkpoint_json();
+    let mut older = harness.rate(Decimal::new(1, 4), 2_500_000_000);
+    older.ts_event = 2_000_000_000.into();
+    older.ts_init = 2_000_000_000.into();
+    assert!(harness.client.process_funding_rate(older).is_err());
+    harness.drain();
+    assert!(harness.client.funding_checkpoint().is_err());
+    assert_eq!(
+        serde_json::to_value(
+            harness
+                .cache
+                .borrow()
+                .account_owned(&AccountId::from("BINANCE-001"))
+                .unwrap()
+        )
+        .unwrap(),
+        original["account"]
+    );
+    let positions = harness
+        .cache
+        .borrow()
+        .positions_open(None, None, None, None, None)
+        .into_iter()
+        .map(|position| position.cloned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        serde_json::to_value(positions).unwrap(),
+        original["positions"]
+    );
+    harness.client.stop().unwrap();
+}
+
+fn bounded_buy(harness: &FundingHarness, id: &str) -> SubmitOrder {
+    let now = harness.clock.borrow().timestamp_ns();
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(TraderId::from("TESTER-001"))
+        .instrument_id(harness.instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("0.010"))
+        .price(Price::from("4000.00"))
+        .time_in_force(TimeInForce::Gtc)
+        .client_order_id(id.into())
+        .ts_init(now)
+        .build();
+    harness
+        .cache
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(harness.client.client_id()), false)
+        .unwrap();
+    SubmitOrder::from_order(
+        &order,
+        TraderId::from("TESTER-001"),
+        Some(harness.client.client_id()),
+        None,
+        UUID4::new(),
+        now,
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bounded_funding_matching_resumes_only_with_fresh_next_period_input() {
+    let mut harness = FundingHarness::with_window(Some((3_000_000_000, 10_000_000_000))).await;
+    harness.open(OrderSide::Buy, "0.010");
+    harness.mark();
+    harness.clock.borrow_mut().set_time(3_000_000_000.into());
+    harness
+        .client
+        .process_funding_rate(harness.rate(Decimal::new(1, 4), 3_000_000_000))
+        .unwrap();
+    harness.drain();
+    assert!(
+        harness
+            .client
+            .submit_order(bounded_buy(&harness, "NO-NEXT"))
+            .is_err()
+    );
+    harness.clock.borrow_mut().set_time(7_000_000_000.into());
+    let mut next = harness.rate(Decimal::new(2, 4), 20_000_000_000);
+    harness.client.process_funding_rate(next).unwrap();
+    assert!(
+        harness
+            .client
+            .submit_order(bounded_buy(&harness, "STALE-NEXT"))
+            .is_err()
+    );
+    next.ts_event = 8_000_000_000.into();
+    next.ts_init = 8_000_000_000.into();
+    assert!(harness.client.process_funding_rate(next).is_err());
+    assert!(
+        harness
+            .client
+            .submit_order(bounded_buy(&harness, "FUTURE-NEXT"))
+            .is_err()
+    );
+    next.ts_event = 7_000_000_000.into();
+    next.ts_init = 7_000_000_000.into();
+    harness.client.process_funding_rate(next).unwrap();
+    let quote = QuoteTick::new(
+        harness.instrument.id(),
+        Price::from("4000.00"),
+        Price::from("4000.00"),
+        Quantity::from("0.100"),
+        Quantity::from("0.100"),
+        7_000_000_000.into(),
+        7_000_000_000.into(),
+    );
+    harness.cache.borrow_mut().add_quote(quote).unwrap();
+    harness.client.process_quote_tick(&quote).unwrap();
+    harness
+        .client
+        .submit_order(bounded_buy(&harness, "FRESH-NEXT"))
+        .unwrap();
+    harness.drain();
+    assert_eq!(
+        harness
+            .cache
+            .borrow()
+            .positions_open(None, None, None, None, None)[0]
+            .quantity,
+        Quantity::from("0.020")
+    );
+    assert_eq!(
+        harness
+            .cache
+            .borrow()
+            .account(&AccountId::from("BINANCE-001"))
+            .unwrap()
+            .balance_total(Some(Currency::USDT())),
+        Some(Money::from("9999.95600000 USDT"))
+    );
+    assert_eq!(
+        harness
+            .client
+            .funding_checkpoint()
+            .unwrap()
+            .unwrap()
+            .receipts()
+            .len(),
+        1
+    );
+    harness.client.stop().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bounded_funding_factory_enforces_original_input_and_restore_cut() {
+    let (time_tx, _time_rx) = tokio::sync::mpsc::unbounded_channel();
+    nautilus_common::runner::replace_time_event_sender(Arc::new(AsyncTimeEventSender::new(
+        time_tx,
+    )));
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(LiveClock::default()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+    cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    let _portfolio = Portfolio::new(clock.clone(), cache.clone(), None);
+    let now = clock.borrow().timestamp_ns();
+    let first = now.as_u64() + 10_000_000_000;
+    let deadline = now.as_u64() + 20_000_000_000;
+    let template = make_window_client(clock.clone(), cache.clone(), Some((first, deadline)));
+    let config = template.config().clone();
+    let original = FundingRateUpdate::new(
+        instrument.id(),
+        Decimal::new(1, 4),
+        Some(480),
+        Some(first.into()),
+        now,
+        now,
+    );
+    let mut stale = original;
+    stale.ts_event = (now.as_u64() - 6_000_000_000).into();
+    let mut future = original;
+    future.ts_init = (now.as_u64() + 5_000_000_000).into();
+    let mut wrong_first = original;
+    wrong_first.next_funding_ns = Some((first + 1_000_000_000).into());
+    for input in [None, Some(stale), Some(future), Some(wrong_first)] {
+        assert!(
+            SandboxExecutionClientFactory::new()
+                .create_funded_quote_only(
+                    TraderId::from("TESTER-001"),
+                    "PAPER",
+                    &config,
+                    cache.clone(),
+                    None,
+                    input
+                )
+                .is_err()
+        );
+        assert!(cache.borrow().account(&config.account_id).is_none());
+    }
+    let (mut client, capture) = SandboxExecutionClientFactory::new()
+        .create_funded_quote_only(
+            TraderId::from("TESTER-001"),
+            "PAPER",
+            &config,
+            cache.clone(),
+            None,
+            Some(original),
+        )
+        .unwrap();
+    client.connect().await.unwrap();
+    let checkpoint = capture.checkpoint().unwrap();
+    let expected = serde_json::to_value(&checkpoint).unwrap();
+    assert_eq!(checkpoint.pending(), &[original]);
+    assert_eq!(checkpoint.window().unwrap().first_boundary.as_u64(), first);
+    assert!(
+        SandboxExecutionClientFactory::new()
+            .create_funded_quote_only(
+                TraderId::from("TESTER-001"),
+                "PAPER",
+                &config,
+                cache.clone(),
+                Some(checkpoint.clone()),
+                Some(original)
+            )
+            .is_err()
+    );
+    let (mut restored, handle) = SandboxExecutionClientFactory::new()
+        .create_funded_quote_only(
+            TraderId::from("TESTER-001"),
+            "PAPER",
+            &config,
+            cache,
+            Some(checkpoint),
+            None,
+        )
+        .unwrap();
+    restored.connect().await.unwrap();
+    assert_eq!(
+        serde_json::to_value(handle.checkpoint().unwrap()).unwrap(),
+        expected
+    );
 }
