@@ -54,7 +54,10 @@ use nautilus_execution::{
 };
 use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
-    data::{Bar, BarType, Data, InstrumentClose, InstrumentStatus, QuoteTick, TradeTick},
+    data::{
+        Bar, BarType, Data, FundingRateUpdate, InstrumentClose, InstrumentStatus, QuoteTick,
+        TradeTick,
+    },
     enums::{
         AccountType, AggressorSide, BookType, ContingencyType, InstrumentCloseType, LiquiditySide,
         MarketStatusAction, OmsType, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
@@ -5986,10 +5989,13 @@ fn test_batch_reduce_only_modifies_share_pending_position_quantity(
     let position = cache
         .position_for_order(&opening.client_order_id())
         .unwrap();
-    assert_eq!(fills, vec![
-        (closing[0].client_order_id(), Quantity::from("0.400")),
-        (closing[1].client_order_id(), Quantity::from("0.100")),
-    ]);
+    assert_eq!(
+        fills,
+        vec![
+            (closing[0].client_order_id(), Quantity::from("0.400")),
+            (closing[1].client_order_id(), Quantity::from("0.100")),
+        ]
+    );
     assert_eq!(
         (position.side, position.quantity),
         (PositionSide::Flat, Quantity::from("0.000"))
@@ -6125,10 +6131,12 @@ fn test_inbound_latency_cancel_all_leaves_in_transit_submit_list_unaffected(
         INSERT_LATENCY_NS,
     );
 
-    let legs = submit_list_through_engine(&harness, trader_id, &instrument, &[
-        ("O-LIST-LEG-1", "98.00"),
-        ("O-LIST-LEG-2", "97.00"),
-    ]);
+    let legs = submit_list_through_engine(
+        &harness,
+        trader_id,
+        &instrument,
+        &[("O-LIST-LEG-1", "98.00"), ("O-LIST-LEG-2", "97.00")],
+    );
     let t0 = legs[0].ts_init();
     send_command_through_engine(
         &harness,
@@ -6826,10 +6834,10 @@ fn test_inbound_latency_contingent_change_preserves_in_transit_order(
         .iter()
         .map(|event| (order_event_kind(event), event.client_order_id()))
         .collect();
-    assert_eq!(events, vec![(
-        if expiry { "expired" } else { "updated" },
-        parent_id
-    )]);
+    assert_eq!(
+        events,
+        vec![(if expiry { "expired" } else { "updated" }, parent_id)]
+    );
     let cache = harness.cache.borrow();
     let child = cache.order(&child_id).unwrap();
     assert_eq!(child.status(), OrderStatus::Submitted);
@@ -6967,7 +6975,7 @@ async fn restored_quote_only_cash_preserves_partial_order_and_trade_identity(#[c
     );
     cache
         .borrow_mut()
-        .add_account(AccountAny::from_events(&[account.clone()]).unwrap())
+        .add_account(AccountAny::from_events(std::slice::from_ref(&account)).unwrap())
         .unwrap();
     let original_account = cache.borrow().account_owned(&account.account_id).unwrap();
     let mut context = restore_cash_context(cache.clone(), clock.clone(), |_| {});
@@ -7290,7 +7298,7 @@ async fn restored_quote_only_margin_preserves_partial_order_and_trade_identity(
     );
     cache
         .borrow_mut()
-        .add_account(AccountAny::from_events(&[account.clone()]).unwrap())
+        .add_account(AccountAny::from_events(std::slice::from_ref(&account)).unwrap())
         .unwrap();
     let original_account = cache.borrow().account_owned(&account.account_id).unwrap();
     let mut context = restore_cash_context(cache.clone(), clock.clone(), |config| {
@@ -7522,7 +7530,7 @@ async fn perpetual_execution_window_guards_matching_and_queued_invocation(
         .unwrap();
     let clock = Rc::new(RefCell::new(TestClock::new()));
     clock.borrow_mut().set_time(1_000_000_000.into());
-    let funding = nautilus_model::data::FundingRateUpdate::new(
+    let funding = FundingRateUpdate::new(
         instrument.id(),
         "0.0001".parse().unwrap(),
         None,

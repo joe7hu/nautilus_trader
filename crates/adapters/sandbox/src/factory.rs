@@ -60,6 +60,11 @@ impl SandboxExecutionClientFactory {
 }
 
 impl SandboxExecutionClientFactory {
+    /// Creates a sandbox client using its original quote-only account state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the original cache state or restoration profile is unsupported.
     pub fn create_restored_quote_only(
         &self,
         trader_id: TraderId,

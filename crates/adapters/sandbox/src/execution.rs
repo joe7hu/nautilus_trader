@@ -64,7 +64,7 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, MarginBalance, Money},
+    types::{AccountBalance, Currency, MarginBalance, Money},
 };
 use ustr::Ustr;
 
@@ -178,6 +178,16 @@ impl SandboxExecutionClient {
         }
     }
 
+    /// Restores the original quote-only sandbox account and order state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is active, original state is unavailable,
+    /// or the account, instrument or order profile is unsupported.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the matching engine is absent after it has been initialized.
     pub fn restore_quote_only(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.restored.get()
@@ -232,9 +242,9 @@ impl SandboxExecutionClient {
             anyhow::ensure!(
                 self.config.default_leverage == rust_decimal::Decimal::ONE
                     && self.config.leverages.is_empty()
-                    && self.config.base_currency == Some(nautilus_model::types::Currency::USDT())
-                    && account.balances().keys().all(|currency| *currency == nautilus_model::types::Currency::USDT())
-                    && self.cache.borrow().instruments(&self.config.venue, None).iter().all(|i| matches!(i, nautilus_model::instruments::InstrumentAny::CryptoPerpetual(p) if !p.is_inverse && p.settlement_currency == nautilus_model::types::Currency::USDT())),
+                    && self.config.base_currency == Some(Currency::USDT())
+                    && account.balances().keys().all(|currency| *currency == Currency::USDT())
+                    && self.cache.borrow().instruments(&self.config.venue, None).iter().all(|i| matches!(i, InstrumentAny::CryptoPerpetual(p) if !p.is_inverse && p.settlement_currency == Currency::USDT())),
                 "unsupported margin restoration profile"
             );
         }
