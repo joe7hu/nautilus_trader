@@ -153,6 +153,18 @@ pub struct FundingCheckpoint {
 }
 
 impl FundingCheckpoint {
+    /// Returns the complete original native account, including metadata absent from account events.
+    #[must_use]
+    pub const fn account(&self) -> &AccountAny {
+        &self.account
+    }
+
+    /// Returns original native positions from the same coherent account cut.
+    #[must_use]
+    pub fn positions(&self) -> &[Position] {
+        &self.positions
+    }
+
     /// Returns the original native account identity.
     #[must_use]
     pub fn account_id(&self) -> AccountId {

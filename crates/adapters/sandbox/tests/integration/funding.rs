@@ -33,7 +33,7 @@ use nautilus_execution::{
 };
 use nautilus_live::runner::{AsyncRunner, AsyncTimeEventSender};
 use nautilus_model::{
-    accounts::Account,
+    accounts::{Account, AccountAny},
     data::{FundingRateUpdate, MarkPriceUpdate, QuoteTick},
     enums::{AccountType, BookType, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce},
     events::{AccountState, OrderEventAny},
@@ -1567,4 +1567,57 @@ async fn bounded_funding_factory_enforces_original_input_and_restore_cut() {
         serde_json::to_value(handle.checkpoint().unwrap()).unwrap(),
         expected
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn funding_recovery_requires_original_account_metadata_beyond_account_events() {
+    let window = Some((3_000_000_000, 5_000_000_000));
+    let mut harness = FundingHarness::with_window(window).await;
+    harness.open(OrderSide::Buy, "0.010");
+    harness.mark();
+    harness.clock.borrow_mut().set_time(3_000_000_000.into());
+    harness
+        .client
+        .process_funding_rate(harness.rate(Decimal::new(1, 4), 3_000_000_000))
+        .unwrap();
+    harness.drain();
+    let checkpoint = harness.client.funding_checkpoint().unwrap().unwrap();
+    let replayed = AccountAny::from_events(&checkpoint.account().events()).unwrap();
+    assert_eq!(replayed.events(), checkpoint.account().events());
+    assert_ne!(
+        serde_json::to_value(&replayed).unwrap(),
+        serde_json::to_value(checkpoint.account()).unwrap()
+    );
+    harness.client.stop().unwrap();
+
+    for original in [false, true] {
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_instrument(harness.instrument.clone())
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_account(if original {
+                checkpoint.account().clone()
+            } else {
+                replayed.clone()
+            })
+            .unwrap();
+
+        for position in checkpoint.positions() {
+            cache
+                .borrow_mut()
+                .add_position(position, OmsType::Netting)
+                .unwrap();
+        }
+        let client = make_window_client(harness.clock.clone(), cache, window);
+        assert_eq!(client.restore_funding(checkpoint.clone()).is_ok(), original);
+        if original {
+            assert_eq!(
+                serde_json::to_value(client.funding_checkpoint().unwrap().unwrap()).unwrap(),
+                serde_json::to_value(&checkpoint).unwrap()
+            );
+        }
+    }
 }
