@@ -7116,7 +7116,7 @@ async fn restored_quote_only_cash_preserves_partial_order_and_trade_identity(#[c
     );
     cache
         .borrow_mut()
-        .add_account(AccountAny::from_events(&[account.clone()]).unwrap())
+        .add_account(AccountAny::from_events(std::slice::from_ref(&account)).unwrap())
         .unwrap();
     let original_account = cache.borrow().account_owned(&account.account_id).unwrap();
     let mut context = restore_cash_context(cache.clone(), clock.clone(), |_| {});
