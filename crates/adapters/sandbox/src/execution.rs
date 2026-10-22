@@ -185,6 +185,11 @@ impl SandboxExecutionClient {
     ///
     /// Returns an error if the client profile or original account, instrument or orders are
     /// incompatible with restoration, or cached account configuration cannot be synchronized.
+    ///
+    /// # Panics
+    ///
+    /// Panics if matching engine creation does not insert the original instrument engine,
+    /// or the client state or cache is already borrowed.
     pub fn restore_quote_only_cash(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.restored.get()

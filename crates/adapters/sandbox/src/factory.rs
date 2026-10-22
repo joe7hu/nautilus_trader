@@ -60,6 +60,12 @@ impl SandboxExecutionClientFactory {
 }
 
 impl SandboxExecutionClientFactory {
+    /// Creates a sandbox client from the original cached cash account and orders.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration or original cached state is incompatible
+    /// with quote-only cash restoration, or cached account configuration cannot be synchronized.
     pub fn create_restored_quote_only_cash(
         &self,
         trader_id: TraderId,
