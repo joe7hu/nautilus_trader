@@ -178,6 +178,12 @@ impl SandboxExecutionClient {
         }
     }
 
+    /// Restores the original cached cash account and its bounded quote-only order state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client profile or original account, instrument or orders are
+    /// incompatible with restoration, or cached account configuration cannot be synchronized.
     pub fn restore_quote_only_cash(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.restored.get()

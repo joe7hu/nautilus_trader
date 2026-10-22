@@ -2857,6 +2857,12 @@ impl OrderMatchingEngine {
         }
     }
 
+    /// Restores original limit orders into an empty quote-only engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the engine profile is unsupported, its matching core is nonempty,
+    /// or the original orders have incompatible identities, states or precision.
     pub fn restore_quote_only_limit_orders(
         &mut self,
         orders: &[OrderAny],
