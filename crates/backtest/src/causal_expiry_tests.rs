@@ -91,6 +91,7 @@ mod causal_remaining {
             .side(OrderSide::Buy)
             .quantity(Quantity::from(8))
             .price(Price::from("1.00000"));
+
         if let Some(at) = expiry {
             b.time_in_force(TimeInForce::Gtd).expire_time(at.into());
         }
@@ -190,6 +191,7 @@ mod causal_remaining {
             observed
                 .borrow_mut()
                 .push((before, event.ts_event.as_u64()));
+
             if action == "cancel" {
                 send_execution_command(TradingCommand::CancelOrder(CancelOrder::new(
                     o.trader_id(),
@@ -204,6 +206,7 @@ mod causal_remaining {
                     None,
                 )));
             }
+
             if action == "modify" {
                 send_execution_command(TradingCommand::ModifyOrder(ModifyOrder::new(
                     o.trader_id(),
@@ -247,6 +250,7 @@ mod causal_remaining {
         let observed = Rc::new(RefCell::new(Vec::new()));
         callback(&e, &o, at, action, "SCHEDULE", observed.clone());
         let clocks = e.collect_all_clocks();
+
         match route {
             "jump" => {
                 e.advance_time_impl(7.into(), &clocks).unwrap();
@@ -426,6 +430,7 @@ mod causal_remaining {
             .side(OrderSide::Buy)
             .quantity(Quantity::from(8))
             .price(Price::from("0.95000"));
+
         if kind == ContingencyType::Oto {
             b.parent_order_id(first_id);
         } else {
@@ -563,6 +568,7 @@ mod causal_remaining {
         let mut results = Vec::new();
         for at in [9_u64, 4] {
             results.push(
+
                 std::thread::spawn(move || {
                     let (mut e, o) = setup(true, true, Some(5));
                     let clocks = e.collect_all_clocks();
@@ -728,6 +734,7 @@ mod causal_remaining {
                 {
                     count.set(count.get() + 1);
                 }
+
                 if let Some(exec) = exec.upgrade() {
                     exec.borrow_mut().process(&event);
                 }
