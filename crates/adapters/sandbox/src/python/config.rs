@@ -38,7 +38,7 @@ use crate::config::SandboxExecutionClientConfig;
 impl SandboxExecutionClientConfig {
     /// Configuration for `SandboxExecutionClient` instances.
     #[new]
-    #[pyo3(signature = (venue, starting_balances, account_id=None, base_currency=None, oms_type=None, account_type=None, default_leverage=None, book_type=None, frozen_account=false, bar_execution=true, trade_execution=true, reject_stop_orders=true, support_gtd_orders=true, support_contingent_orders=true, use_position_ids=true, use_random_ids=false, use_reduce_only=true, fee_model=None, fill_model=None, queue_position=false, liquidity_consumption=false, bar_adaptive_high_low_ordering=false, use_market_order_acks=false, oto_full_trigger=false, price_protection_points=None, latency_model=None))]
+    #[pyo3(signature = (venue, starting_balances, account_id=None, base_currency=None, oms_type=None, account_type=None, default_leverage=None, book_type=None, frozen_account=false, bar_execution=true, trade_execution=true, reject_stop_orders=true, support_gtd_orders=true, support_contingent_orders=true, use_position_ids=true, use_random_ids=false, use_reduce_only=true, fee_model=None, fill_model=None, queue_position=false, liquidity_consumption=false, bar_adaptive_high_low_ordering=false, use_market_order_acks=false, oto_full_trigger=false, price_protection_points=None, latency_model=None, gtd_expiry_before_match=false))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
         venue: Venue,
@@ -67,6 +67,7 @@ impl SandboxExecutionClientConfig {
         oto_full_trigger: bool,
         price_protection_points: Option<u32>,
         latency_model: Option<Py<PyAny>>,
+        gtd_expiry_before_match: bool,
     ) -> PyResult<Self> {
         // Generate the default account ID from the venue
         let account_id =
@@ -99,6 +100,7 @@ impl SandboxExecutionClientConfig {
             trade_execution,
             reject_stop_orders,
             support_gtd_orders,
+            gtd_expiry_before_match,
             support_contingent_orders,
             use_position_ids,
             use_random_ids,
@@ -199,6 +201,11 @@ impl SandboxExecutionClientConfig {
     #[getter]
     fn support_gtd_orders(&self) -> bool {
         self.support_gtd_orders
+    }
+
+    #[getter]
+    fn gtd_expiry_before_match(&self) -> bool {
+        self.gtd_expiry_before_match
     }
 
     #[getter]

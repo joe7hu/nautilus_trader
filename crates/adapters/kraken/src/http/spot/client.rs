@@ -2031,7 +2031,11 @@ impl KrakenSpotHttpClient {
                 .fetch_trade_balance_snapshot(margin_balance_asset)
                 .await?;
             let target_code = normalize_currency_code(margin_balance_asset.unwrap_or("ZUSD"));
-            let currency = Currency::new(target_code, 8, 0, "0", CurrencyType::Crypto);
+            let currency = if target_code == "BTC" {
+                Currency::BTC()
+            } else {
+                Currency::new(target_code, 8, 0, "0", CurrencyType::Crypto)
+            };
             let margin_entry = AccountBalance::from_total_and_free(
                 snapshot.equity,
                 snapshot.free_margin,
@@ -2065,17 +2069,18 @@ impl KrakenSpotHttpClient {
                     return None;
                 }
 
-                let normalized_code = currency_code
-                    .strip_prefix("X")
-                    .or_else(|| currency_code.strip_prefix("Z"))
-                    .unwrap_or(currency_code);
+                let normalized_code = normalize_currency_code(currency_code);
 
                 if skip_margin_wallet && normalized_code == target_code {
                     return None;
                 }
 
                 let locked = Decimal::from_str_exact(&entry.hold_trade).ok()?;
-                let currency = Currency::new(normalized_code, 8, 0, "0", CurrencyType::Crypto);
+                let currency = if normalized_code == "BTC" {
+                    Currency::BTC()
+                } else {
+                    Currency::new(normalized_code, 8, 0, "0", CurrencyType::Crypto)
+                };
                 AccountBalance::from_total_and_locked(total, locked, currency).ok()
             })
             .chain(margin_entry)

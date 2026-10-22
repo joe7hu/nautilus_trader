@@ -72,6 +72,7 @@ use crate::config::SandboxExecutionClientConfig;
 
 // Bounds retained state for quote-only instruments that expire without event-driven cleanup
 const EXPIRED_ENGINE_SWEEP_INTERVAL: DurationNanos = DurationNanos::from_mins(1);
+const GTD_ORDER_SWEEP_INTERVAL: DurationNanos = DurationNanos::from_millis(100);
 
 /// A sandbox execution client for paper trading against live market data.
 ///
@@ -450,7 +451,11 @@ impl SandboxExecutionClient {
 
         if let Err(e) = self.clock.borrow_mut().set_timer_ns(
             &name,
-            EXPIRED_ENGINE_SWEEP_INTERVAL,
+            if self.config.gtd_expiry_before_match {
+                GTD_ORDER_SWEEP_INTERVAL
+            } else {
+                EXPIRED_ENGINE_SWEEP_INTERVAL
+            },
             None,
             None,
             Some(TimeEventCallback::from(callback)),
@@ -1221,6 +1226,10 @@ impl SandboxInner {
     // open positions because this path cannot settle them. Open orders must also remain because
     // `Cache::purge_instrument_skip_order_guard` requires callers to terminalize order state first
     fn sweep_expired_engines(&mut self) {
+        let now = self.clock.borrow().timestamp_ns();
+        for engine in self.matching_engines.values_mut() {
+            engine.process_order_expirations(now);
+        }
         let expired_ids: Vec<InstrumentId> = self
             .matching_engines
             .keys()

@@ -4006,6 +4006,7 @@ impl OrderMatchingEngine {
             .iter_orders()
             .map(|order| order.client_order_id)
             .collect();
+
         for id in ids {
             if !self.core.order_exists(id) {
                 continue;
