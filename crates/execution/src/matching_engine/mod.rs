@@ -4023,6 +4023,7 @@ impl OrderMatchingEngine {
                     })
                     .map(|order| self.order_snapshot(id).unwrap_or_else(|| order.clone()))
             };
+
             if let Some(order) = due {
                 self.delete_core_order(id);
                 self.cached_filled_qty.swap_remove(&id);
