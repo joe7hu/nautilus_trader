@@ -113,7 +113,6 @@ pub struct BacktestEngine {
     force_stop: bool,
     last_ns: UnixNanos,
     last_module_ns: Option<UnixNanos>,
-    last_liquidation_ns: Option<UnixNanos>,
     end_ns: UnixNanos,
     run_started: Option<UnixNanos>,
     run_finished: Option<UnixNanos>,
@@ -182,7 +181,6 @@ impl BacktestEngine {
             force_stop: false,
             last_ns: UnixNanos::default(),
             last_module_ns: None,
-            last_liquidation_ns: None,
             end_ns: UnixNanos::default(),
             run_started: None,
             run_finished: None,
@@ -1141,7 +1139,6 @@ impl BacktestEngine {
         self.force_stop = false;
         self.last_ns = UnixNanos::default();
         self.last_module_ns = None;
-        self.last_liquidation_ns = None;
         self.end_ns = UnixNanos::default();
         self.has_book_processed.clear();
 
@@ -1942,11 +1939,6 @@ impl BacktestEngine {
             exchange.borrow().set_clock_time(ts_now);
         }
 
-        // Drain commands then iterate matching engines to fill newly added
-        // orders. Fills may enqueue further commands (e.g. hedge orders
-        // submitted from on_order_filled), so loop until quiescent.
-        // Only process and iterate venues that had pending commands each
-        // pass, to avoid extra fill-model rolls on untouched venues.
         loop {
             // Drain first so commands buffered in the trading queue (e.g. from
             // on_stop handlers) reach the venues before we check for activity.
@@ -1970,16 +1962,6 @@ impl BacktestEngine {
                 let mut exchange = self.venues[venue_id].borrow_mut();
                 exchange.process_for_scope(ts_now, settlement_scope);
             }
-            self.drain_command_queues();
-
-            for venue_id in &active_venues {
-                self.venues[venue_id]
-                    .borrow_mut()
-                    .iterate_matching_engines(ts_now);
-            }
-
-            // Drain again so fill-triggered commands (e.g. hedge orders
-            // from on_order_filled) are visible to has_pending_commands
             self.drain_command_queues();
         }
     }
@@ -2016,12 +1998,7 @@ impl BacktestEngine {
         Ok(())
     }
 
-    fn run_venue_liquidations(&mut self, ts_now: UnixNanos, settlement_scope: SettlementScope) {
-        if self.last_liquidation_ns == Some(ts_now) {
-            return;
-        }
-        self.last_liquidation_ns = Some(ts_now);
-
+    fn run_venue_liquidations(&self, ts_now: UnixNanos, settlement_scope: SettlementScope) {
         if self
             .venues
             .values()
@@ -2036,6 +2013,10 @@ impl BacktestEngine {
 
         self.drain_command_queues();
         self.settle_venues(ts_now, settlement_scope);
+
+        for exchange in self.venues.values() {
+            exchange.borrow_mut().complete_liquidations();
+        }
     }
 
     fn drain_exec_client_events(&self) {

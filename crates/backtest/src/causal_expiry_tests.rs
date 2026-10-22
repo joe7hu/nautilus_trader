@@ -1,11 +1,18 @@
 mod causal_remaining {
     use super::*;
-    use nautilus_common::messages::execution::CancelOrder;
-    use nautilus_execution::models::fee::{FeeModelHandle, FixedFeeModel};
+    use nautilus_common::{
+        messages::execution::{CancelOrder, SubmitOrderList},
+        msgbus::TypedIntoHandler,
+    };
+    use nautilus_execution::{
+        matching_engine::config::OrderMatchingEngineConfig,
+        models::fee::{FeeModelHandle, FixedFeeModel},
+    };
     use nautilus_model::{
         enums::{ContingencyType, TimeInForce},
-        identifiers::Symbol,
+        identifiers::{OrderListId, Symbol},
         instruments::CurrencyPair,
+        orders::OrderList,
         types::Currency,
     };
 
@@ -149,7 +156,7 @@ mod causal_remaining {
             })
             .collect();
         assert_eq!(o.filled_qty(), Quantity::from(qty));
-        assert_eq!(fills.len(), if qty == 0 { 0 } else { 1 });
+        assert_eq!(fills.len(), usize::from(qty != 0));
         if qty > 0 {
             assert_eq!(fills[0].last_qty, Quantity::from(8));
             assert_eq!(fills[0].last_px, Price::from("1.10000"));
@@ -167,7 +174,7 @@ mod causal_remaining {
             .collect()
     }
     fn callback(
-        e: &mut BacktestEngine,
+        e: &BacktestEngine,
         o: &OrderAny,
         at: u64,
         action: &str,
@@ -237,7 +244,7 @@ mod causal_remaining {
     ) {
         let (mut e, o) = setup(causal, true, Some(5));
         let observed = Rc::new(RefCell::new(Vec::new()));
-        callback(&mut e, &o, at, action, "SCHEDULE", observed.clone());
+        callback(&e, &o, at, action, "SCHEDULE", observed.clone());
         let clocks = e.collect_all_clocks();
         match route {
             "jump" => {
@@ -327,7 +334,7 @@ mod causal_remaining {
         assert!(terminal(&result).is_empty());
         economics(&result, if is_gtd { 0 } else { 8 });
     }
-    #[test]
+    #[rstest]
     fn mixed_venues_independent_expiry_and_repeated_maintenance() {
         let mut e = engine();
         venue(&mut e, "CA", true, true);
@@ -449,12 +456,12 @@ mod causal_remaining {
         assert_eq!(snapshot(&e, &first).event_count(), a.event_count());
         assert_eq!(snapshot(&e, &second).event_count(), b.event_count());
     }
-    #[test]
+    #[rstest]
     fn repeated_equal_time_timer_callbacks_observe_one_terminal() {
         let (mut e, o) = setup(true, true, Some(5));
         let observed = Rc::new(RefCell::new(Vec::new()));
-        callback(&mut e, &o, 5, "read", "FIRST-TIMER", observed.clone());
-        callback(&mut e, &o, 5, "read", "SECOND-TIMER", observed.clone());
+        callback(&e, &o, 5, "read", "FIRST-TIMER", observed.clone());
+        callback(&e, &o, 5, "read", "SECOND-TIMER", observed.clone());
         let clocks = e.collect_all_clocks();
         e.advance_time_impl(5.into(), &clocks).unwrap();
         e.finalize_timestamp(&clocks, 5.into(), SettlementScope::All)
@@ -473,9 +480,9 @@ mod causal_remaining {
             serde_json::json!({"case":"duplicate-timers","callbacks":2,"expired_events":1,"fills":0,"fees":0})
         );
     }
-    #[test]
+    #[rstest]
     fn serialized_policy_defaults_stay_disabled() {
-        let c: nautilus_execution::matching_engine::config::OrderMatchingEngineConfig =
+        let c: OrderMatchingEngineConfig =
             serde_json::from_str("{}").unwrap();
         assert!(!c.gtd_expiry_before_match);
         assert!(c.support_gtd_orders);
@@ -505,7 +512,7 @@ mod causal_remaining {
             quote(o.instrument_id(), 4, "1.10000", 6);
         }
         let observed = Rc::new(RefCell::new(Vec::new()));
-        callback(&mut e, &o, 5, "modify", "ECONOMIC-COUNTEREXAMPLE", observed);
+        callback(&e, &o, 5, "modify", "ECONOMIC-COUNTEREXAMPLE", observed);
         let clocks = e.collect_all_clocks();
         e.advance_time_impl(7.into(), &clocks).unwrap();
         let result = snapshot(&e, &o);
@@ -535,7 +542,7 @@ mod causal_remaining {
             Quantity::from(if partial { 2 } else { 0 }),
             "expiry callback must create no additional execution"
         );
-        assert_eq!(actual.len(), if partial { 1 } else { 0 });
+        assert_eq!(actual.len(), usize::from(partial));
         if partial {
             assert_eq!(
                 actual[0],
@@ -551,7 +558,7 @@ mod causal_remaining {
         assert_eq!(terminal(&result), vec![("Expired".into(), 5)]);
     }
 
-    #[test]
+    #[rstest]
     fn independent_native_graph_clocks() {
         let mut results = Vec::new();
         for at in [9_u64, 4] {
@@ -599,10 +606,10 @@ mod causal_remaining {
             .unwrap()
             .borrow_mut()
             .set_latency_model(LatencyModelHandle::new(StaticLatencyModel::new(
-                Default::default(),
-                nautilus_core::DurationNanos::new(delay),
-                Default::default(),
-                Default::default(),
+                DurationNanos::default(),
+                DurationNanos::new(delay),
+                DurationNanos::default(),
+                DurationNanos::default(),
             )));
         let o = order(&e, id, "DELAYED", Some(5));
         cache(&e, &o);
@@ -636,7 +643,7 @@ mod causal_remaining {
                 _ => None,
             })
             .collect();
-        assert_eq!(fills.len(), if causal { 0 } else { 1 });
+        assert_eq!(fills.len(), usize::from(!causal));
         if !causal {
             assert_eq!(fills[0].last_px, Price::from("1.00000"));
             assert_eq!(fills[0].commission, Some(Money::from("0.25 USD")));
@@ -699,13 +706,13 @@ mod causal_remaining {
                 _ => None,
             })
             .collect();
-        assert_eq!(fills.len(), if causal { 0 } else { 1 });
+        assert_eq!(fills.len(), usize::from(!causal));
         if !causal {
             assert_eq!(fills[0].last_px, Price::from("1.00000"));
             assert_eq!(fills[0].commission, Some(Money::from("0.25 USD")));
         }
     }
-    #[test]
+    #[rstest]
     fn stale_oto_list_leg_emits_one_rejection() {
         let mut e = engine();
         venue(&mut e, "CA", true, true);
@@ -716,7 +723,7 @@ mod causal_remaining {
         // Observe raw native dispatch, then forward to the unchanged real engine.
         msgbus::register_order_event_endpoint(
             MessagingSwitchboard::exec_engine_process(),
-            nautilus_common::msgbus::TypedIntoHandler::from(move |event: OrderEventAny| {
+            TypedIntoHandler::from(move |event: OrderEventAny| {
                 if matches!(&event,OrderEventAny::Rejected(r) if r.client_order_id==ClientOrderId::from("CHILD"))
                 {
                     count.set(count.get() + 1);
@@ -752,15 +759,15 @@ mod causal_remaining {
         let clocks = e.collect_all_clocks();
         e.advance_time_impl(6.into(), &clocks).unwrap();
         quote(id, 6, "1.00000", 16);
-        let list = nautilus_model::orders::OrderList::new(
-            nautilus_model::identifiers::OrderListId::from("OVERDUE-LIST"),
+        let list = OrderList::new(
+            OrderListId::from("OVERDUE-LIST"),
             id,
             parent.strategy_id(),
             vec![parent.client_order_id(), child.client_order_id()],
             6.into(),
         );
         send_execution_command(TradingCommand::SubmitOrderList(
-            nautilus_common::messages::execution::SubmitOrderList::new(
+            SubmitOrderList::new(
                 parent.trader_id(),
                 Some(ClientId::from("CA")),
                 parent.strategy_id(),

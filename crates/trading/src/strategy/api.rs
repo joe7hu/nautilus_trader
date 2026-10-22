@@ -31,7 +31,7 @@ use nautilus_model::{
     orders::{OrderAny, OrderList},
     types::{Currency, Money, Price, Quantity},
 };
-use nautilus_portfolio::Portfolio;
+use nautilus_portfolio::{Portfolio, portfolio::ReportingValuation};
 use rust_decimal::Decimal;
 use ustr::Ustr;
 
@@ -848,10 +848,7 @@ impl<'a> PortfolioApi<'a> {
         &self,
         account_id: &AccountId,
         reporting_currency: Currency,
-    ) -> Option<(
-        PortfolioSnapshot,
-        nautilus_portfolio::portfolio::ReportingValuation,
-    )> {
+    ) -> Option<(PortfolioSnapshot, ReportingValuation)> {
         self.portfolio
             .borrow_mut()
             .build_reporting_snapshot(account_id, reporting_currency)

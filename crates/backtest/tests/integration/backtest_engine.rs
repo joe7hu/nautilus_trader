@@ -33,9 +33,11 @@ use nautilus_common::{
     actor::{
         DataActor, DataActorCore, data_actor::DataActorConfig, registry::try_get_actor_unchecked,
     },
+    cache::Cache,
     component::Component,
     enums::ComponentState,
-    msgbus, nautilus_actor,
+    msgbus::{self, MessagingSwitchboard, TypedHandler},
+    nautilus_actor,
     timer::TimeEvent,
 };
 use nautilus_core::{DurationNanos, UUID4, UnixNanos};
@@ -58,7 +60,7 @@ use nautilus_model::{
         OrderStatus, PositionAdjustmentType, PriceType, TimeInForce, TrailingOffsetType,
         TriggerType,
     },
-    events::{OrderEventAny, OrderFilled},
+    events::{AccountState, OrderEventAny, OrderFilled, PositionEvent},
     identifiers::{
         AccountId, ActorId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, PositionId,
         StrategyId, Symbol, TradeId, Venue,
@@ -1866,6 +1868,128 @@ fn test_run_processes_scheduled_funding_settlement(crypto_perpetual_ethusdt: Cry
     assert_eq!(
         result.summary["account.BINANCE.balance.USDT.locked"],
         balance.locked.to_string(),
+    );
+}
+
+#[derive(Debug)]
+struct UnappliedFundingAccountModule {
+    events: Rc<RefCell<Vec<AccountState>>>,
+}
+
+impl SimulationModule for UnappliedFundingAccountModule {
+    fn pre_process(&self, data: &Data) -> anyhow::Result<()> {
+        if matches!(data, Data::FundingRate(_)) {
+            let events = self.events.clone();
+            msgbus::register_account_state_endpoint(
+                MessagingSwitchboard::portfolio_update_account(),
+                TypedHandler::from(move |event: &AccountState| {
+                    events.borrow_mut().push(event.clone());
+                }),
+            );
+        }
+        Ok(())
+    }
+    fn process(
+        &self,
+        _ts_now: UnixNanos,
+        _ctx: &ExchangeContext,
+    ) -> anyhow::Result<SimulationModuleResult> {
+        Ok(SimulationModuleResult::NotReady)
+    }
+    fn acknowledge(&self, _outcomes: &[AccountAdjustmentOutcome]) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn log_diagnostics(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn reset(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[rstest]
+fn test_run_halts_on_unapplied_funding_account_and_cannot_retry() {
+    let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let venue = SimulatedVenueConfig::builder()
+        .venue(Venue::from("BINANCE"))
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Margin)
+        .book_type(BookType::L1_MBP)
+        .starting_balances(vec![Money::from("1000000 USDT")])
+        .modules(vec![SimulationModuleHandle::new(
+            UnappliedFundingAccountModule {
+                events: events.clone(),
+            },
+        )])
+        .build()
+        .unwrap();
+    engine.add_venue(venue).unwrap();
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+    let instrument_id = instrument.id();
+    engine.add_instrument(&instrument).unwrap();
+    engine
+        .add_strategy(SnapshotNettingFlip::new(
+            instrument_id,
+            Quantity::from("1.000"),
+        ))
+        .unwrap();
+    let boundary = UnixNanos::from(4_000_000_000);
+    engine
+        .add_data(
+            vec![
+                quote(instrument_id, "1000.00", "1001.00", 1_000_000_000),
+                quote(instrument_id, "1000.00", "1001.00", 2_000_000_000),
+                Data::MarkPrice(MarkPriceUpdate::new(
+                    instrument_id,
+                    Price::from("1000.00"),
+                    2_500_000_000.into(),
+                    2_500_000_000.into(),
+                )),
+                Data::FundingRate(FundingRateUpdate::new(
+                    instrument_id,
+                    "0.001".parse().unwrap(),
+                    Some(480),
+                    Some(boundary),
+                    3_000_000_000.into(),
+                    3_000_000_000.into(),
+                )),
+                quote(instrument_id, "1100.00", "1101.00", 5_000_000_000),
+            ],
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+    let first = engine.run(None, None, None, false).unwrap_err();
+    let second = engine.run(None, None, None, false).unwrap_err();
+    assert!(first.to_string().contains("Funding settlement failed"));
+    assert_eq!(second.to_string(), first.to_string());
+    assert!(engine.kernel().trader.borrow().is_stopped());
+    assert_eq!(engine.backtest_end(), Some(boundary));
+    let cache = engine.kernel().cache.borrow();
+    let position = cache.positions_open(None, Some(&instrument_id), None, None, None)[0].cloned();
+    assert_eq!(position.adjustments.len(), 1);
+    assert_eq!(
+        position.adjustments[0].pnl_change,
+        Some(Money::from("-1 USDT"))
+    );
+    assert_eq!(position.realized_pnl, Some(Money::from("-1.4004 USDT")));
+    assert_eq!(
+        cache
+            .account(&position.account_id)
+            .unwrap()
+            .balance_total(Some(Currency::USDT())),
+        Some(Money::from("999999.5996 USDT"))
+    );
+    assert_eq!(
+        cache.quote(&instrument_id).unwrap().ts_init,
+        UnixNanos::from(2_000_000_000)
+    );
+    assert_eq!(events.borrow().len(), 1);
+    assert_eq!(
+        events.borrow()[0].balances[0].total,
+        Money::from("999998.5996 USDT")
     );
 }
 
@@ -6679,4 +6803,321 @@ fn test_add_venue_with_oto_full_trigger(crypto_perpetual_ethusdt: CryptoPerpetua
     engine.add_data(quotes, None, true, true).unwrap();
     engine.run(None, None, None, false).unwrap();
     assert_eq!(engine.get_result().iterations, 1);
+}
+
+#[derive(Debug)]
+struct QuotePartialLimitStrategy {
+    core: StrategyCore,
+    instrument_id: InstrumentId,
+    submitted: bool,
+    modify: bool,
+    order_id: Option<ClientOrderId>,
+    events: Rc<RefCell<Vec<OrderEventAny>>>,
+}
+
+nautilus_strategy!(QuotePartialLimitStrategy, {
+    fn on_order_event(&mut self, event: OrderEventAny) {
+        self.events.borrow_mut().push(event);
+    }
+});
+
+impl DataActor for QuotePartialLimitStrategy {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        self.subscribe_quotes(self.instrument_id, None, None);
+        Ok(())
+    }
+
+    fn on_quote(&mut self, _quote: &QuoteTick) -> anyhow::Result<()> {
+        if !self.submitted {
+            self.submitted = true;
+            let order = self.order().limit(
+                self.instrument_id,
+                OrderSide::Buy,
+                Quantity::from("1.000"),
+                Price::from(if self.modify { "999.00" } else { "1000.10" }),
+                Some(TimeInForce::Gtc),
+                None,
+                Some(false),
+                Some(false),
+                Some(false),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            self.order_id = Some(order.client_order_id());
+            self.submit_order(order, None, None, None)?;
+        } else if self.modify {
+            self.modify = false;
+            self.modify_order(
+                self.order_id.unwrap(),
+                None,
+                Some(Price::from("1000.10")),
+                None,
+                None,
+                None,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[rstest]
+#[case::direct_single(false, false, false, "0.400", 1)]
+#[case::queued_single(true, false, false, "0.400", 1)]
+#[case::direct_remainder(false, true, false, "1.000", 2)]
+#[case::queued_remainder(true, true, false, "1.000", 2)]
+#[case::direct_modify(false, false, true, "0.400", 1)]
+#[case::queued_modify(true, false, true, "0.400", 1)]
+fn test_quote_partial_fill_has_one_matching_opportunity_per_stimulus(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+    #[case] use_message_queue: bool,
+    #[case] include_remainder: bool,
+    #[case] modify: bool,
+    #[case] expected_quantity: &str,
+    #[case] expected_fills: usize,
+) {
+    let instrument_id = crypto_perpetual_ethusdt.id;
+    let mut engine = BacktestEngine::new(BacktestEngineConfig {
+        bypass_logging: true,
+        run_analysis: false,
+        ..Default::default()
+    })
+    .unwrap();
+    engine
+        .add_venue(
+            SimulatedVenueConfig::builder()
+                .venue(instrument_id.venue)
+                .oms_type(OmsType::Netting)
+                .account_type(AccountType::Margin)
+                .book_type(BookType::L1_MBP)
+                .starting_balances(vec![Money::from("10000 USDT")])
+                .use_message_queue(use_message_queue)
+                .liquidity_consumption(false)
+                .bar_execution(false)
+                .trade_execution(false)
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+    engine
+        .add_instrument(&InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt))
+        .unwrap();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    engine
+        .add_strategy(QuotePartialLimitStrategy {
+            core: StrategyCore::new(StrategyConfig {
+                strategy_id: Some(StrategyId::from("PARTIAL-001")),
+                ..Default::default()
+            }),
+            instrument_id,
+            submitted: false,
+            modify,
+            order_id: None,
+            events: events.clone(),
+        })
+        .unwrap();
+    let quotes = if modify {
+        vec![(1_000_000_000, "0.400"), (2_000_000_000, "0.400")]
+    } else if include_remainder {
+        vec![(1_000_000_000, "0.400"), (2_000_000_000, "0.600")]
+    } else {
+        vec![(1_000_000_000, "0.400")]
+    };
+    let data = quotes
+        .into_iter()
+        .map(|(ts, size)| {
+            Data::Quote(QuoteTick::new(
+                instrument_id,
+                Price::from("1000.00"),
+                Price::from("1000.10"),
+                Quantity::from(size),
+                Quantity::from(size),
+                UnixNanos::from(ts),
+                UnixNanos::from(ts),
+            ))
+        })
+        .collect();
+    engine.add_data(data, None, true, true).unwrap();
+    engine.run(None, None, None, false).unwrap();
+
+    if modify {
+        let events = events.borrow();
+        let updated = events
+            .iter()
+            .position(|e| matches!(e, OrderEventAny::Updated(_)))
+            .unwrap();
+        let fills: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                if let OrderEventAny::Filled(fill) = e {
+                    Some((i, fill))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(fills.len(), 1);
+        assert!(updated < fills[0].0);
+        assert_eq!(fills[0].1.last_qty, Quantity::from("0.400"));
+        assert_eq!(fills[0].1.last_px, Price::from("1000.10"));
+    }
+    let cache_rc = engine.kernel().cache();
+    let cache = cache_rc.borrow();
+    let orders = cache.orders(None, None, None, None, None);
+    assert_eq!(orders[0].filled_qty(), Quantity::from(expected_quantity));
+    if !include_remainder {
+        assert_eq!(orders[0].leaves_qty(), Quantity::from("0.600"));
+    }
+    drop(orders);
+    drop(cache);
+    let result = engine.get_canonical_result().unwrap();
+    assert_eq!(
+        result.as_value()["fills"].as_array().unwrap().len(),
+        expected_fills
+    );
+    assert_eq!(
+        result.as_value()["orders"][0]["Limit"]["core"]["filled_qty"],
+        expected_quantity,
+    );
+}
+
+#[derive(Debug)]
+struct OpeningApplicationFault {
+    cache: Rc<RefCell<Cache>>,
+    events: Rc<RefCell<Vec<PositionEvent>>>,
+    armed: Cell<bool>,
+}
+
+impl SimulationModule for OpeningApplicationFault {
+    fn pre_process(&self, data: &Data) -> anyhow::Result<()> {
+        if matches!(data, Data::Quote(_)) && !self.armed.replace(true) {
+            let cache = self.cache.clone();
+            let events = self.events.clone();
+            msgbus::subscribe_position_events(
+                "events.position.*".into(),
+                TypedHandler::from(move |event: &PositionEvent| {
+                    events.borrow_mut().push(event.clone());
+                    let mut account = cache.borrow().account_owned(&event.account_id()).unwrap();
+                    account.set_calculate_account_state(false);
+                    cache.borrow_mut().update_account_owned(account).unwrap();
+                }),
+                Some(11),
+            );
+        }
+        Ok(())
+    }
+    fn process(
+        &self,
+        _ts_now: UnixNanos,
+        _ctx: &ExchangeContext,
+    ) -> anyhow::Result<SimulationModuleResult> {
+        Ok(SimulationModuleResult::NotReady)
+    }
+    fn acknowledge(&self, _outcomes: &[AccountAdjustmentOutcome]) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn log_diagnostics(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn reset(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[rstest]
+#[case(false)]
+#[case(true)]
+fn first_timestamp_maintenance_requires_actual_opening_account_application(#[case] suppress: bool) {
+    let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let venue = SimulatedVenueConfig::builder()
+        .venue(Venue::from("BINANCE"))
+        .oms_type(OmsType::Netting)
+        .account_type(AccountType::Margin)
+        .book_type(BookType::L1_MBP)
+        .starting_balances(vec![Money::from("10000 USDT")])
+        .default_leverage(Decimal::ONE)
+        .liquidation_enabled(true)
+        .modules(if suppress {
+            vec![SimulationModuleHandle::new(OpeningApplicationFault {
+                cache: engine.kernel().cache.clone(),
+                events: events.clone(),
+                armed: std::cell::Cell::new(false),
+            })]
+        } else {
+            Vec::new()
+        })
+        .build()
+        .unwrap();
+    engine.add_venue(venue).unwrap();
+    let mut original = crypto_perpetual_ethusdt();
+    original.taker_fee = "0.0005".parse().unwrap();
+    original.margin_maint = "0.1".parse().unwrap();
+    let instrument = InstrumentAny::CryptoPerpetual(original);
+    let instrument_id = instrument.id();
+    engine.add_instrument(&instrument).unwrap();
+    let mut first_quote = SnapshotNettingFlip::new(instrument_id, Quantity::from("0.010"));
+    first_quote.tick_count = 1;
+    engine.add_strategy(first_quote).unwrap();
+    engine
+        .add_data(
+            vec![
+                quote(instrument_id, "3999.99", "4000.00", 1_000_000_000),
+                quote(instrument_id, "3999.99", "4000.00", 2_000_000_000),
+            ],
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+    let result = engine.run(None, None, None, false);
+    {
+        let cache = engine.kernel().cache.borrow();
+        let position =
+            cache.positions_open(None, Some(&instrument_id), None, None, None)[0].cloned();
+        let account = cache.account_owned(&position.account_id).unwrap();
+        eprintln!(
+            "first_timestamp_census {}",
+            serde_json::json!({"suppressed":suppress,"run_error":result.as_ref().err().map(ToString::to_string),"observed_native_positions":events.borrow().len(),"account":account.id(),"balance":account.balance_total(Some(Currency::USDT())),"position_account":position.account_id,"position_qty":position.quantity,"actual_application":cache.position_account_applied(&position,None)})
+        );
+    }
+
+    if suppress {
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("actual post-position native account application missing")
+        );
+        assert_eq!(
+            engine.run(None, None, None, false).unwrap_err().to_string(),
+            error.to_string()
+        );
+        assert!(!events.borrow().is_empty());
+        assert!(engine.kernel().trader.borrow().is_stopped());
+    } else {
+        result.unwrap();
+    }
+    let cache = engine.kernel().cache.borrow();
+    let position = cache.positions_open(None, Some(&instrument_id), None, None, None)[0].cloned();
+    assert_eq!(position.quantity, Quantity::from("0.010"));
+    assert_eq!(cache.orders(None, None, None, None, None).len(), 1);
+    let account = cache.account_owned(&position.account_id).unwrap();
+    assert_eq!(
+        account.balance_total(Some(Currency::USDT())),
+        Some(Money::from("9999.98 USDT"))
+    );
+    let AccountAny::Margin(margin) = account else {
+        panic!("native margin account required")
+    };
+    assert_eq!(
+        margin.total_maintenance_margin(Currency::USDT()),
+        Money::from(if suppress { "0 USDT" } else { "4 USDT" })
+    );
+    assert_eq!(cache.position_account_applied(&position, None), !suppress);
 }

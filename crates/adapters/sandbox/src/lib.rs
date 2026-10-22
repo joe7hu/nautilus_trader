@@ -59,6 +59,10 @@ pub mod python;
 
 // Re-exports
 pub use crate::{
-    config::SandboxExecutionClientConfig, execution::SandboxExecutionClient,
+    config::SandboxExecutionClientConfig,
+    execution::{
+        SandboxExecutionClient, SandboxFundingHandle, SandboxMaintenanceCheckpoint,
+        SandboxMaintenanceHandle,
+    },
     factory::SandboxExecutionClientFactory,
 };

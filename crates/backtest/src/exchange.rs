@@ -17,7 +17,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
+    collections::{BTreeSet, BinaryHeap, VecDeque, hash_map::Entry},
     fmt::Debug,
     rc::Rc,
 };
@@ -29,13 +29,15 @@ use nautilus_common::{
     clients::ExecutionClient,
     clock::{Clock, TestClock},
     messages::execution::{ModifyOrder, TradingCommand},
-    msgbus::{self, MessagingSwitchboard, TypedHandler, switchboard},
+    msgbus::{self, MessagingSwitchboard, TypedHandler},
 };
 use nautilus_core::{
-    DurationNanos, UUID4, UnixNanos,
+    UUID4, UnixNanos,
     correctness::{CorrectnessResultExt, FAILED, check_equal},
 };
 use nautilus_execution::{
+    funding::FundingOwner,
+    maintenance::MaintenanceOwner,
     matching_core::RestingOrder,
     matching_engine::{
         OrderMatchingEngine, config::OrderMatchingEngineConfig, inflight::InflightOrders,
@@ -52,17 +54,15 @@ use nautilus_model::{
         Bar, Data, FundingRateUpdate, InstrumentClose, InstrumentStatus, OrderBookDelta,
         OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
     },
-    enums::{AccountType, AggressorSide, BookType, OmsType, OrderStatus, PositionAdjustmentType},
-    events::{FundingSettlement, OrderEventAny, OrderUpdated, PositionAdjusted, PositionEvent},
+    enums::{AccountType, AggressorSide, BookType, OmsType, OrderStatus},
+    events::{OrderEventAny, OrderUpdated},
     identifiers::{AccountId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
     orderbook::OrderBook,
     orders::{Order, OrderAny},
-    position::Position,
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
-use ustr::Ustr;
 
 use crate::{
     config::SimulatedVenueConfig,
@@ -162,8 +162,8 @@ pub struct SimulatedExchange {
     instruments: AHashMap<InstrumentId, InstrumentAny>,
     matching_engines: IndexMap<InstrumentId, OrderMatchingEngine>,
     last_raw_id: u32,
-    pending_funding_rates: BTreeMap<(UnixNanos, InstrumentId), FundingRateUpdate>,
-    funding_settlements: BTreeSet<(UnixNanos, InstrumentId)>,
+    funding: FundingOwner,
+    maintenance: AHashMap<(AccountId, Currency), MaintenanceOwner>,
     leverages: AHashMap<InstrumentId, Decimal>,
     margin_model: Option<MarginModelHandle>,
     modules: Vec<SimulationModuleHandle>,
@@ -252,9 +252,14 @@ impl SimulatedExchange {
             latency_model: config.latency_model,
             instruments: AHashMap::new(),
             matching_engines: IndexMap::new(),
+            maintenance: AHashMap::new(),
             last_raw_id: 0,
-            pending_funding_rates: BTreeMap::new(),
-            funding_settlements: BTreeSet::new(),
+            funding: FundingOwner::new(
+                config.venue,
+                clock.clone(),
+                cache.clone(),
+                config.frozen_account,
+            ),
             leverages: config.leverages,
             margin_model: config.margin_model,
             modules: config.modules,
@@ -359,6 +364,7 @@ impl SimulatedExchange {
 
     fn pre_process_modules(&mut self, data: &Data) -> anyhow::Result<()> {
         self.check_module_error()?;
+        self.initialize_maintenance_owners()?;
 
         for module_index in 0..self.modules.len() {
             if let Err(e) = self.modules[module_index].pre_process(data) {
@@ -398,10 +404,18 @@ impl SimulatedExchange {
 
     pub fn initialize_account(&mut self) {
         self.generate_fresh_account_state();
+
+        if let Err(e) = self.initialize_maintenance_owners() {
+            self.module_error = Some(e.to_string());
+        }
     }
 
     /// Loads non-emulated open orders from the cache into matching engines.
     pub fn load_open_orders(&mut self) {
+        if let Err(e) = self.initialize_maintenance_owners() {
+            self.module_error = Some(e.to_string());
+            return;
+        }
         let mut open_orders: Vec<(OrderAny, AccountId)> = {
             let cache = self.cache.as_ref().borrow();
             cache
@@ -1195,19 +1209,7 @@ impl SimulatedExchange {
     ) -> anyhow::Result<Option<UnixNanos>> {
         self.pre_process_modules(&Data::FundingRate(funding_rate))?;
 
-        let Some(boundary) = Self::funding_boundary(&funding_rate) else {
-            log::debug!(
-                "Funding rate update for {} does not define a settlement boundary",
-                funding_rate.instrument_id
-            );
-            return Ok(None);
-        };
-
-        let key = (boundary, funding_rate.instrument_id);
-        if !self.funding_settlements.contains(&key) {
-            self.pending_funding_rates.insert(key, funding_rate);
-        }
-        Ok(Some(boundary))
+        Ok(self.funding.queue(funding_rate))
     }
 
     /// Processes a scheduled funding settlement for the instrument.
@@ -1221,13 +1223,9 @@ impl SimulatedExchange {
         ts_event: UnixNanos,
     ) -> anyhow::Result<()> {
         self.check_module_error()?;
-        let key = (ts_event, instrument_id);
-        let Some(funding_rate) = self.pending_funding_rates.remove(&key) else {
-            return Ok(());
-        };
 
-        if !self.settle_funding_rate(&funding_rate, ts_event) {
-            self.pending_funding_rates.insert(key, funding_rate);
+        if let Some(rate) = self.funding.pending_rate(ts_event, instrument_id) {
+            self.settle_funding_rate(&rate, ts_event, false);
         }
         Ok(())
     }
@@ -1237,11 +1235,7 @@ impl SimulatedExchange {
         &self,
         replay_ts: UnixNanos,
     ) -> Vec<(UnixNanos, InstrumentId)> {
-        self.pending_funding_rates
-            .keys()
-            .copied()
-            .take_while(|(boundary, _)| *boundary <= replay_ts)
-            .collect()
+        self.funding.due(replay_ts)
     }
 
     pub(crate) fn settle_funding_boundary(
@@ -1249,319 +1243,54 @@ impl SimulatedExchange {
         boundary: UnixNanos,
         instrument_id: InstrumentId,
     ) -> bool {
-        let key = (boundary, instrument_id);
-        let Some(funding_rate) = self.pending_funding_rates.remove(&key) else {
-            return true;
+        let Some(rate) = self.funding.pending_rate(boundary, instrument_id) else {
+            return self.funding.process_replay(
+                instrument_id,
+                boundary,
+                None,
+                self.exec_client.as_deref(),
+                true,
+            );
         };
-
-        if self.settle_funding_rate(&funding_rate, boundary) {
-            true
-        } else {
-            self.pending_funding_rates.insert(key, funding_rate);
-            false
-        }
+        self.settle_funding_rate(&rate, boundary, true)
     }
 
     #[must_use]
     pub(crate) fn next_funding_boundary(&self) -> Option<UnixNanos> {
-        self.pending_funding_rates
-            .first_key_value()
-            .map(|((boundary, _), _)| *boundary)
+        self.funding.next_boundary()
     }
 
     fn settle_funding_rate(
         &mut self,
         funding_rate: &FundingRateUpdate,
         ts_event: UnixNanos,
+        require_application: bool,
     ) -> bool {
-        let settlement_key = (ts_event, funding_rate.instrument_id);
-        if self.funding_settlements.contains(&settlement_key) {
-            return true;
-        }
-
-        let Some(exec_client) = &self.exec_client else {
-            log::warn!(
-                "Cannot settle funding for {}: execution client is not registered",
-                funding_rate.instrument_id
-            );
-            return false;
-        };
-        let account_id = exec_client.account_id();
-        let account_venue = exec_client.venue();
-
         if !self
             .matching_engines
             .contains_key(&funding_rate.instrument_id)
         {
-            let instrument = {
-                let cache = self.cache.as_ref().borrow();
-                cache.instrument(&funding_rate.instrument_id).cloned()
+            let instrument = self
+                .cache
+                .borrow()
+                .instrument(&funding_rate.instrument_id)
+                .cloned();
+            let Some(instrument) = instrument else {
+                return false;
             };
 
-            if let Some(instrument) = instrument {
-                if let Err(e) = self.add_instrument(instrument) {
-                    log::error!(
-                        "Cannot settle funding for {}: failed to add instrument: {e}",
-                        funding_rate.instrument_id
-                    );
-                    return false;
-                }
-            } else {
-                log::warn!(
-                    "Cannot settle funding for {}: no matching engine or instrument",
-                    funding_rate.instrument_id
-                );
+            if self.add_instrument(instrument).is_err() {
                 return false;
             }
         }
-
-        let open_positions: Vec<Position> = {
-            let cache = self.cache.borrow();
-            cache
-                .positions_open(
-                    Some(&self.id),
-                    Some(&funding_rate.instrument_id),
-                    None,
-                    Some(&account_id),
-                    None,
-                )
-                .into_iter()
-                .map(|position| position.cloned())
-                .collect()
-        };
-
-        if open_positions.is_empty() {
-            self.funding_settlements.insert(settlement_key);
-            return true;
-        }
-
-        let Some(settlement_price) = self.funding_settlement_price(funding_rate.instrument_id)
-        else {
-            log::warn!(
-                "Cannot settle funding for {}: no mark price or top-of-book price",
-                funding_rate.instrument_id
-            );
-            return false;
-        };
-
-        let settlement_currency = open_positions[0].settlement_currency;
-        let mut valued_positions = Vec::with_capacity(open_positions.len());
-        let mut account_adjustments: AHashMap<Currency, Money> = AHashMap::new();
-
-        for position in open_positions {
-            if position.settlement_currency != settlement_currency {
-                log::error!(
-                    "Cannot settle funding for {}: position settlement currencies differ",
-                    funding_rate.instrument_id
-                );
-                return false;
-            }
-
-            let notional = match position.try_notional_value(settlement_price) {
-                Ok(notional) => notional,
-                Err(e) => {
-                    log::error!(
-                        "Cannot settle funding for position {}: invalid notional value: {e}",
-                        position.id
-                    );
-                    return false;
-                }
-            };
-            let side = if position.signed_qty > 0.0 {
-                -Decimal::ONE
-            } else {
-                Decimal::ONE
-            };
-            let Some(amount) = notional
-                .as_decimal()
-                .checked_mul(funding_rate.rate)
-                .and_then(|value| value.checked_mul(side))
-            else {
-                log::error!(
-                    "Cannot settle funding for position {}: funding amount overflow",
-                    position.id
-                );
-                return false;
-            };
-            let pnl_change = match Money::from_decimal(amount, notional.currency) {
-                Ok(money) => money,
-                Err(e) => {
-                    log::error!(
-                        "Cannot settle funding for position {}: invalid funding amount: {e}",
-                        position.id
-                    );
-                    return false;
-                }
-            };
-
-            if pnl_change.currency != settlement_currency {
-                log::error!(
-                    "Cannot settle funding for position {}: settlement currency {} differs from funding currency {}",
-                    position.id,
-                    settlement_currency,
-                    pnl_change.currency
-                );
-                return false;
-            }
-
-            if let Some(realized) = position.realized_pnl {
-                if realized.currency != pnl_change.currency {
-                    log::error!(
-                        "Cannot settle funding for position {}: realized PnL currency {} differs from funding currency {}",
-                        position.id,
-                        realized.currency,
-                        pnl_change.currency
-                    );
-                    return false;
-                }
-
-                if realized.checked_add(pnl_change).is_none() {
-                    log::error!(
-                        "Cannot settle funding for position {}: realized PnL overflow",
-                        position.id
-                    );
-                    return false;
-                }
-            }
-            let total_adjustment =
-                if let Some(current) = account_adjustments.get(&pnl_change.currency).copied() {
-                    let Some(total) = current.checked_add(pnl_change) else {
-                        log::error!(
-                            "Cannot settle funding for {}: aggregate account adjustment overflow",
-                            funding_rate.instrument_id
-                        );
-                        return false;
-                    };
-                    total
-                } else {
-                    pnl_change
-                };
-            account_adjustments.insert(pnl_change.currency, total_adjustment);
-            valued_positions.push((position, pnl_change));
-        }
-
-        let mut account_adjustments = account_adjustments.into_values().collect::<Vec<_>>();
-        account_adjustments.sort_unstable_by_key(|adjustment| adjustment.currency.code);
-
-        if !self.frozen_account {
-            let cache = self.cache.borrow();
-            let Some(account) = cache.account_for_venue(&account_venue) else {
-                log::error!("Cannot settle funding: no account for venue {account_venue}");
-                return false;
-            };
-
-            for adjustment in &account_adjustments {
-                let Some(balance) = account.balance(Some(adjustment.currency)) else {
-                    log::error!(
-                        "Cannot settle funding: no account balance for currency {}",
-                        adjustment.currency
-                    );
-                    return false;
-                };
-
-                if balance.total.checked_add(*adjustment).is_none()
-                    || balance.free.checked_add(*adjustment).is_none()
-                {
-                    log::error!(
-                        "Cannot settle funding: {} account adjustment exceeds Money bounds",
-                        adjustment.currency
-                    );
-                    return false;
-                }
-            }
-        }
-
-        let ts_init = self.clock.borrow().timestamp_ns();
-        let settlement = FundingSettlement::new(
-            msgbus::get_message_bus().borrow().trader_id,
+        let price = self.funding_settlement_price(funding_rate.instrument_id);
+        self.funding.process_replay(
             funding_rate.instrument_id,
-            account_id,
-            funding_rate.rate,
-            settlement_price,
-            settlement_currency,
-            UUID4::new(),
             ts_event,
-            ts_init,
-        );
-        let mut adjusted_positions = Vec::with_capacity(valued_positions.len());
-        for (original, pnl_change) in valued_positions {
-            let mut adjusted = original.clone();
-            let adjustment = PositionAdjusted::new(
-                settlement.trader_id,
-                adjusted.strategy_id,
-                adjusted.instrument_id,
-                adjusted.id,
-                adjusted.account_id,
-                PositionAdjustmentType::Funding,
-                None,
-                Some(pnl_change),
-                Some(Ustr::from(&format!(
-                    "funding_settlement:{}",
-                    settlement.event_id
-                ))),
-                UUID4::new(),
-                settlement.ts_event,
-                settlement.ts_init,
-            );
-            adjusted.apply_adjustment(adjustment);
-            adjusted_positions.push((original, adjusted, adjustment));
-        }
-
-        {
-            let mut cache = self.cache.borrow_mut();
-
-            for (index, (_, adjusted, _)) in adjusted_positions.iter().enumerate() {
-                if let Err(e) = cache.update_position(adjusted) {
-                    log::error!(
-                        "Cannot update position {} after funding settlement: {e}",
-                        adjusted.id
-                    );
-
-                    // Inclusive of `index`: the failed update commits the adjusted position
-                    // to the cache before attempting to persist it, so the position whose
-                    // update returned the error also needs restoring.
-                    for (original, _, _) in adjusted_positions[..=index].iter().rev() {
-                        if let Err(rollback_error) = cache.update_position(original) {
-                            log::error!(
-                                "Cannot roll back position {} after failed funding settlement: {rollback_error}",
-                                original.id
-                            );
-                        }
-                    }
-                    return false;
-                }
-            }
-        }
-
-        for adjustment in &account_adjustments {
-            if !self.adjust_account(*adjustment) {
-                let mut cache = self.cache.borrow_mut();
-                for (original, _, _) in adjusted_positions.iter().rev() {
-                    if let Err(e) = cache.update_position(original) {
-                        log::error!(
-                            "Cannot roll back position {} after failed account adjustment: {e}",
-                            original.id
-                        );
-                    }
-                }
-                return false;
-            }
-        }
-
-        self.funding_settlements.insert(settlement_key);
-        let settlement_topic = switchboard::get_funding_settlement_topic(settlement.instrument_id);
-        msgbus::publish_any(settlement_topic, &settlement);
-
-        for (_, _, adjustment) in adjusted_positions {
-            let event = PositionEvent::PositionAdjusted(adjustment);
-            let PositionEvent::PositionAdjusted(adjustment) = &event else {
-                continue;
-            };
-            let topic = switchboard::get_event_position_topic(adjustment.strategy_id);
-            msgbus::publish_position_event(topic, &event);
-        }
-
-        true
+            price,
+            self.exec_client.as_deref(),
+            require_application,
+        )
     }
 
     fn funding_settlement_price(&self, instrument_id: InstrumentId) -> Option<Price> {
@@ -1575,21 +1304,8 @@ impl SimulatedExchange {
         Price::from_decimal_dp(midpoint, bid.precision.max(ask.precision)).ok()
     }
 
-    fn is_interval_funding_boundary(funding_rate: &FundingRateUpdate) -> bool {
-        let Some(interval_mins) = funding_rate.interval else {
-            return false;
-        };
-        let Ok(interval) = DurationNanos::try_from_mins(u64::from(interval_mins)) else {
-            return false;
-        };
-
-        !interval.is_zero() && funding_rate.ts_event.floor(interval) == funding_rate.ts_event
-    }
-
-    fn funding_boundary(funding_rate: &FundingRateUpdate) -> Option<UnixNanos> {
-        funding_rate.next_funding_ns.or_else(|| {
-            Self::is_interval_funding_boundary(funding_rate).then_some(funding_rate.ts_event)
-        })
+    fn funding_boundary(rate: &FundingRateUpdate) -> Option<UnixNanos> {
+        FundingOwner::boundary(rate)
     }
 
     /// Advances the exchange clock and processes all pending inflight and queued trading commands
@@ -1728,8 +1444,8 @@ impl SimulatedExchange {
             matching_engine.reset();
         }
 
-        self.pending_funding_rates.clear();
-        self.funding_settlements.clear();
+        self.funding.reset();
+        self.maintenance.clear();
         self.message_queue.clear();
         self.inflight_queue.clear();
         self.inflight_orders.clear();
@@ -1765,109 +1481,87 @@ impl SimulatedExchange {
     /// > **Note**: A future `cross_margin_mode` venue configuration could extend this to
     /// > liquidate all positions across all settlement currencies simultaneously.
     pub fn process_liquidations(&mut self, ts_now: UnixNanos) {
-        if !self.liquidation_enabled {
+        if let Err(e) = self.initialize_maintenance_owners() {
+            self.module_error = Some(e.to_string());
             return;
         }
 
-        if self.frozen_account {
+        if !self.liquidation_enabled || self.frozen_account {
             return;
         }
-
-        let account = {
-            let cache = self.cache.borrow();
-            cache.account_for_venue_owned(&self.id)
-        };
-        let Some(account) = account else { return };
-        let AccountAny::Margin(margin_account) = &account else {
+        let account = self.cache.borrow().account_for_venue_owned(&self.id);
+        let Some(AccountAny::Margin(account)) = account else {
             return;
         };
-        let account_id = margin_account.id();
 
-        let currencies: Vec<Currency> = margin_account.currencies();
-
-        let open_positions: Vec<Position> = {
-            let cache = self.cache.borrow();
-            cache
-                .positions_open(Some(&self.id), None, None, None, None)
-                .into_iter()
-                .map(|p| p.cloned())
-                .collect()
-        };
-
-        // Pre-bucket position indices by settlement currency to avoid repeated full scans.
-        let mut positions_by_currency: AHashMap<Currency, Vec<usize>> = AHashMap::new();
-        for (i, p) in open_positions.iter().enumerate() {
-            positions_by_currency
-                .entry(p.settlement_currency)
-                .or_default()
-                .push(i);
-        }
-
-        for currency in currencies {
-            let Some(balance) = margin_account.balance(Some(currency)) else {
-                continue;
-            };
-            let balance_f64 = balance.total.as_f64();
-
-            let Some(indices) = positions_by_currency.get(&currency) else {
-                continue;
+        for currency in account.currencies() {
+            let key = (account.id(), currency);
+            let Some(owner) = self.maintenance.get_mut(&key) else {
+                self.module_error = Some("native maintenance baseline missing".into());
+                return;
             };
 
-            let (upnl_f64, all_priced) = {
-                let cache = self.cache.borrow();
-                let mut upnl = 0.0_f64;
-                let mut all_priced = true;
-
-                for &i in indices {
-                    let p = &open_positions[i];
-                    if let Some(pnl) = cache.calculate_unrealized_pnl(p) {
-                        upnl += pnl.as_f64();
-                    } else {
-                        all_priced = false;
-                        break;
-                    }
-                }
-                (upnl, all_priced)
-            };
-
-            if !all_priced {
-                continue; // defer until all positions are priced
-            }
-
-            let equity = balance_f64 + upnl_f64;
-            let maintenance = margin_account.total_maintenance_margin(currency).as_f64();
-
-            if maintenance == 0.0 {
-                continue;
-            }
-
-            let threshold = maintenance * self.liquidation_trigger_ratio;
-
-            if equity > threshold {
-                continue;
-            }
-
-            log::warn!(
-                "LIQUIDATION triggered for account {} currency {}: equity={:.4} <= threshold={:.4} (maintenance={:.4} x ratio={})",
-                account_id,
+            if let Err(e) = owner.process(
+                ts_now,
                 currency,
-                equity,
-                threshold,
-                maintenance,
-                self.liquidation_trigger_ratio
-            );
+                self.liquidation_cancel_open_orders,
+                self.matching_engines.values_mut(),
+            ) {
+                if owner.can_capture() && !owner.pending() {
+                    log::warn!("Native maintenance deferred: {e}");
+                } else {
+                    self.module_error = Some(e.to_string());
+                    return;
+                }
+            }
+        }
+    }
 
-            for matching_engine in self.matching_engines.values_mut() {
-                matching_engine.liquidate_open_positions(
-                    ts_now,
-                    self.liquidation_cancel_open_orders,
-                    currency,
-                );
+    fn initialize_maintenance_owners(&mut self) -> anyhow::Result<()> {
+        if !self.liquidation_enabled || self.frozen_account {
+            return Ok(());
+        }
+        let account = self.cache.borrow().account_for_venue_owned(&self.id);
+        let Some(account) = account else {
+            anyhow::bail!("native maintenance account missing")
+        };
+        let AccountAny::Margin(account) = account else {
+            return Ok(());
+        };
+        let ratio = Decimal::from_f64_retain(self.liquidation_trigger_ratio)
+            .ok_or_else(|| anyhow::anyhow!("invalid native maintenance trigger ratio"))?;
+
+        for currency in account.currencies() {
+            if let Entry::Vacant(entry) = self.maintenance.entry((account.id(), currency)) {
+                entry.insert(MaintenanceOwner::new(
+                    account.id(),
+                    self.cache.clone(),
+                    ratio,
+                    usize::MAX,
+                )?);
+            }
+        }
+        Ok(())
+    }
+
+    /// Confirms original liquidation application after native settlement and retains its cut.
+    pub fn complete_liquidations(&mut self) {
+        for owner in self.maintenance.values_mut() {
+            if let Err(e) = owner
+                .complete()
+                .and_then(|()| owner.acknowledge(owner.completed()))
+            {
+                self.module_error = Some(e.to_string());
+                return;
             }
         }
     }
 
     fn process_trading_command(&mut self, command: TradingCommand) {
+        if let Err(e) = self.initialize_maintenance_owners() {
+            self.module_error = Some(e.to_string());
+            return;
+        }
         self.inflight_orders.remove(&command);
         let instrument_id = command.instrument_id();
         assert!(

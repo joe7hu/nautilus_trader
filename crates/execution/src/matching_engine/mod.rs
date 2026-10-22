@@ -1708,26 +1708,33 @@ impl OrderMatchingEngine {
 
     /// Processes a quote tick to update the market state.
     pub fn process_quote_tick(&mut self, quote: &QuoteTick) {
+        if self.install_quote_tick(quote) {
+            self.iterate(quote.ts_init, AggressorSide::NoAggressor);
+        }
+    }
+
+    /// Installs a quote without matching resting orders, for the native maintenance barrier.
+    pub fn install_quote_tick(&mut self, quote: &QuoteTick) -> bool {
         log::debug!("Processing {quote}");
 
         if let Err(e) = self.check_price_precision(quote.bid_price.precision, "bid_price") {
             self.log_precision_mismatch("quote tick", quote.instrument_id, &e);
-            return;
+            return false;
         }
 
         if let Err(e) = self.check_price_precision(quote.ask_price.precision, "ask_price") {
             self.log_precision_mismatch("quote tick", quote.instrument_id, &e);
-            return;
+            return false;
         }
 
         if let Err(e) = self.check_size_precision(quote.bid_size.precision, "bid_size") {
             self.log_precision_mismatch("quote tick", quote.instrument_id, &e);
-            return;
+            return false;
         }
 
         if let Err(e) = self.check_size_precision(quote.ask_size.precision, "ask_size") {
             self.log_precision_mismatch("quote tick", quote.instrument_id, &e);
-            return;
+            return false;
         }
 
         self.precision_mismatch_streak = 0;
@@ -1741,12 +1748,11 @@ impl OrderMatchingEngine {
                     self.book.ts_last,
                     self.book.instrument_id,
                 );
-                self.iterate(quote.ts_init, AggressorSide::NoAggressor);
-                return;
+                return false;
             }
 
             if !self.update_quote_tick_or_skip(quote, "quote tick") {
-                return;
+                return false;
             }
 
             if self.config.queue_position {
@@ -1764,7 +1770,7 @@ impl OrderMatchingEngine {
             self.last_quote_ask = Some(quote.ask_price);
         }
 
-        self.iterate(quote.ts_init, AggressorSide::NoAggressor);
+        true
     }
 
     /// Processes a bar and simulates market dynamics by creating synthetic ticks.
@@ -2743,9 +2749,42 @@ impl OrderMatchingEngine {
         cancel_open_orders: bool,
         settlement_currency: Currency,
     ) {
+        let accounts: IndexSet<_> = self
+            .cache
+            .borrow()
+            .positions_open(None, Some(&self.instrument.id()), None, None, None)
+            .iter()
+            .map(|p| p.account_id)
+            .collect();
+
+        for account in accounts {
+            if let Err(e) = self.liquidate_account_positions(
+                ts_now,
+                cancel_open_orders,
+                settlement_currency,
+                account,
+            ) {
+                log::error!("Native liquidation failed: {e}");
+            }
+        }
+    }
+
+    /// Dispatches original reduce-only IOC closes for one exact native account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before submitting a conflicting original ID or invalid native order.
+    pub fn liquidate_account_positions(
+        &mut self,
+        ts_now: UnixNanos,
+        cancel_open_orders: bool,
+        settlement_currency: Currency,
+        target_account: AccountId,
+    ) -> anyhow::Result<Vec<ClientOrderId>> {
+        let mut originals = Vec::new();
         // Only liquidate positions settled in the breached currency.
         if self.instrument.settlement_currency() != settlement_currency {
-            return;
+            return Ok(originals);
         }
 
         if cancel_open_orders {
@@ -2756,7 +2795,10 @@ impl OrderMatchingEngine {
                     cache.order_owned(&order_info.client_order_id)
                 };
 
-                if let Some(order) = order {
+                if let Some(order) = order
+                    && order.account_id() == Some(target_account)
+                {
+                    originals.push(order.client_order_id());
                     self.cancel_order(&order, None);
                 }
             }
@@ -2773,7 +2815,13 @@ impl OrderMatchingEngine {
         )> = {
             let cache = self.cache.borrow();
             cache
-                .positions_open(None, Some(&instrument_id), None, None, None)
+                .positions_open(
+                    None,
+                    Some(&instrument_id),
+                    None,
+                    Some(&target_account),
+                    None,
+                )
                 .into_iter()
                 .filter_map(|pos| {
                     OrderCore::closing_side(pos.side).map(|closing_side| {
@@ -2805,9 +2853,9 @@ impl OrderMatchingEngine {
                 continue;
             }
 
-            let client_order_id = ClientOrderId::from(
-                format!("LIQUIDATION-{}-{}", self.venue, UUID4::new()).as_str(),
-            );
+            let client_order_id = self
+                .ids_generator
+                .liquidation_client_order_id(account_id, instrument_id)?;
             let order = OrderAny::Market(MarketOrder::new(
                 trader_id,
                 strategy_id,
@@ -2833,19 +2881,22 @@ impl OrderMatchingEngine {
                 ))]),
             ));
 
-            let venue_order_id = self.ids_generator.get_venue_order_id(&order).unwrap();
+            anyhow::ensure!(
+                self.cache.borrow().order(&client_order_id).is_none(),
+                "native liquidation order ID collision"
+            );
+            let venue_order_id = self.ids_generator.get_venue_order_id(&order)?;
+            originals.push(client_order_id);
             {
                 let mut cache = self.cache.borrow_mut();
-                if let Err(e) = cache.add_order(order.clone(), Some(position_id), None, false) {
-                    log::debug!("Liquidation order already in cache: {e}");
-                } else {
-                    drop(cache);
-                    self.publish_order_initialized(&order);
-                    self.cache
-                        .borrow_mut()
-                        .add_venue_order_id(&client_order_id, &venue_order_id, false)
-                        .ok();
-                }
+                cache.add_order(order.clone(), Some(position_id), None, false).map_err(|e| anyhow::anyhow!("original native liquidation {client_order_id} cache allocation failed: {e}"))?;
+                drop(cache);
+                self.publish_order_initialized(&order);
+                self.cache.borrow_mut().add_venue_order_id(
+                    &client_order_id,
+                    &venue_order_id,
+                    false,
+                )?;
             }
 
             // Route through the normal market-order fill machinery (fill model,
@@ -2854,9 +2905,98 @@ impl OrderMatchingEngine {
             self.generate_order_submitted(&order, account_id);
             self.generate_order_accepted(&order, venue_order_id);
             self.fill_market_order(client_order_id);
+            if let Some(original) = self.order_snapshot(client_order_id)
+                && !original.is_closed()
+            {
+                self.cancel_order(&original, None);
+            }
         }
+        Ok(originals)
     }
 
+    /// Captures all original native ID counters for this engine.
+    pub fn ids_checkpoint(&self) -> ids_generator::IdsCheckpoint {
+        self.ids_generator.checkpoint()
+    }
+
+    /// Restores one original opening order and at most two terminal native liquidation closes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unresolved IOC, changed linkage or mismatched original counters.
+    pub fn restore_quote_only_history(
+        &mut self,
+        orders: &[OrderAny],
+        account_id: AccountId,
+        ids: &ids_generator::IdsCheckpoint,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            orders.len() <= 3 && self.core.iter_orders().next().is_none(),
+            "unsupported native order history"
+        );
+        let opening: Vec<_> = orders
+            .iter()
+            .filter(|o| o.order_type() == OrderType::Limit && o.time_in_force() == TimeInForce::Gtc)
+            .cloned()
+            .collect();
+        anyhow::ensure!(
+            opening.len() <= 1 && (orders.is_empty() || opening.len() == 1),
+            "native history needs its original opening"
+        );
+
+        for close in orders
+            .iter()
+            .filter(|o| o.order_type() != OrderType::Limit || o.time_in_force() != TimeInForce::Gtc)
+        {
+            anyhow::ensure!(
+                close.instrument_id() == self.instrument.id()
+                    && close.account_id() == Some(account_id)
+                    && close.order_type() == OrderType::Market
+                    && close.time_in_force() == TimeInForce::Ioc
+                    && close.is_reduce_only()
+                    && close.is_closed()
+                    && close.venue_order_id().is_some()
+                    && close.contingency_type().is_none()
+                    && !close.is_emulated()
+                    && close.client_order_id().as_str().starts_with("LIQUIDATION-")
+                    && close.tags().is_some_and(|tags| tags
+                        .iter()
+                        .any(|tag| tag.as_str() == format!("LIQUIDATION_{}_CLOSE", self.venue)))
+                    && opening
+                        .first()
+                        .is_some_and(|o| o.trader_id() == close.trader_id()
+                            && o.strategy_id() == close.strategy_id()
+                            && o.order_side() != close.order_side())
+                    && self
+                        .cache
+                        .borrow()
+                        .position_id(&close.client_order_id())
+                        .is_some(),
+                "unsupported original native liquidation close"
+            );
+        }
+        ids.validate_history(orders)?;
+        self.restore_quote_only_limit_orders(&opening, account_id)?;
+        let execution_count = orders
+            .iter()
+            .flat_map(|o| o.events())
+            .filter(|event| matches!(event, OrderEventAny::Filled(_)))
+            .count();
+        self.ids_generator.reset();
+        self.ids_generator.restore(ids)?;
+        anyhow::ensure!(
+            self.ids_generator.checkpoint().execution_count() == execution_count,
+            "original native execution counter mismatch"
+        );
+        Ok(())
+    }
+
+    /// Restores the complete original limit-order history into an empty quote-only engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the engine profile is unsupported, its matching core is nonempty,
+    /// or the original orders have incompatible identities, states or precision.
     pub fn restore_quote_only_limit_orders(
         &mut self,
         orders: &[OrderAny],
@@ -2865,7 +3005,7 @@ impl OrderMatchingEngine {
         anyhow::ensure!(
             self.core.iter_orders().next().is_none()
                 && self.book_type == BookType::L1_MBP
-                && self.account_type == AccountType::Cash
+                && matches!(self.account_type, AccountType::Cash | AccountType::Margin)
                 && self.oms_type == OmsType::Netting
                 && !self.config.queue_position
                 && !self.config.liquidity_consumption
@@ -4212,13 +4352,25 @@ impl OrderMatchingEngine {
     }
 
     fn fill_resting_limit_order(&mut self, client_order_id: ClientOrderId) {
-        // A market-to-limit remainder rests as maker after its initial taker fill
-        if self
-            .core
-            .get_order(client_order_id)
-            .is_some_and(|order| order.order_type == OrderType::MarketToLimit)
-            && let Some(mut order) = self.cache.borrow_mut().order_mut(&client_order_id)
-        {
+        let resting = self.core.get_order(client_order_id).is_some_and(|order| {
+            order.order_type == OrderType::MarketToLimit
+                || (order.order_type == OrderType::Limit
+                    && !self
+                        .pending_order_updates
+                        .borrow()
+                        .contains_key(&client_order_id)
+                    && self
+                        .cache
+                        .borrow()
+                        .order(&client_order_id)
+                        .is_some_and(|cached| {
+                            cached.filled_qty().is_positive()
+                                && self.cached_filled_qty.get(&client_order_id)
+                                    == Some(&cached.filled_qty())
+                        }))
+        });
+
+        if resting && let Some(mut order) = self.cache.borrow_mut().order_mut(&client_order_id) {
             order.set_liquidity_side(LiquiditySide::Maker);
         }
         self.fill_limit_order(client_order_id);

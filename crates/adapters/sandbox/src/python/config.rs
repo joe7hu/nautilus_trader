@@ -88,6 +88,8 @@ impl SandboxExecutionClientConfig {
             base_currency,
             oms_type: oms_type.unwrap_or(OmsType::Netting),
             account_type: account_type.unwrap_or(AccountType::Margin),
+            execution_deadline_ns: None,
+            expected_funding_ns: None,
             default_leverage: default_leverage.unwrap_or(Decimal::ONE),
             leverages: ahash::AHashMap::new(),
             book_type: book_type.unwrap_or(BookType::L1_MBP),

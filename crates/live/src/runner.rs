@@ -499,6 +499,10 @@ impl AsyncRunner {
     #[inline]
     pub fn handle_exec_event(event: ExecutionEvent) {
         match event {
+            ExecutionEvent::FundingBoundary(message)
+            | ExecutionEvent::SimulationBoundary(message) => {
+                message.dispatch();
+            }
             ExecutionEvent::Order(order_event) => {
                 msgbus::send_order_event(MessagingSwitchboard::exec_engine_process(), order_event);
             }

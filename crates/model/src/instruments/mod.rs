@@ -722,7 +722,10 @@ pub(crate) fn try_notional_value(
             .and_then(|value| value.checked_div(price.as_decimal()))
             .ok_or_else(|| anyhow::anyhow!("inverse notional calculation overflow"))?
     } else if is_inverse {
-        quantity.as_decimal()
+        quantity
+            .as_decimal()
+            .checked_mul(multiplier.as_decimal())
+            .ok_or_else(|| anyhow::anyhow!("inverse quote notional calculation overflow"))?
     } else {
         quantity
             .as_decimal()
@@ -1605,6 +1608,30 @@ mod tests {
         let notional = xbtusd_inverse_perp.calculate_notional_value(quantity, price, Some(true));
         let expected = Money::new(100.0, xbtusd_inverse_perp.quote_currency());
         assert_eq!(notional, expected);
+    }
+
+    #[rstest]
+    #[case("1", "100", "100 USD", "0.00250000 BTC")]
+    #[case("2", "100", "200 USD", "0.00500000 BTC")]
+    #[case("1", "1", "1 USD", "0.00002500 BTC")]
+    fn inverse_contract_notional_preserves_original_multiplier(
+        mut xbtusd_inverse_perp: CryptoPerpetual,
+        #[case] contracts: &str,
+        #[case] multiplier: &str,
+        #[case] quote: &str,
+        #[case] base: &str,
+    ) {
+        xbtusd_inverse_perp.multiplier = Quantity::from(multiplier);
+        let quantity = Quantity::from(contracts);
+        let price = Price::from("40000.0");
+        assert_eq!(
+            xbtusd_inverse_perp.calculate_notional_value(quantity, price, Some(true)),
+            Money::from(quote)
+        );
+        assert_eq!(
+            xbtusd_inverse_perp.calculate_notional_value(quantity, price, None),
+            Money::from(base)
+        );
     }
 
     #[rstest]

@@ -882,6 +882,7 @@ impl ClientOutput {
         let trader_id = factory.trader_id();
 
         let valid = match &event {
+            ExecutionEvent::FundingBoundary(_) | ExecutionEvent::SimulationBoundary(_) => false,
             ExecutionEvent::Account(event) => event.account_id == account_id,
             ExecutionEvent::Order(event) => {
                 event.trader_id() == trader_id

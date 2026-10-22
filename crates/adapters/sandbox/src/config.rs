@@ -60,6 +60,10 @@ pub struct SandboxExecutionClientConfig {
     /// The account type for the client.
     #[builder(default = AccountType::Margin)]
     pub account_type: AccountType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_deadline_ns: Option<nautilus_core::UnixNanos>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_funding_ns: Option<nautilus_core::UnixNanos>,
     /// The account default leverage (for margin accounts).
     #[builder(default = Decimal::ONE)]
     pub default_leverage: Decimal,

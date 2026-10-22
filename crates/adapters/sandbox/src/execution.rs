@@ -43,18 +43,31 @@ use nautilus_common::{
         self, MStr, MessagingSwitchboard, Pattern, TypedHandler,
         typed_handler::ShareableMessageHandler,
     },
+    runner::TimeEventMessage,
     timer::{TimeEvent, TimeEventCallback},
 };
 use nautilus_core::{DurationNanos, Params, UUID4, UnixNanos, WeakCell};
 use nautilus_execution::{
     client::core::ExecutionClientCore,
-    matching_engine::{OrderMatchingEngine, inflight::InflightOrders},
+    funding::{
+        FundingAccountPublisher, FundingCheckpoint, FundingOwner, FundingPriceCut, FundingProgress,
+        FundingWindow,
+    },
+    maintenance::{
+        MaintenanceCheckpoint, MaintenanceOwner, MaintenanceReceipt, MaintenanceThreshold,
+    },
+    matching_engine::{
+        OrderMatchingEngine, ids_generator::IdsCheckpoint, inflight::InflightOrders,
+    },
     models::{fee::FeeModelHandle, fill::FillModelHandle, latency::LatencyModel},
 };
 use nautilus_model::{
-    accounts::AccountAny,
-    data::{Bar, InstrumentClose, InstrumentStatus, OrderBookDeltas, QuoteTick, TradeTick},
-    enums::{AccountType, BookType, OmsType},
+    accounts::{Account, AccountAny},
+    data::{
+        Bar, FundingRateUpdate, InstrumentClose, InstrumentStatus, OrderBookDeltas, QuoteTick,
+        TradeTick,
+    },
+    enums::{AccountType, AggressorSide, BookType, OmsType, PositionAdjustmentType},
     events::{
         OrderCancelRejected, OrderEventAny, OrderModifyRejected, OrderRejected, PositionEvent,
     },
@@ -63,9 +76,11 @@ use nautilus_model::{
     },
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
+    position::Position,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, MarginBalance, Money},
+    types::{AccountBalance, Currency, MarginBalance, Money, Quantity},
 };
+use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use crate::config::SandboxExecutionClientConfig;
@@ -89,6 +104,174 @@ pub struct SandboxExecutionClient {
     cache: Rc<RefCell<Cache>>,
 }
 
+/// Read-only access to the funding cut of one registered native sandbox client.
+///
+/// This handle stays on the client's native owner thread and cannot publish or settle events.
+#[derive(Clone)]
+pub struct SandboxFundingHandle {
+    funding: Rc<SandboxFunding>,
+    account_id: AccountId,
+}
+
+impl Debug for SandboxFundingHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(SandboxFundingHandle))
+            .field("account_id", &self.account_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SandboxFundingHandle {
+    /// Captures the original funding lifecycle against its current native account and positions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error while a boundary, account application or owner borrow is unresolved.
+    pub fn checkpoint(&self) -> anyhow::Result<FundingCheckpoint> {
+        anyhow::ensure!(
+            self.funding.enabled.get() && !self.funding.in_flight.get(),
+            "native funding capture is unavailable"
+        );
+        self.funding
+            .owner
+            .try_borrow()
+            .map_err(|_| anyhow::anyhow!("native funding owner is borrowed"))?
+            .checkpoint(self.account_id)
+    }
+}
+
+/// Full original maintenance lifecycle and native matching ID state for dormant restoration.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SandboxMaintenanceCheckpoint {
+    version: u8,
+    profile: SandboxExecutionClientConfig,
+    instruments: Vec<InstrumentAny>,
+    owner: MaintenanceCheckpoint,
+    engines: Vec<(InstrumentId, IdsCheckpoint)>,
+}
+
+/// Owner-thread access to coherent original maintenance capture and its durable acknowledgement.
+#[derive(Clone)]
+pub struct SandboxMaintenanceHandle {
+    inner: Rc<RefCell<SandboxInner>>,
+}
+
+impl Debug for SandboxMaintenanceHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(SandboxMaintenanceHandle))
+            .finish_non_exhaustive()
+    }
+}
+
+impl SandboxMaintenanceHandle {
+    /// Captures the complete original native account/position/order-generator lifecycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error while a native turn, account application or owner borrow is unresolved.
+    pub fn checkpoint(&self) -> anyhow::Result<SandboxMaintenanceCheckpoint> {
+        let inner = self
+            .inner
+            .try_borrow()
+            .map_err(|_| anyhow::anyhow!("native maintenance owner borrowed"))?;
+        anyhow::ensure!(
+            !inner.maintenance_in_flight,
+            "native maintenance FIFO turn pending"
+        );
+        anyhow::ensure!(
+            inner.config.latency_model.is_none()
+                && inner.config.fill_model.is_none()
+                && inner.config.fee_model.is_none(),
+            "runtime-only native models cannot be captured for restoration"
+        );
+        let owner = inner
+            .maintenance
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("native maintenance disabled"))?;
+        anyhow::ensure!(
+            owner.checkpoint().account().is_some() && !owner.pending() && owner.can_capture(),
+            "native maintenance original application unresolved"
+        );
+        Ok(SandboxMaintenanceCheckpoint {
+            version: 1,
+            profile: inner.config.clone(),
+            instruments: inner
+                .cache
+                .borrow()
+                .instruments(&inner.config.venue, None)
+                .into_iter()
+                .cloned()
+                .collect(),
+            owner: owner.checkpoint(),
+            engines: inner
+                .matching_engines
+                .iter()
+                .map(|(id, engine)| (*id, engine.ids_checkpoint()))
+                .collect(),
+        })
+    }
+
+    /// Reads the same native exit-quote threshold without changing money, orders or counters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unresolved application or unsupported native valuation.
+    pub fn threshold(
+        &self,
+        instrument: InstrumentId,
+    ) -> anyhow::Result<Option<MaintenanceThreshold>> {
+        let inner = self
+            .inner
+            .try_borrow()
+            .map_err(|_| anyhow::anyhow!("native maintenance owner borrowed"))?;
+        anyhow::ensure!(
+            !inner.maintenance_in_flight,
+            "native maintenance FIFO turn pending"
+        );
+        let instrument = inner.cache.borrow().try_instrument(&instrument)?.clone();
+        inner
+            .maintenance
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("native maintenance disabled"))?
+            .threshold(&instrument)
+    }
+
+    /// Releases only the captured exact original receipt prefix after durable acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unresolved or mismatched native receipts.
+    pub fn acknowledge(&self, prefix: usize) -> anyhow::Result<()> {
+        let mut inner = self
+            .inner
+            .try_borrow_mut()
+            .map_err(|_| anyhow::anyhow!("native maintenance owner borrowed"))?;
+        inner
+            .maintenance
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("native maintenance disabled"))?
+            .acknowledge(prefix)?;
+        let now = inner.clock.borrow().timestamp_ns();
+        inner.minimum_quote_init = Some(now);
+        Ok(())
+    }
+}
+
+impl SandboxMaintenanceCheckpoint {
+    /// Returns the original full native account metadata and event history.
+    pub fn account(&self) -> Option<&AccountAny> {
+        self.owner.account()
+    }
+    /// Returns the original native positions without reconstructing their economics.
+    pub fn positions(&self) -> &[Position] {
+        self.owner.positions()
+    }
+    /// Returns the complete original native maintenance receipt prefix.
+    pub fn receipts(&self) -> &[MaintenanceReceipt] {
+        self.owner.receipts()
+    }
+}
+
 struct RegisteredHandlers {
     deltas_pattern: MStr<Pattern>,
     deltas_handler: TypedHandler<OrderBookDeltas>,
@@ -102,6 +285,8 @@ struct RegisteredHandlers {
     status_handler: ShareableMessageHandler,
     close_pattern: MStr<Pattern>,
     close_handler: ShareableMessageHandler,
+    funding_pattern: MStr<Pattern>,
+    funding_handler: TypedHandler<FundingRateUpdate>,
     position_pattern: MStr<Pattern>,
     position_handler: TypedHandler<PositionEvent>,
 }
@@ -134,6 +319,29 @@ impl SandboxExecutionClient {
             balances.insert(money.currency.code.to_string(), *money);
         }
 
+        let funding = Rc::new(SandboxFunding {
+            owner: RefCell::new(FundingOwner::new(
+                config.venue,
+                clock.clone(),
+                cache.clone(),
+                config.frozen_account,
+            )),
+            publisher: SandboxFundingPublisher {
+                factory: OrderEventFactory::new(
+                    core.trader_id,
+                    core.account_id,
+                    core.account_type,
+                    core.base_currency,
+                ),
+                venue: config.venue,
+                clock: clock.clone(),
+            },
+            initialized: Cell::new(false),
+            enabled: Cell::new(false),
+            active: Cell::new(false),
+            in_flight: Cell::new(false),
+            generation: Cell::new(0),
+        });
         let fill_model = config
             .fill_model
             .clone()
@@ -145,6 +353,13 @@ impl SandboxExecutionClient {
                 cache: cache.clone(),
                 config: config.clone(),
                 fill_model,
+                funding: funding.clone(),
+                maintenance: None,
+                maintenance_in_flight: false,
+                maintenance_active: false,
+                maintenance_quote: None,
+                maintenance_restore: MaintenanceRestore::Fresh,
+                maintenance_source_fault: false,
                 matching_engines: AHashMap::new(),
                 next_engine_raw_id: 0,
                 balances,
@@ -178,12 +393,28 @@ impl SandboxExecutionClient {
         }
     }
 
-    pub fn restore_quote_only_cash(&mut self) -> anyhow::Result<()> {
+    /// Restores the original quote-only sandbox account and order state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is active, original state is unavailable,
+    /// or the account, instrument or order profile is unsupported.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the matching engine is absent after it has been initialized.
+    pub fn restore_quote_only(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.restored.get()
                 && !self.core.borrow().is_connected()
-                && self.inner.borrow().matching_engines.is_empty()
-                && self.config.account_type == AccountType::Cash
+                && (self.inner.borrow().matching_engines.is_empty()
+                    || self.inner.borrow().maintenance.is_some())
+                && (self.inner.borrow().maintenance.is_none()
+                    || self.inner.borrow().maintenance_restore == MaintenanceRestore::Restored)
+                && matches!(
+                    self.config.account_type,
+                    AccountType::Cash | AccountType::Margin
+                )
                 && self.config.oms_type == OmsType::Netting
                 && self.config.book_type == BookType::L1_MBP
                 && !self.config.bar_execution
@@ -206,9 +437,9 @@ impl SandboxExecutionClient {
                 .account_owned(&account_id)
                 .ok_or_else(|| anyhow::anyhow!("original cash account unavailable"))?;
             anyhow::ensure!(
-                matches!(account, AccountAny::Cash(_))
+                account.account_type() == self.config.account_type
                     && account.base_currency() == self.config.base_currency,
-                "original account is not cash"
+                "original account type mismatch"
             );
             let orders = cache
                 .orders(Some(&self.config.venue), None, None, None, None)
@@ -216,8 +447,13 @@ impl SandboxExecutionClient {
                 .map(|o| (*o).clone())
                 .collect::<Vec<_>>();
             anyhow::ensure!(
-                orders.len() <= 1,
-                "restoration supports one original place order"
+                orders.len()
+                    <= if self.inner.borrow().maintenance.is_some() {
+                        3
+                    } else {
+                        1
+                    },
+                "restoration exceeds the original bounded order history"
             );
             let instrument = orders
                 .first()
@@ -225,7 +461,43 @@ impl SandboxExecutionClient {
                 .transpose()?;
             (account, orders, instrument)
         };
-        if let Some(instrument) = instrument {
+
+        if self.config.account_type == AccountType::Margin {
+            let has_funding = self
+                .cache
+                .borrow()
+                .positions(
+                    Some(&self.config.venue),
+                    None,
+                    None,
+                    Some(&account_id),
+                    None,
+                )
+                .iter()
+                .any(|position| {
+                    position.adjustments.iter().any(|adjustment| {
+                        adjustment.adjustment_type == PositionAdjustmentType::Funding
+                    })
+                });
+            anyhow::ensure!(
+                !has_funding || self.funding_checkpoint()?.is_some(),
+                "original funding checkpoint required for funded positions"
+            );
+            anyhow::ensure!(
+                self.config.default_leverage == rust_decimal::Decimal::ONE
+                    && self.config.leverages.is_empty()
+                    && account.balances().keys().all(|currency| Some(*currency) == self.config.base_currency)
+                    && self.cache.borrow().instruments(&self.config.venue, None).iter().all(|i| matches!(i, InstrumentAny::CryptoPerpetual(p) if
+                        (self.config.base_currency == Some(Currency::USDT()) && !p.is_inverse && p.settlement_currency == Currency::USDT())
+                        || (self.config.base_currency == Some(Currency::BTC()) && p.is_inverse && p.base_currency == Currency::BTC() && p.quote_currency == Currency::USD() && p.settlement_currency == Currency::BTC() && p.multiplier == Quantity::from("100"))
+                    )),
+                "unsupported margin restoration profile"
+            );
+        }
+
+        if let Some(instrument) = instrument
+            && self.inner.borrow().maintenance.is_none()
+        {
             let mut inner = self.inner.borrow_mut();
             inner.ensure_matching_engine(&instrument);
             inner
@@ -241,6 +513,129 @@ impl SandboxExecutionClient {
             .collect();
         self.sync_cached_account_config()?;
         self.restored.set(true);
+        Ok(())
+    }
+
+    /// Enables native funding settlement before the client starts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an active, frozen, cash or before-funding-only profile.
+    pub fn enable_funding(&self) -> anyhow::Result<()> {
+        let funding = self.inner.borrow().funding.clone();
+        if funding.enabled.get() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !self.core.borrow().is_connected()
+                && self
+                    .cache
+                    .borrow()
+                    .account(&self.config.account_id)
+                    .is_none(),
+            "an existing native funded account requires its original checkpoint"
+        );
+        anyhow::ensure!(
+            !self.core.borrow().is_started()
+                && self.config.account_type == AccountType::Margin
+                && !self.config.frozen_account
+                && matches!(
+                    (
+                        self.config.execution_deadline_ns,
+                        self.config.expected_funding_ns
+                    ),
+                    (None, None) | (Some(_), Some(_))
+                ),
+            "unsupported native funding profile"
+        );
+        let window = self
+            .config
+            .execution_deadline_ns
+            .zip(self.config.expected_funding_ns)
+            .map(|(deadline, first_boundary)| FundingWindow {
+                first_boundary,
+                deadline,
+            });
+        let now = self.clock.borrow().timestamp_ns();
+        anyhow::ensure!(
+            window.is_none_or(|window| now < window.first_boundary
+                && window.deadline.as_u64().saturating_sub(now.as_u64()) <= 300_000_000_000),
+            "native funding window is expired or exceeds five minutes"
+        );
+        funding.owner.borrow_mut().bind_window(window)?;
+        funding.enabled.set(true);
+        Ok(())
+    }
+
+    /// Queues an original native funding update on an explicitly enabled client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for disabled funding or conflicting original input.
+    pub fn process_funding_rate(&self, update: FundingRateUpdate) -> anyhow::Result<()> {
+        let funding = self.inner.borrow().funding.clone();
+        anyhow::ensure!(funding.enabled.get(), "native funding is disabled");
+        funding.owner.borrow_mut().queue_live(update)?;
+        SandboxFunding::schedule(&self.inner);
+        Ok(())
+    }
+
+    /// Captures the complete original native funding state at a coherent financial cut.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error while settlement or account application is unresolved.
+    pub fn funding_checkpoint(&self) -> anyhow::Result<Option<FundingCheckpoint>> {
+        self.funding_handle()
+            .map(|handle| handle.checkpoint())
+            .transpose()
+    }
+
+    /// Returns a read-only funding capture handle for an explicitly enabled client.
+    #[must_use]
+    pub fn funding_handle(&self) -> Option<SandboxFundingHandle> {
+        let funding = self.inner.borrow().funding.clone();
+        funding.enabled.get().then_some(SandboxFundingHandle {
+            funding,
+            account_id: self.config.account_id,
+        })
+    }
+
+    /// Restores funding against original cached native account and positions without arming work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an active client or a mismatched native financial cut.
+    pub fn restore_funding(&self, checkpoint: FundingCheckpoint) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.core.borrow().is_started()
+                && !self.core.borrow().is_connected()
+                && self.config.account_type == AccountType::Margin
+                && !self.config.frozen_account
+                && matches!(
+                    (
+                        self.config.execution_deadline_ns,
+                        self.config.expected_funding_ns
+                    ),
+                    (None, None) | (Some(_), Some(_))
+                ),
+            "unsupported native funding restoration profile"
+        );
+        let funding = self.inner.borrow().funding.clone();
+        let window = self
+            .config
+            .execution_deadline_ns
+            .zip(self.config.expected_funding_ns)
+            .map(|(deadline, first_boundary)| FundingWindow {
+                first_boundary,
+                deadline,
+            });
+        funding.owner.borrow_mut().bind_window(window)?;
+        funding
+            .owner
+            .borrow_mut()
+            .restore(checkpoint, self.config.account_id)?;
+        funding.enabled.set(true);
         Ok(())
     }
 
@@ -337,6 +732,22 @@ impl SandboxExecutionClient {
             })
         };
 
+        let funding_handler = {
+            let inner = inner_weak.clone();
+            TypedHandler::from(move |update: &FundingRateUpdate| {
+                if update.instrument_id.venue == venue
+                    && let Some(inner) = inner.upgrade()
+                {
+                    let funding = inner.borrow().funding.clone();
+                    if funding.enabled.get() && funding.active.get() {
+                        if let Err(e) = funding.owner.borrow_mut().queue_live(*update) {
+                            log::error!("Native funding update rejected: {e}");
+                        }
+                        SandboxFunding::schedule(&inner);
+                    }
+                }
+            })
+        };
         let position_handler = {
             TypedHandler::from(move |event: &PositionEvent| {
                 let PositionEvent::PositionClosed(position_closed) = event else {
@@ -368,6 +779,7 @@ impl SandboxExecutionClient {
         let status_pattern: MStr<Pattern> = format!("data.status.{venue}.*").into();
         let close_pattern: MStr<Pattern> = format!("data.close.{venue}.*").into();
         let position_pattern: MStr<Pattern> = "events.position.*".into();
+        let funding_pattern: MStr<Pattern> = format!("data.funding_rates.{venue}.*").into();
 
         msgbus::subscribe_book_deltas(deltas_pattern, deltas_handler.clone(), Some(10));
         msgbus::subscribe_quotes(quote_pattern, quote_handler.clone(), Some(10));
@@ -376,6 +788,7 @@ impl SandboxExecutionClient {
         msgbus::subscribe_any(status_pattern, status_handler.clone(), Some(10));
         msgbus::subscribe_instrument_close(close_pattern, close_handler.clone(), Some(10));
         msgbus::subscribe_position_events(position_pattern, position_handler.clone(), Some(10));
+        msgbus::subscribe_funding_rates(funding_pattern, funding_handler.clone(), Some(10));
 
         *self.handlers.borrow_mut() = Some(RegisteredHandlers {
             deltas_pattern,
@@ -390,6 +803,8 @@ impl SandboxExecutionClient {
             status_handler,
             close_pattern,
             close_handler,
+            funding_pattern,
+            funding_handler,
             position_pattern,
             position_handler,
         });
@@ -408,6 +823,7 @@ impl SandboxExecutionClient {
             msgbus::unsubscribe_bars(handlers.bar_pattern, &handlers.bar_handler);
             msgbus::unsubscribe_any(handlers.status_pattern, &handlers.status_handler);
             msgbus::unsubscribe_instrument_close(handlers.close_pattern, &handlers.close_handler);
+            msgbus::unsubscribe_funding_rates(handlers.funding_pattern, &handlers.funding_handler);
             msgbus::unsubscribe_position_events(
                 handlers.position_pattern,
                 &handlers.position_handler,
@@ -496,12 +912,229 @@ impl SandboxExecutionClient {
         self.cache.borrow_mut().update_account(&account)
     }
 
+    /// Enables bounded native maintenance before connection without changing legacy profiles.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported or already connected simulation profiles.
+    pub fn enable_maintenance(&self, ratio: Decimal) -> anyhow::Result<()> {
+        let now = self.clock.borrow().timestamp_ns();
+        let deadline = self
+            .config
+            .execution_deadline_ns
+            .ok_or_else(|| anyhow::anyhow!("native maintenance deadline missing"))?;
+        let first = self
+            .config
+            .expected_funding_ns
+            .ok_or_else(|| anyhow::anyhow!("native maintenance funding boundary missing"))?;
+        anyhow::ensure!(
+            deadline > now
+                && deadline.as_u64().saturating_sub(now.as_u64()) <= 300_000_000_000
+                && first > now
+                && (self.inner.borrow().funding.enabled.get() || deadline < first),
+            "native maintenance window must remain within five minutes and its original funding authority"
+        );
+        anyhow::ensure!(
+            !self.core.borrow().is_connected()
+                && !self.restored.get()
+                && self.config.account_type == AccountType::Margin
+                && self.config.oms_type == OmsType::Netting
+                && self.config.book_type == BookType::L1_MBP
+                && !self.config.frozen_account
+                && !self.config.bar_execution
+                && !self.config.trade_execution
+                && self.config.execution_deadline_ns.is_some()
+                && self.config.expected_funding_ns.is_some(),
+            "unsupported bounded maintenance profile"
+        );
+        let mut inner = self.inner.borrow_mut();
+        anyhow::ensure!(
+            inner.maintenance.is_none(),
+            "native maintenance already enabled"
+        );
+        inner.maintenance = Some(MaintenanceOwner::new(
+            inner.account_id,
+            self.cache.clone(),
+            ratio,
+            2,
+        )?);
+        Ok(())
+    }
+
+    /// Returns the retained original bounded maintenance cut.
+    pub fn maintenance_checkpoint(&self) -> Option<SandboxMaintenanceCheckpoint> {
+        let inner = self.inner.borrow();
+        inner
+            .maintenance
+            .as_ref()
+            .map(|owner| SandboxMaintenanceCheckpoint {
+                version: 1,
+                profile: inner.config.clone(),
+                instruments: inner
+                    .cache
+                    .borrow()
+                    .instruments(&inner.config.venue, None)
+                    .into_iter()
+                    .cloned()
+                    .collect(),
+                owner: owner.checkpoint(),
+                engines: inner
+                    .matching_engines
+                    .iter()
+                    .map(|(id, engine)| (*id, engine.ids_checkpoint()))
+                    .collect(),
+            })
+    }
+
+    /// Restores original maintenance/account/counter state without connecting or matching.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for changed original state or an unresolved native close.
+    pub fn restore_maintenance(
+        &self,
+        original: SandboxMaintenanceCheckpoint,
+        ratio: Decimal,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.restored.get() && !self.core.borrow().is_connected(),
+            "native maintenance restore requires a fresh disarmed client"
+        );
+        let mut inner = self.inner.borrow_mut();
+        anyhow::ensure!(
+            inner.maintenance_restore == MaintenanceRestore::Fresh && inner.maintenance.is_none(),
+            "native maintenance restore requires an unused original destination"
+        );
+        inner.maintenance_restore = MaintenanceRestore::Pending;
+        anyhow::ensure!(
+            inner.config.account_type == AccountType::Margin
+                && inner.config.oms_type == OmsType::Netting
+                && inner.config.book_type == BookType::L1_MBP
+                && !inner.config.frozen_account
+                && !inner.config.bar_execution
+                && !inner.config.trade_execution
+                && inner.config.execution_deadline_ns.is_some()
+                && inner.config.expected_funding_ns.is_some(),
+            "unsupported original native maintenance profile"
+        );
+        inner.maintenance = Some(MaintenanceOwner::new(
+            inner.account_id,
+            self.cache.clone(),
+            ratio,
+            2,
+        )?);
+        let current_instruments: Vec<_> = inner
+            .cache
+            .borrow()
+            .instruments(&inner.config.venue, None)
+            .into_iter()
+            .cloned()
+            .collect();
+        anyhow::ensure!(
+            original.version == 1
+                && serde_json::to_value(&original.profile)? == serde_json::to_value(&inner.config)?
+                && serde_json::to_value(&original.instruments)?
+                    == serde_json::to_value(current_instruments)?,
+            "native maintenance original profile/instrument mismatch"
+        );
+        anyhow::ensure!(
+            inner.maintenance.is_some()
+                && inner.matching_engines.is_empty()
+                && original.engines.len() <= 1,
+            "unsupported native maintenance destination"
+        );
+
+        for (instrument_id, ids) in &original.engines {
+            let (instrument, orders) = {
+                let cache = self.cache.borrow();
+                let instrument = cache.try_instrument(instrument_id)?.clone();
+                let orders = cache
+                    .orders(
+                        None,
+                        Some(instrument_id),
+                        None,
+                        Some(&inner.account_id),
+                        None,
+                    )
+                    .into_iter()
+                    .map(|order| (*order).clone())
+                    .collect::<Vec<_>>();
+                (instrument, orders)
+            };
+            inner.ensure_matching_engine(&instrument);
+            let account_id = inner.account_id;
+            inner
+                .matching_engines
+                .get_mut(instrument_id)
+                .ok_or_else(|| anyhow::anyhow!("native matcher absent"))?
+                .restore_quote_only_history(&orders, account_id, ids)?;
+        }
+        inner
+            .maintenance
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("native maintenance owner absent"))?
+            .restore(original.owner)?;
+        inner.maintenance_restore = MaintenanceRestore::Restored;
+        Ok(())
+    }
+
+    /// Captures the read-only native exit-quote threshold for the supported position.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unresolved application, unsupported basis or absent instrument.
+    pub fn maintenance_threshold(
+        &self,
+        instrument: InstrumentId,
+    ) -> anyhow::Result<Option<MaintenanceThreshold>> {
+        let inner = self.inner.borrow();
+        anyhow::ensure!(
+            !inner.maintenance_in_flight,
+            "native maintenance turn pending"
+        );
+        let owner = inner
+            .maintenance
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("native maintenance disabled"))?;
+        let instrument = self.cache.borrow().try_instrument(&instrument)?.clone();
+        owner.threshold(&instrument)
+    }
+
+    /// Confirms durable retention of the exact original native maintenance receipt prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a mismatched prefix or unresolved original application.
+    pub fn acknowledge_maintenance(&self, prefix: usize) -> anyhow::Result<()> {
+        self.maintenance_handle().acknowledge(prefix)
+    }
+
+    /// Returns a same-thread handle to the original maintenance owner.
+    pub fn maintenance_handle(&self) -> SandboxMaintenanceHandle {
+        SandboxMaintenanceHandle {
+            inner: self.inner.clone(),
+        }
+    }
+
     /// Processes a quote tick through the matching engine.
     ///
     /// # Errors
     ///
     /// Returns an error if the instrument is not found in the cache.
     pub fn process_quote_tick(&self, quote: &QuoteTick) -> anyhow::Result<()> {
+        if self.inner.borrow().maintenance.is_some() {
+            return SandboxInner::schedule_maintenance_quote(&self.inner, *quote);
+        }
+        SandboxFunding::schedule(&self.inner);
+        if !self
+            .inner
+            .borrow()
+            .execution_open(quote.instrument_id, Some(quote.ts_init.max(quote.ts_event)))
+        {
+            SandboxInner::drain_inbound(&self.inner);
+            return Ok(());
+        }
+
         if self
             .inner
             .borrow()
@@ -533,6 +1166,15 @@ impl SandboxExecutionClient {
     ///
     /// Returns an error if the instrument is not found in the cache.
     pub fn process_trade_tick(&self, trade: &TradeTick) -> anyhow::Result<()> {
+        SandboxFunding::schedule(&self.inner);
+        if self.inner.borrow().funding.enabled.get()
+            && !self
+                .inner
+                .borrow()
+                .execution_open(trade.instrument_id, Some(trade.ts_event.max(trade.ts_init)))
+        {
+            return Ok(());
+        }
         SandboxInner::drain_inbound(&self.inner);
 
         if !self.config.trade_execution {
@@ -560,6 +1202,15 @@ impl SandboxExecutionClient {
     ///
     /// Returns an error if the instrument is not found in the cache.
     pub fn process_bar(&self, bar: &Bar) -> anyhow::Result<()> {
+        SandboxFunding::schedule(&self.inner);
+        if self.inner.borrow().funding.enabled.get()
+            && !self.inner.borrow().execution_open(
+                bar.bar_type.instrument_id(),
+                Some(bar.ts_event.max(bar.ts_init)),
+            )
+        {
+            return Ok(());
+        }
         SandboxInner::drain_inbound(&self.inner);
 
         if !self.config.bar_execution {
@@ -587,6 +1238,19 @@ impl SandboxExecutionClient {
     ///
     /// Returns an error if the instrument is not found in the cache.
     pub fn process_order_book_deltas(&self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
+        if self.inner.borrow().maintenance.is_some() {
+            return Ok(());
+        }
+
+        SandboxFunding::schedule(&self.inner);
+        if self.inner.borrow().funding.enabled.get()
+            && !self.inner.borrow().execution_open(
+                deltas.instrument_id,
+                Some(deltas.ts_event.max(deltas.ts_init)),
+            )
+        {
+            return Ok(());
+        }
         SandboxInner::drain_inbound(&self.inner);
 
         let instrument_id = deltas.instrument_id;
@@ -602,9 +1266,19 @@ impl SandboxExecutionClient {
 
     /// Resets the sandbox to its initial state.
     pub fn reset(&self) {
+        if self.inner.borrow().funding.enabled.get() || self.inner.borrow().maintenance.is_some() {
+            log::error!("Retained sandbox reset requires a new isolated account and owner");
+            return;
+        }
         self.restored.set(false);
         let mut inner = self.inner.borrow_mut();
         inner.minimum_quote_init = None;
+        inner.funding.owner.borrow_mut().reset();
+        inner.funding.in_flight.set(false);
+        inner
+            .funding
+            .generation
+            .set(inner.funding.generation.get().wrapping_add(1));
         for engine in inner.matching_engines.values_mut() {
             engine.reset();
         }
@@ -618,6 +1292,9 @@ impl SandboxExecutionClient {
 
         inner.clear_inbound_queue();
         self.cancel_inbound_alert();
+        self.clock
+            .borrow_mut()
+            .cancel_timer(&funding_timer_name(self.config.account_id));
 
         log::info!(
             "Sandbox execution client reset: venue={}",
@@ -677,6 +1354,10 @@ impl ExecutionClient for SandboxExecutionClient {
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.inner.borrow().funding.enabled.get() && self.inner.borrow().maintenance.is_none(),
+            "cannot reset a retained native funding owner"
+        );
         Self::reset(self);
         Ok(())
     }
@@ -704,6 +1385,31 @@ impl ExecutionClient for SandboxExecutionClient {
             return Ok(());
         }
 
+        let funding = self.inner.borrow().funding.clone();
+        let now = self.clock.borrow().timestamp_ns();
+        if funding.enabled.get() {
+            let owner = funding.owner.borrow();
+            anyhow::ensure!(
+                owner.window().is_none_or(|window| now < window.deadline
+                    && (if self.restored.get() {
+                        owner
+                            .due(now)
+                            .iter()
+                            .all(|(boundary, _)| *boundary >= window.deadline)
+                    } else {
+                        now < window.first_boundary
+                            && owner.next_boundary() == Some(window.first_boundary)
+                    })),
+                "expired or unresolved restored native funding window"
+            );
+        }
+        anyhow::ensure!(
+            !funding.enabled.get() || try_get_exec_event_sender().is_some(),
+            "funding requires the native execution FIFO channel"
+        );
+        funding.active.set(true);
+        self.inner.borrow_mut().maintenance_active = true;
+
         if let Some(sender) = try_get_exec_event_sender() {
             let handler: Rc<dyn Fn(OrderEventAny)> = Rc::new(move |event: OrderEventAny| {
                 if let Err(e) = sender.send(ExecutionEvent::Order(event)) {
@@ -722,7 +1428,12 @@ impl ExecutionClient for SandboxExecutionClient {
         }
         self.register_message_handlers();
         self.register_expiry_sweep_timer();
+        SandboxFunding::schedule(&self.inner);
 
+        anyhow::ensure!(
+            self.inner.borrow().maintenance.is_none() || try_get_exec_event_sender().is_some(),
+            "maintenance requires the native execution FIFO channel"
+        );
         self.core.borrow().set_started();
         let core = self.core.borrow();
         log::info!(
@@ -740,6 +1451,25 @@ impl ExecutionClient for SandboxExecutionClient {
             return Ok(());
         }
 
+        let funding = self.inner.borrow().funding.clone();
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.maintenance_active = false;
+            if inner.maintenance_in_flight
+                && let Some(owner) = inner.maintenance.as_mut()
+            {
+                owner.fail("native maintenance stopped during an unresolved turn".into());
+            }
+        }
+        funding.active.set(false);
+        funding
+            .generation
+            .set(funding.generation.get().wrapping_add(1));
+        funding.in_flight.set(false);
+        funding.owner.borrow_mut().cancel_barrier();
+        self.clock
+            .borrow_mut()
+            .cancel_timer(&funding_timer_name(self.config.account_id));
         self.deregister_message_handlers();
         self.cancel_expiry_sweep_timer();
         self.cancel_inbound_alert();
@@ -768,11 +1498,40 @@ impl ExecutionClient for SandboxExecutionClient {
             return Ok(());
         }
 
-        if !self.restored.get() {
+        anyhow::ensure!(
+            self.inner.borrow().maintenance_restore == MaintenanceRestore::Fresh
+                || (self.inner.borrow().maintenance_restore == MaintenanceRestore::Restored
+                    && self.restored.get()),
+            "original native maintenance restoration incomplete"
+        );
+        let funding = self.inner.borrow().funding.clone();
+        let publish_initial = !self.restored.get()
+            && ((!funding.enabled.get() && self.inner.borrow().maintenance.is_none())
+                || !funding.initialized.get());
+        if publish_initial {
+            if funding.enabled.get() || self.inner.borrow().maintenance.is_some() {
+                anyhow::ensure!(
+                    self.cache
+                        .borrow()
+                        .account(&self.config.account_id)
+                        .is_none(),
+                    "native funded account already exists"
+                );
+                funding.initialized.set(true);
+            }
             let balances = self.get_account_balances();
             let ts_event = self.clock.borrow().timestamp_ns();
             self.generate_account_state(balances, vec![], false, ts_event, None)?;
         }
+        anyhow::ensure!(
+            !funding.enabled.get()
+                || self
+                    .cache
+                    .borrow()
+                    .account(&self.config.account_id)
+                    .is_some(),
+            "original native funding initialization unavailable"
+        );
 
         self.core.borrow().set_connected();
         log::info!(
@@ -796,6 +1555,10 @@ impl ExecutionClient for SandboxExecutionClient {
     }
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.inner.borrow().execution_open(cmd.instrument_id, None),
+            "sandbox execution window expired"
+        );
         let order = self.get_order(&cmd.client_order_id)?;
 
         if order.is_closed() {
@@ -803,6 +1566,9 @@ impl ExecutionClient for SandboxExecutionClient {
             return Ok(());
         }
 
+        if let Some(owner) = self.inner.borrow_mut().maintenance.as_mut() {
+            owner.claim_opening(&order)?;
+        }
         let ts_init = self.clock.borrow().timestamp_ns();
         let event = self.factory.generate_order_submitted(&order, ts_init);
         self.dispatch_order_event(event);
@@ -810,6 +1576,7 @@ impl ExecutionClient for SandboxExecutionClient {
         let mut inner = self.inner.borrow_mut();
         if inner.config.latency_model.is_none() {
             inner.apply_submit_order(&cmd)?;
+            inner.maintenance_after_command()?;
         } else {
             inner.defer_or_apply(TradingCommand::SubmitOrder(cmd));
         }
@@ -817,12 +1584,24 @@ impl ExecutionClient for SandboxExecutionClient {
     }
 
     fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.inner.borrow().execution_open(cmd.instrument_id, None),
+            "sandbox execution window expired"
+        );
         let ts_init = self.clock.borrow().timestamp_ns();
 
         let orders: Vec<OrderAny> = self
             .cache
             .borrow()
             .orders_for_ids(&cmd.order_list.client_order_ids, &cmd);
+
+        if let Some(owner) = self.inner.borrow_mut().maintenance.as_mut() {
+            anyhow::ensure!(
+                orders.len() == 1,
+                "native maintenance list requires one original opening"
+            );
+            owner.claim_opening(&orders[0])?;
+        }
 
         for order in &orders {
             if order.is_closed() {
@@ -837,6 +1616,7 @@ impl ExecutionClient for SandboxExecutionClient {
         let mut inner = self.inner.borrow_mut();
         if inner.config.latency_model.is_none() {
             let _ = inner.apply_submit_order_list(&cmd);
+            inner.maintenance_after_command()?;
         } else {
             inner.defer_or_apply(TradingCommand::SubmitOrderList(cmd));
         }
@@ -844,9 +1624,22 @@ impl ExecutionClient for SandboxExecutionClient {
     }
 
     fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.inner.borrow().execution_open(cmd.instrument_id, None),
+            "sandbox execution window expired"
+        );
         let mut inner = self.inner.borrow_mut();
+        anyhow::ensure!(
+            inner
+                .maintenance
+                .as_ref()
+                .is_none_or(|owner| owner.modification_allowed(cmd.client_order_id, cmd.quantity)),
+            "native maintenance modification exceeds original exposure"
+        );
+
         if inner.config.latency_model.is_none() {
             inner.apply_modify_order(&cmd);
+            inner.maintenance_after_command()?;
         } else {
             inner.defer_or_apply(TradingCommand::ModifyOrder(cmd));
         }
@@ -854,9 +1647,22 @@ impl ExecutionClient for SandboxExecutionClient {
     }
 
     fn batch_modify_orders(&self, cmd: BatchModifyOrders) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.inner.borrow().execution_open(cmd.instrument_id, None),
+            "sandbox execution window expired"
+        );
         let mut inner = self.inner.borrow_mut();
+        anyhow::ensure!(
+            inner.maintenance.as_ref().is_none_or(|owner| cmd
+                .modifies
+                .iter()
+                .all(|modify| owner.modification_allowed(modify.client_order_id, modify.quantity))),
+            "native maintenance batch modification exceeds original exposure"
+        );
+
         if inner.config.latency_model.is_none() {
             inner.apply_batch_modify_orders(&cmd);
+            inner.maintenance_after_command()?;
         } else {
             inner.defer_or_apply(TradingCommand::ModifyOrders(cmd));
         }
@@ -865,7 +1671,7 @@ impl ExecutionClient for SandboxExecutionClient {
 
     fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
         let mut inner = self.inner.borrow_mut();
-        if inner.config.latency_model.is_none() {
+        if inner.config.latency_model.is_none() && !inner.funding.enabled.get() {
             inner.apply_cancel_order(&cmd);
         } else {
             inner.defer_or_apply(TradingCommand::CancelOrder(cmd));
@@ -875,7 +1681,7 @@ impl ExecutionClient for SandboxExecutionClient {
 
     fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
         let mut inner = self.inner.borrow_mut();
-        if inner.config.latency_model.is_none() {
+        if inner.config.latency_model.is_none() && !inner.funding.enabled.get() {
             inner.apply_cancel_all_orders(&cmd);
         } else {
             inner.defer_or_apply(TradingCommand::CancelAllOrders(cmd));
@@ -885,7 +1691,7 @@ impl ExecutionClient for SandboxExecutionClient {
 
     fn batch_cancel_orders(&self, cmd: BatchCancelOrders) -> anyhow::Result<()> {
         let mut inner = self.inner.borrow_mut();
-        if inner.config.latency_model.is_none() {
+        if inner.config.latency_model.is_none() && !inner.funding.enabled.get() {
             inner.apply_batch_cancel_orders(&cmd);
         } else {
             inner.defer_or_apply(TradingCommand::CancelOrders(cmd));
@@ -894,6 +1700,17 @@ impl ExecutionClient for SandboxExecutionClient {
     }
 
     fn query_account(&self, _cmd: QueryAccount) -> anyhow::Result<()> {
+        if self.inner.borrow().funding.enabled.get() || self.inner.borrow().maintenance.is_some() {
+            let state = self
+                .get_account()
+                .and_then(|account| account.last_event())
+                .ok_or_else(|| anyhow::anyhow!("native funded account unavailable"))?;
+            msgbus::publish_account_state(
+                format!("events.account.{}", state.account_id).into(),
+                &state,
+            );
+            return Ok(());
+        }
         let balances = self.get_current_account_balances();
         let ts_event = self.clock.borrow().timestamp_ns();
         self.generate_account_state(balances, vec![], false, ts_event, None)?;
@@ -953,12 +1770,195 @@ impl ExecutionClient for SandboxExecutionClient {
     }
 }
 
+struct SandboxFundingPublisher {
+    factory: OrderEventFactory,
+    venue: Venue,
+    clock: Rc<RefCell<dyn Clock>>,
+}
+
+impl FundingAccountPublisher for SandboxFundingPublisher {
+    fn account_id(&self) -> AccountId {
+        self.factory.account_id()
+    }
+    fn venue(&self) -> Venue {
+        self.venue
+    }
+    fn publish(
+        &self,
+        balances: Vec<AccountBalance>,
+        margins: Vec<MarginBalance>,
+        ts_event: UnixNanos,
+    ) -> anyhow::Result<()> {
+        let state = self.factory.generate_account_state(
+            balances,
+            margins,
+            true,
+            ts_event,
+            self.clock.borrow().timestamp_ns(),
+            None,
+        );
+        msgbus::send_account_state(MessagingSwitchboard::portfolio_update_account(), &state);
+        Ok(())
+    }
+}
+
+struct SandboxFunding {
+    owner: RefCell<FundingOwner>,
+    publisher: SandboxFundingPublisher,
+    initialized: Cell<bool>,
+    enabled: Cell<bool>,
+    active: Cell<bool>,
+    in_flight: Cell<bool>,
+    generation: Cell<u64>,
+}
+
+impl SandboxFunding {
+    fn schedule(inner: &Rc<RefCell<SandboxInner>>) {
+        let funding = inner.borrow().funding.clone();
+        if !funding.enabled.get() || !funding.active.get() || funding.in_flight.get() {
+            return;
+        }
+        let now = funding.publisher.clock.borrow().timestamp_ns();
+        let due = funding.owner.borrow_mut().seal_due(now);
+        if due.is_empty() {
+            Self::arm_next(inner);
+            return;
+        }
+        let cuts: Vec<_> = {
+            let this = inner.borrow();
+            let cache = this.cache.borrow();
+            due.into_iter()
+                .map(|(boundary, instrument)| {
+                    let price = cache
+                        .mark_price(&instrument)
+                        .copied()
+                        .map(FundingPriceCut::Mark)
+                        .or_else(|| {
+                            let engine = this.matching_engines.get(&instrument)?;
+                            Some(FundingPriceCut::Midpoint {
+                                bid: engine.best_bid_price()?,
+                                ask: engine.best_ask_price()?,
+                                observed_ns: now,
+                            })
+                        });
+                    (boundary, instrument, price)
+                })
+                .collect()
+        };
+        funding.in_flight.set(true);
+        let generation = funding.generation.get();
+        let weak = Rc::downgrade(inner);
+        let callback: Rc<dyn Fn(TimeEvent)> = Rc::new(move |_| {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            let funding = inner.borrow().funding.clone();
+            if !funding.active.get() || funding.generation.get() != generation {
+                return;
+            }
+
+            for (boundary, instrument, price) in &cuts {
+                let progress = funding.owner.borrow_mut().process_live(
+                    *instrument,
+                    *boundary,
+                    price.clone(),
+                    &funding.publisher,
+                );
+
+                if !matches!(progress, FundingProgress::Applied | FundingProgress::Empty) {
+                    break;
+                }
+            }
+            funding.in_flight.set(false);
+            Self::arm_next(&inner);
+        });
+        let event = TimeEvent::new(
+            funding_timer_name(funding.publisher.account_id()).into(),
+            UUID4::new(),
+            now,
+            now,
+        );
+        let message = ExecutionEvent::FundingBoundary(TimeEventMessage::new(
+            event,
+            TimeEventCallback::from(callback),
+        ));
+
+        if let Some(sender) = try_get_exec_event_sender()
+            && let Err(e) = sender.send(message)
+        {
+            log::error!("Native funding barrier unavailable: {e}");
+        }
+    }
+
+    fn arm_next(inner: &Rc<RefCell<SandboxInner>>) {
+        let funding = inner.borrow().funding.clone();
+        if !funding.active.get() || funding.in_flight.get() {
+            return;
+        }
+        let Some(next) = funding.owner.borrow().next_boundary() else {
+            return;
+        };
+
+        if funding
+            .owner
+            .borrow()
+            .window()
+            .is_some_and(|window| next >= window.deadline)
+        {
+            return;
+        }
+        let now = funding.publisher.clock.borrow().timestamp_ns();
+        if next <= now {
+            return;
+        }
+        let clock = funding.publisher.clock.clone();
+        let name = funding_timer_name(funding.publisher.account_id());
+        if clock.borrow().next_time_ns(&name) == Some(next) {
+            return;
+        }
+        clock.borrow_mut().cancel_timer(&name);
+        let weak = Rc::downgrade(inner);
+        let callback: Rc<dyn Fn(TimeEvent)> = Rc::new(move |_| {
+            if let Some(inner) = weak.upgrade() {
+                Self::schedule(&inner);
+            }
+        });
+
+        if let Err(e) = clock.borrow_mut().set_time_alert_ns(
+            &name,
+            next,
+            Some(TimeEventCallback::from(callback)),
+            Some(true),
+        ) {
+            log::error!("Native funding timer unavailable: {e}");
+        }
+    }
+}
+
+fn funding_timer_name(account: AccountId) -> String {
+    format!("{account}-sandbox-funding")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MaintenanceRestore {
+    Fresh,
+    Pending,
+    Restored,
+}
+
 // Wrapped in `Rc<RefCell<>>` so message handlers can hold weak references
 struct SandboxInner {
     clock: Rc<RefCell<dyn Clock>>,
     cache: Rc<RefCell<Cache>>,
     config: SandboxExecutionClientConfig,
     fill_model: FillModelHandle,
+    funding: Rc<SandboxFunding>,
+    maintenance: Option<MaintenanceOwner>,
+    maintenance_in_flight: bool,
+    maintenance_active: bool,
+    maintenance_quote: Option<QuoteTick>,
+    maintenance_restore: MaintenanceRestore,
+    maintenance_source_fault: bool,
     matching_engines: AHashMap<InstrumentId, OrderMatchingEngine>,
     next_engine_raw_id: u32,
     balances: AHashMap<String, Money>,
@@ -1010,6 +2010,341 @@ impl PartialEq for DelayedCommand {
 impl Eq for DelayedCommand {}
 
 impl SandboxInner {
+    fn validate_maintenance_quote(&self, quote: &QuoteTick) -> anyhow::Result<()> {
+        let now = self.clock.borrow().timestamp_ns();
+        anyhow::ensure!(
+            quote.ts_event <= now
+                && quote.ts_init <= now
+                && now.as_u64().saturating_sub(quote.ts_event.as_u64()) <= 5_000_000_000
+                && now.as_u64().saturating_sub(quote.ts_init.as_u64()) <= 5_000_000_000,
+            "stale native maintenance quote"
+        );
+        let cache = self.cache.borrow();
+        let instrument = cache.try_instrument(&quote.instrument_id)?;
+        anyhow::ensure!(
+            check_quote_or_drop("maintenance quote", quote, instrument)
+                && quote.bid_price <= quote.ask_price,
+            "invalid native maintenance quote"
+        );
+        let tick = instrument.price_increment();
+        anyhow::ensure!(
+            tick.raw() > 0
+                && [quote.bid_price, quote.ask_price]
+                    .iter()
+                    .all(|price| !price.is_error()
+                        && !price.is_undefined()
+                        && price.raw() >= 0
+                        && (!instrument.is_inverse() || price.raw() > 0)
+                        && price.raw() % tick.raw() == 0
+                        && instrument.min_price().is_none_or(|min| *price >= min)
+                        && instrument.max_price().is_none_or(|max| *price <= max)),
+            "native maintenance quote outside instrument domain"
+        );
+        Ok(())
+    }
+
+    fn schedule_maintenance_quote(
+        inner: &Rc<RefCell<Self>>,
+        quote: QuoteTick,
+    ) -> anyhow::Result<()> {
+        {
+            let this = inner.borrow();
+            if this
+                .config
+                .execution_deadline_ns
+                .is_some_and(|deadline| this.clock.borrow().timestamp_ns() >= deadline)
+            {
+                return Ok(());
+            }
+        }
+        SandboxFunding::schedule(inner);
+        {
+            let mut this = inner.borrow_mut();
+            if let Err(e) = this.validate_maintenance_quote(&quote) {
+                this.maintenance_source_fault = true;
+                if let Some(owner) = this.maintenance.as_mut() {
+                    owner.defer(e.to_string());
+                }
+                return Err(e);
+            }
+        }
+        Self::drain_inbound(inner);
+        {
+            let mut this = inner.borrow_mut();
+            if !this.maintenance_active
+                || !this
+                    .maintenance
+                    .as_ref()
+                    .is_some_and(MaintenanceOwner::can_observe)
+                || !this.execution_authorized(
+                    quote.instrument_id,
+                    Some(quote.ts_init.max(quote.ts_event)),
+                )
+            {
+                return Ok(());
+            }
+
+            if this
+                .minimum_quote_init
+                .is_some_and(|cut| quote.ts_init < cut)
+            {
+                return Ok(());
+            }
+
+            if let Some(previous) = this.maintenance.as_ref().and_then(MaintenanceOwner::quote) {
+                if previous == quote {
+                    return Ok(());
+                }
+
+                if quote.ts_init <= previous.ts_init || quote.ts_event < previous.ts_event {
+                    this.maintenance_source_fault = true;
+                    if let Some(owner) = this.maintenance.as_mut() {
+                        owner.defer("reordered or conflicting original maintenance source".into());
+                    }
+                    anyhow::bail!("reordered or conflicting original maintenance source");
+                }
+            }
+            let instrument = this
+                .cache
+                .borrow()
+                .try_instrument(&quote.instrument_id)?
+                .clone();
+            this.ensure_matching_engine(&instrument);
+            if this.maintenance_in_flight {
+                if this.maintenance_quote.is_none_or(|old| {
+                    quote.ts_init >= old.ts_init && quote.ts_event >= old.ts_event
+                }) {
+                    this.maintenance_quote = Some(quote);
+                }
+                return Ok(());
+            }
+            this.maintenance_source_fault = false;
+            this.maintenance_in_flight = true;
+        }
+        Self::enqueue_maintenance_turn(inner, quote, 0)
+    }
+
+    fn enqueue_maintenance_turn(
+        inner: &Rc<RefCell<Self>>,
+        quote: QuoteTick,
+        stage: u8,
+    ) -> anyhow::Result<()> {
+        let now = inner.borrow().clock.borrow().timestamp_ns();
+        let result =
+            Self::send_maintenance_turn(WeakCell::from(Rc::downgrade(inner)), quote, stage, now);
+        if let Err(e) = &result
+            && let Some(owner) = inner.borrow_mut().maintenance.as_mut()
+        {
+            owner.fail(e.to_string());
+        }
+        result
+    }
+
+    fn send_maintenance_turn(
+        weak: WeakCell<Self>,
+        quote: QuoteTick,
+        stage: u8,
+        now: UnixNanos,
+    ) -> anyhow::Result<()> {
+        let callback: Rc<dyn Fn(TimeEvent)> = Rc::new(move |_| {
+            let Some(inner) = weak.upgrade() else { return };
+            if let Err(e) = Self::run_maintenance_turn(&inner, quote, stage) {
+                let mut this = inner.borrow_mut();
+                if let Some(owner) = this.maintenance.as_mut() {
+                    if owner.pending() {
+                        owner.fail(e.to_string());
+                    } else {
+                        owner.defer(e.to_string());
+                    }
+                }
+                this.maintenance_in_flight = false;
+                log::error!("Native maintenance application unavailable: {e}");
+            }
+        });
+        let event = TimeEvent::new("sandbox-maintenance".into(), UUID4::new(), now, now);
+        try_get_exec_event_sender()
+            .ok_or_else(|| anyhow::anyhow!("native maintenance execution FIFO unavailable"))?
+            .send(ExecutionEvent::SimulationBoundary(TimeEventMessage::new(
+                event,
+                TimeEventCallback::from(callback),
+            )))
+            .map_err(|e| anyhow::anyhow!("native maintenance dispatch: {e}"))
+    }
+
+    fn maintenance_after_command(&mut self) -> anyhow::Result<()> {
+        let Some(owner) = self.maintenance.as_ref() else {
+            return Ok(());
+        };
+        let quote = owner
+            .quote()
+            .ok_or_else(|| anyhow::anyhow!("native command source cut unavailable"))?;
+        self.maintenance_in_flight = true;
+        let now = self.clock.borrow().timestamp_ns();
+        let result = Self::send_maintenance_turn(self.self_weak.clone(), quote, 1, now);
+        if let Err(e) = &result
+            && let Some(owner) = self.maintenance.as_mut()
+        {
+            owner.fail(e.to_string());
+        }
+        result
+    }
+
+    fn run_maintenance_turn(
+        inner: &Rc<RefCell<Self>>,
+        quote: QuoteTick,
+        stage: u8,
+    ) -> anyhow::Result<()> {
+        let mut this = inner.borrow_mut();
+        anyhow::ensure!(
+            stage == 2
+                || (this.maintenance_active
+                    && this.execution_authorized(
+                        quote.instrument_id,
+                        Some(quote.ts_event.max(quote.ts_init))
+                    )),
+            "native maintenance authority expired"
+        );
+
+        if stage != 2 {
+            anyhow::ensure!(
+                !this.maintenance_source_fault,
+                "native maintenance source invalidated during FIFO application"
+            );
+            this.validate_maintenance_quote(&quote)?;
+        }
+        let mut owner = this
+            .maintenance
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("native maintenance owner missing"))?;
+        let result = (|| {
+            if stage == 2 {
+                owner.complete()?;
+                return Ok(None);
+            }
+
+            if stage == 0 {
+                owner.observe_quote(quote)?;
+                anyhow::ensure!(
+                    this.matching_engines
+                        .get_mut(&quote.instrument_id)
+                        .is_some_and(|engine| engine.install_quote_tick(&quote)),
+                    "native maintenance quote installation failed"
+                );
+            }
+            let currency = this
+                .cache
+                .borrow()
+                .try_instrument(&quote.instrument_id)?
+                .settlement_currency();
+            let now = this.clock.borrow().timestamp_ns();
+            if owner.process(now, currency, true, this.matching_engines.values_mut())? {
+                return Ok(Some(2));
+            }
+
+            if !owner.ready() {
+                return Ok(None);
+            }
+
+            if stage == 0 {
+                this.matching_engines
+                    .get_mut(&quote.instrument_id)
+                    .ok_or_else(|| anyhow::anyhow!("native maintenance matcher missing"))?
+                    .iterate(quote.ts_init, AggressorSide::NoAggressor);
+                return Ok(Some(1));
+            }
+            Ok(None)
+        })();
+
+        if let Err(e) = &result {
+            if owner.pending() {
+                owner.fail(e.to_string());
+            } else {
+                owner.defer(e.to_string());
+            }
+        }
+        this.maintenance = Some(owner);
+        match result {
+            Ok(Some(next)) => {
+                drop(this);
+                Self::enqueue_maintenance_turn(inner, quote, next)
+            }
+            Ok(None) => {
+                this.maintenance_in_flight = false;
+                let pending_quote = this.maintenance_quote.take();
+                let ready = this
+                    .maintenance
+                    .as_ref()
+                    .is_some_and(MaintenanceOwner::can_observe);
+                drop(this);
+                Self::drain_inbound(inner);
+                if ready && let Some(quote) = pending_quote {
+                    Self::schedule_maintenance_quote(inner, quote)?;
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn execution_open(&self, instrument: InstrumentId, event_ns: Option<UnixNanos>) -> bool {
+        if self.maintenance.is_some()
+            && (!self.maintenance_active
+                || self.maintenance_in_flight
+                || !self.maintenance.as_ref().is_some_and(|owner| {
+                    owner.opening_ready(instrument, self.clock.borrow().timestamp_ns())
+                }))
+        {
+            return false;
+        }
+        self.execution_authorized(instrument, event_ns)
+    }
+
+    fn execution_authorized(&self, instrument: InstrumentId, event_ns: Option<UnixNanos>) -> bool {
+        if self.funding.enabled.get() {
+            return self.funding.active.get()
+                && !self.funding.in_flight.get()
+                && self.funding.owner.try_borrow().is_ok_and(|owner| {
+                    owner.matching_ready(instrument, self.clock.borrow().timestamp_ns(), event_ns)
+                });
+        }
+
+        match (
+            self.config.execution_deadline_ns,
+            self.config.expected_funding_ns,
+        ) {
+            (None, None) => true,
+            (Some(deadline), Some(_)) => {
+                self.clock.borrow().timestamp_ns() < deadline
+                    && event_ns.is_none_or(|event| event < deadline)
+                    && self
+                        .cache
+                        .borrow()
+                        .funding_rate(&instrument)
+                        .is_some_and(|funding| {
+                            funding.next_funding_ns == self.config.expected_funding_ns
+                                && funding.next_funding_ns.is_some_and(|next| next > deadline)
+                                && funding.ts_init <= self.clock.borrow().timestamp_ns()
+                                && funding.ts_event <= self.clock.borrow().timestamp_ns()
+                                && self
+                                    .clock
+                                    .borrow()
+                                    .timestamp_ns()
+                                    .as_u64()
+                                    .saturating_sub(funding.ts_init.as_u64())
+                                    <= 5_000_000_000
+                                && self
+                                    .clock
+                                    .borrow()
+                                    .timestamp_ns()
+                                    .as_u64()
+                                    .saturating_sub(funding.ts_event.as_u64())
+                                    <= 5_000_000_000
+                        })
+            }
+            _ => false,
+        }
+    }
+
     fn ensure_matching_engine(&mut self, instrument: &InstrumentAny) {
         let instrument_id = instrument.id();
 
@@ -1065,6 +2400,12 @@ impl SandboxInner {
     }
 
     fn process_trade_tick(&mut self, trade: &TradeTick) {
+        if self.funding.enabled.get()
+            && !self.execution_open(trade.instrument_id, Some(trade.ts_event.max(trade.ts_init)))
+        {
+            return;
+        }
+
         if !self.config.trade_execution {
             return;
         }
@@ -1086,6 +2427,15 @@ impl SandboxInner {
     }
 
     fn process_bar(&mut self, bar: &Bar) {
+        if self.funding.enabled.get()
+            && !self.execution_open(
+                bar.bar_type.instrument_id(),
+                Some(bar.ts_event.max(bar.ts_init)),
+            )
+        {
+            return;
+        }
+
         if !self.config.bar_execution {
             return;
         }
@@ -1107,6 +2457,18 @@ impl SandboxInner {
     }
 
     fn process_order_book_deltas(&mut self, deltas: &OrderBookDeltas) {
+        if self.maintenance.is_some() {
+            return;
+        }
+
+        if self.funding.enabled.get()
+            && !self.execution_open(
+                deltas.instrument_id,
+                Some(deltas.ts_event.max(deltas.ts_init)),
+            )
+        {
+            return;
+        }
         let instrument_id = deltas.instrument_id;
 
         let instrument = self.cache.borrow().instrument(&instrument_id).cloned();
@@ -1122,6 +2484,18 @@ impl SandboxInner {
     }
 
     fn process_instrument_status(&mut self, status: &InstrumentStatus) {
+        if self.maintenance.is_some() {
+            return;
+        }
+
+        if self.funding.enabled.get()
+            && !self.execution_open(
+                status.instrument_id,
+                Some(status.ts_event.max(status.ts_init)),
+            )
+        {
+            return;
+        }
         let instrument_id = status.instrument_id;
 
         if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
@@ -1144,6 +2518,15 @@ impl SandboxInner {
     }
 
     fn process_instrument_close(&mut self, close: &InstrumentClose) {
+        if self.maintenance.is_some() {
+            return;
+        }
+
+        if self.funding.enabled.get()
+            && !self.execution_open(close.instrument_id, Some(close.ts_event.max(close.ts_init)))
+        {
+            return;
+        }
         let instrument_id = close.instrument_id;
 
         // A delayed close belongs to an existing exposure lifecycle. Unlike an
@@ -1230,6 +2613,20 @@ impl SandboxInner {
     /// Routes a deferred [`TradingCommand`] to its venue-side apply helper.
     fn apply_trading_command(&mut self, cmd: &TradingCommand) -> anyhow::Result<()> {
         self.inflight_orders.remove(cmd);
+
+        if (self.funding.enabled.get()
+            || matches!(
+                cmd,
+                TradingCommand::SubmitOrder(_)
+                    | TradingCommand::SubmitOrderList(_)
+                    | TradingCommand::ModifyOrder(_)
+                    | TradingCommand::ModifyOrders(_)
+            ))
+            && !self.execution_open(cmd.instrument_id(), None)
+        {
+            self.reject_command(cmd, "Sandbox execution window expired");
+            return Ok(());
+        }
 
         // Only a deferred command can overtake the submit that would have created the engine, so
         // build it here and let the venue raise the rejection.
@@ -1457,6 +2854,10 @@ impl SandboxInner {
     }
 
     fn apply_submit_order(&mut self, cmd: &SubmitOrder) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.execution_open(cmd.instrument_id, None),
+            "sandbox execution window expired"
+        );
         let mut order = self.cache.borrow().try_order_owned(&cmd.client_order_id)?;
 
         let instrument_id = order.instrument_id();
@@ -1467,7 +2868,8 @@ impl SandboxInner {
         let cache = self.cache.borrow();
 
         if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
-            if let Some(quote) = cache.quote(&instrument_id)
+            if self.maintenance.is_none()
+                && let Some(quote) = cache.quote(&instrument_id)
                 && check_quote_or_drop("cached quote tick", quote, &instrument)
             {
                 engine.process_quote_tick(quote);
@@ -1494,6 +2896,12 @@ impl SandboxInner {
     /// `OrderSubmitted` dispatch kept by the client handler, returning the legs that could not
     /// reach a matching engine.
     fn apply_submit_order_list(&mut self, cmd: &SubmitOrderList) -> Vec<OrderAny> {
+        if !self.execution_open(cmd.instrument_id, None) {
+            return self
+                .cache
+                .borrow()
+                .orders_for_ids(&cmd.order_list.client_order_ids, cmd);
+        }
         let orders: Vec<OrderAny> = self
             .cache
             .borrow()
@@ -1525,7 +2933,8 @@ impl SandboxInner {
             let cache = self.cache.borrow();
 
             if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
-                if let Some(quote) = cache.quote(&instrument_id)
+                if self.maintenance.is_none()
+                    && let Some(quote) = cache.quote(&instrument_id)
                     && check_quote_or_drop("cached quote tick", quote, &instrument)
                 {
                     engine.process_quote_tick(quote);
@@ -1572,6 +2981,13 @@ impl SandboxInner {
     }
 
     fn apply_modify_order(&mut self, cmd: &ModifyOrder) {
+        if !self.execution_open(cmd.instrument_id, None) {
+            self.reject_command(
+                &TradingCommand::ModifyOrder(cmd.clone()),
+                "Sandbox execution window expired",
+            );
+            return;
+        }
         let account_id = self.account_id;
         if let Some(engine) = self.matching_engines.get_mut(&cmd.instrument_id) {
             engine.process_modify(cmd, account_id);
@@ -1632,6 +3048,10 @@ impl SandboxInner {
     /// A zero-leg command is still queued behind a head already due, so the two apply in
     /// `(due_ns, seq)` order.
     fn defer_or_apply(&mut self, command: TradingCommand) {
+        if self.funding.enabled.get() && !self.execution_open(command.instrument_id(), None) {
+            self.reject_command(&command, "Native funding boundary is unresolved");
+            return;
+        }
         let now_ns = self.clock.borrow().timestamp_ns();
         let head_is_due = self
             .inbound_queue
@@ -1677,6 +3097,21 @@ impl SandboxInner {
     }
 
     fn on_quote_tick(inner: &Rc<RefCell<Self>>, quote: &QuoteTick) {
+        if inner.borrow().maintenance.is_some() {
+            if let Err(e) = Self::schedule_maintenance_quote(inner, *quote) {
+                log::error!("Native maintenance quote failed: {e}");
+            }
+            return;
+        }
+        SandboxFunding::schedule(inner);
+        if !inner
+            .borrow()
+            .execution_open(quote.instrument_id, Some(quote.ts_init.max(quote.ts_event)))
+        {
+            Self::drain_inbound(inner);
+            return;
+        }
+
         if inner
             .borrow()
             .minimum_quote_init
@@ -1689,26 +3124,31 @@ impl SandboxInner {
     }
 
     fn on_trade_tick(inner: &Rc<RefCell<Self>>, trade: &TradeTick) {
+        SandboxFunding::schedule(inner);
         Self::drain_inbound(inner);
         inner.borrow_mut().process_trade_tick(trade);
     }
 
     fn on_bar(inner: &Rc<RefCell<Self>>, bar: &Bar) {
+        SandboxFunding::schedule(inner);
         Self::drain_inbound(inner);
         inner.borrow_mut().process_bar(bar);
     }
 
     fn on_order_book_deltas(inner: &Rc<RefCell<Self>>, deltas: &OrderBookDeltas) {
+        SandboxFunding::schedule(inner);
         Self::drain_inbound(inner);
         inner.borrow_mut().process_order_book_deltas(deltas);
     }
 
     fn on_instrument_status(inner: &Rc<RefCell<Self>>, status: &InstrumentStatus) {
+        SandboxFunding::schedule(inner);
         Self::drain_inbound(inner);
         inner.borrow_mut().process_instrument_status(status);
     }
 
     fn on_instrument_close(inner: &Rc<RefCell<Self>>, close: &InstrumentClose) {
+        SandboxFunding::schedule(inner);
         Self::drain_inbound(inner);
         inner.borrow_mut().process_instrument_close(close);
     }
@@ -1720,12 +3160,25 @@ impl SandboxInner {
     /// before a tick is processed is applied before that tick, and by the alert when no data is
     /// flowing.
     fn drain_inbound(inner: &Rc<RefCell<Self>>) {
+        SandboxFunding::schedule(inner);
         // The alert fires on the runner task, where a nested msgbus dispatch may already hold the
         // borrow; the next data tick or public `process_*` call releases the queue instead.
         let Ok(mut this) = inner.try_borrow_mut() else {
             log::debug!("Skipping sandbox inbound drain due to active borrow");
             return;
         };
+
+        if this.maintenance_in_flight
+            || this.funding.enabled.get()
+                && (this.funding.in_flight.get()
+                    || this
+                        .funding
+                        .owner
+                        .borrow()
+                        .blocks_execution(this.clock.borrow().timestamp_ns()))
+        {
+            return;
+        }
 
         if this.config.latency_model.is_none() {
             return;
@@ -1740,6 +3193,21 @@ impl SandboxInner {
                     &delayed.command,
                     "Command could not be applied at the venue",
                 );
+            }
+
+            if this.maintenance.is_some()
+                && matches!(
+                    delayed.command,
+                    TradingCommand::SubmitOrder(_)
+                        | TradingCommand::SubmitOrderList(_)
+                        | TradingCommand::ModifyOrder(_)
+                        | TradingCommand::ModifyOrders(_)
+                )
+            {
+                if let Err(e) = this.maintenance_after_command() {
+                    log::error!("Native delayed maintenance command failed: {e}");
+                }
+                break;
             }
         }
 
@@ -1848,12 +3316,21 @@ fn inbound_alert_name(client_id: ClientId) -> String {
 }
 
 fn check_quote_or_drop(context: &str, quote: &QuoteTick, instrument: &InstrumentAny) -> bool {
-    if quote_matches_instrument_precision(quote, instrument) {
+    let price_domain = !instrument.is_inverse()
+        || (quote.bid_price <= quote.ask_price
+            && [quote.bid_price, quote.ask_price].into_iter().all(|price| {
+                instrument.try_normalize_price(price).is_ok()
+                    && price.raw() > 0
+                    && instrument.min_price().is_none_or(|min| price >= min)
+                    && instrument.max_price().is_none_or(|max| price <= max)
+            }));
+
+    if quote_matches_instrument_precision(quote, instrument) && price_domain {
         return true;
     }
 
     log::warn!(
-        "Dropping {context} for {} due to precision mismatch \
+        "Dropping {context} for {} due to invalid precision or inverse price domain \
          (bid_px={}, ask_px={}, bid_sz={}, ask_sz={}, expected_price={}, expected_size={})",
         instrument.id(),
         quote.bid_price.precision,

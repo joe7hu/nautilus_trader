@@ -60,6 +60,7 @@ rand = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 smallvec = { workspace = true }
 ustr = { workspace = true }
 uuid = { workspace = true }
@@ -67,6 +68,7 @@ uuid = { workspace = true }
 madsim = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
+
 
 [dev-dependencies]
 nautilus-model = { workspace = true, features = ["test-support"] }
@@ -76,7 +78,6 @@ criterion = { workspace = true }
 parking_lot = { workspace = true }
 proptest = { workspace = true }
 rstest = { workspace = true }
-serde_json = { workspace = true }
 
 [[bench]]
 name = "matching_core"
