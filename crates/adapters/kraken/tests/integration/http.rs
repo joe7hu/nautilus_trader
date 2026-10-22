@@ -3759,7 +3759,7 @@ async fn test_spot_request_account_state_margin_other_wallets_lock_own_holds() {
         .unwrap();
 
     // Fixture holds from test_data/http_spot_balance_ex.json.
-    for (code, expected_locked) in [("XBT", dec!(0.1)), ("ETH", dec!(0))] {
+    for (code, expected_locked) in [("BTC", dec!(0.1)), ("ETH", dec!(0))] {
         let balance = state
             .balances
             .iter()
@@ -3833,8 +3833,9 @@ async fn test_spot_request_account_state_cash_locks_held_amounts() {
     let xbt = state
         .balances
         .iter()
-        .find(|b| b.currency.code == "XBT")
-        .expect("expected XBT balance");
+        .find(|b| b.currency.code == "BTC")
+        .expect("expected canonical BTC balance");
+    assert_eq!(xbt.currency, Currency::BTC());
     assert_eq!(xbt.total.as_decimal().normalize(), dec!(0.5));
     assert_eq!(xbt.locked.as_decimal().normalize(), dec!(0.1));
     assert_eq!(xbt.free.as_decimal().normalize(), dec!(0.4));
@@ -3913,8 +3914,8 @@ async fn test_spot_request_account_state_cash_includes_net_credit() {
     let xbt = state
         .balances
         .iter()
-        .find(|b| b.currency.code == "XBT")
-        .expect("expected XBT balance from available credit alone");
+        .find(|b| b.currency.code == "BTC")
+        .expect("expected canonical BTC balance from available credit alone");
     assert_eq!(xbt.total.as_decimal().normalize(), dec!(1));
     assert_eq!(xbt.locked.as_decimal(), Decimal::ZERO);
     assert_eq!(xbt.free.as_decimal().normalize(), dec!(1));
