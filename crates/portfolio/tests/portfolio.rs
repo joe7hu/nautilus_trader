@@ -9431,6 +9431,11 @@ fn test_missing_xrate_flags_instrument(
     assert!(snapshot.stale_instruments.is_empty());
     assert!(snapshot.stale_currencies.is_empty());
     assert_eq!(snapshot.unpriced_instruments, vec![instrument_audusd.id()]);
+    let (_, reporting) = portfolio
+        .build_reporting_snapshot(&account_id, Currency::EUR())
+        .unwrap();
+    assert_eq!(reporting.equity, None);
+    assert!(reporting.is_stale);
 }
 
 #[rstest]
@@ -10175,4 +10180,206 @@ fn test_deregister_statistics_clears_defaults(simple_cache: Cache, clock: TestCl
 
     assert!(portfolio.registered_statistics().is_empty());
     assert!(portfolio.statistics().general.is_empty());
+}
+
+#[rstest]
+#[case("10000.00000000", "0.00000000", "82600.00", "10000.00000000")]
+#[case("9966.92695600", "0.00040000", "82600.00", "9999.96695600")]
+#[case("9917.31738999", "0.00100000", "82600.00", "9999.91738999")]
+#[case("9917.31738999", "0.00100000", "82610.00", "9999.92738999")]
+#[case("9917.31738999", "0.00100000", "82590.00", "9999.90738999")]
+fn reporting_equity_preserves_cash_accounting_and_counts_credited_asset_once(
+    mut simple_cache: Cache,
+    clock: TestClock,
+    instrument_btcusdt: InstrumentAny,
+    #[case] cash: &str,
+    #[case] btc: &str,
+    #[case] bid: &str,
+    #[case] expected: &str,
+) {
+    let account_id = AccountId::new("BINANCE-REPORTING");
+    simple_cache
+        .add_instrument(instrument_btcusdt.clone())
+        .unwrap();
+    let quote = QuoteTick::new(
+        instrument_btcusdt.id(),
+        Price::from(bid),
+        Price::from("82620.01"),
+        Quantity::from("1.000000"),
+        Quantity::from("1.000000"),
+        1.into(),
+        1.into(),
+    );
+    simple_cache.add_quote(quote).unwrap();
+    let mut portfolio = Portfolio::new(
+        Rc::new(RefCell::new(clock)),
+        Rc::new(RefCell::new(simple_cache)),
+        None,
+    );
+    let balances = [(cash, Currency::USDT()), (btc, Currency::BTC())]
+        .map(|(value, currency)| {
+            let amount = Money::from_decimal(value.parse().unwrap(), currency).unwrap();
+            AccountBalance::new(amount, Money::zero(currency), amount)
+        })
+        .to_vec();
+    let state = AccountState::new(
+        account_id,
+        AccountType::Cash,
+        balances.clone(),
+        vec![],
+        true,
+        uuid4(),
+        0.into(),
+        0.into(),
+        None,
+    );
+    portfolio.update_account(&state);
+
+    if btc != "0.00000000" {
+        let fill = make_fill_for_account(
+            &instrument_btcusdt,
+            account_id,
+            OrderSide::Buy,
+            Quantity::from(btc),
+            Price::from("82600.01"),
+            PositionId::new("P-REPORTING"),
+        );
+        let position = Position::new(&instrument_btcusdt, fill);
+        portfolio
+            .cache()
+            .borrow_mut()
+            .add_position(&position, OmsType::Netting)
+            .unwrap();
+        portfolio.update_position(&PositionEvent::PositionOpened(get_open_position(&position)));
+    }
+    let (snapshot, reporting) = portfolio
+        .build_reporting_snapshot(&account_id, Currency::USDT())
+        .unwrap();
+    assert_eq!(
+        reporting.equity,
+        Some(Money::from_decimal(expected.parse().unwrap(), Currency::USDT()).unwrap())
+    );
+    assert!(!reporting.is_stale);
+    assert_eq!(
+        reporting.flat_pnl,
+        (btc == "0.00000000").then(|| Money::zero(Currency::USDT()))
+    );
+    assert_eq!(snapshot.base_currency, None);
+    assert_eq!(snapshot.base_currency_equity, None);
+    for balance in &balances {
+        assert!(snapshot.balances.contains(balance));
+    }
+    assert_eq!(
+        portfolio
+            .cache()
+            .borrow()
+            .account(&account_id)
+            .unwrap()
+            .events(),
+        vec![state]
+    );
+}
+
+#[rstest]
+#[case("0.00000000", Some("10000.00000000"))]
+#[case("0.00100000", None)]
+fn reporting_equity_requires_conversion_for_every_nonzero_currency(
+    simple_cache: Cache,
+    clock: TestClock,
+    #[case] btc: &str,
+    #[case] expected: Option<&str>,
+) {
+    let account_id = AccountId::new("BINANCE-REPORTING");
+    let mut portfolio = Portfolio::new(
+        Rc::new(RefCell::new(clock)),
+        Rc::new(RefCell::new(simple_cache)),
+        None,
+    );
+    assert!(
+        portfolio
+            .build_reporting_snapshot(&account_id, Currency::USDT())
+            .is_none()
+    );
+    let balances = [("10000.00000000", Currency::USDT()), (btc, Currency::BTC())]
+        .map(|(value, currency)| {
+            let amount = Money::from_decimal(value.parse().unwrap(), currency).unwrap();
+            AccountBalance::new(amount, Money::zero(currency), amount)
+        })
+        .to_vec();
+    portfolio.update_account(&AccountState::new(
+        account_id,
+        AccountType::Cash,
+        balances,
+        vec![],
+        true,
+        uuid4(),
+        0.into(),
+        0.into(),
+        None,
+    ));
+    let (_, reporting) = portfolio
+        .build_reporting_snapshot(&account_id, Currency::USDT())
+        .unwrap();
+    assert_eq!(
+        reporting.equity,
+        expected
+            .map(|value| Money::from_decimal(value.parse().unwrap(), Currency::USDT()).unwrap())
+    );
+    assert_eq!(reporting.is_stale, expected.is_none());
+}
+
+#[rstest]
+fn reporting_flat_pnl_does_not_erase_archived_closed_positions(
+    mut simple_cache: Cache,
+    clock: TestClock,
+    instrument_audusd: InstrumentAny,
+) {
+    let account_id = AccountId::new("SIM-001");
+    simple_cache
+        .add_instrument(instrument_audusd.clone())
+        .unwrap();
+    let mut portfolio = Portfolio::new(
+        Rc::new(RefCell::new(clock)),
+        Rc::new(RefCell::new(simple_cache)),
+        None,
+    );
+    portfolio.update_account(&get_cash_account(Some(account_id.as_str())));
+    let position_id = PositionId::new("P-ARCHIVED-REPORTING");
+    let mut position = Position::new(
+        &instrument_audusd,
+        make_fill_for_account(
+            &instrument_audusd,
+            account_id,
+            OrderSide::Buy,
+            Quantity::from("100000"),
+            Price::from("0.80000"),
+            position_id,
+        ),
+    );
+    position.apply(&make_fill_for_account(
+        &instrument_audusd,
+        account_id,
+        OrderSide::Sell,
+        Quantity::from("100000"),
+        Price::from("0.80100"),
+        position_id,
+    ));
+    assert!(position.is_closed());
+    assert_eq!(position.realized_pnl, Some(Money::from("100.00 USD")));
+    portfolio
+        .cache()
+        .borrow_mut()
+        .snapshot_position(&position)
+        .unwrap();
+    assert!(
+        portfolio
+            .cache()
+            .borrow()
+            .positions(None, None, None, Some(&account_id), None)
+            .is_empty()
+    );
+    let (_, reporting) = portfolio
+        .build_reporting_snapshot(&account_id, Currency::USD())
+        .unwrap();
+    assert_eq!(reporting.flat_pnl, None);
 }

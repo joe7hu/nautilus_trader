@@ -428,8 +428,8 @@ distclean: clean  #-- Nuclear clean - remove all untracked files (requires FORCE
 #== Code Quality
 
 .PHONY: format
-format:  #-- Format Rust (with nightly) and Python code
-	cargo +nightly fmt
+format:  #-- Format Rust and Python code
+	bash .pre-commit-hooks/cargo_fmt_stable.sh --all
 	VIRTUAL_ENV= uv run --project python --no-sync ruff format . --config python/pyproject.toml --force-exclude
 
 .PHONY: pre-commit
