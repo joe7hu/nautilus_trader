@@ -232,6 +232,7 @@ impl SandboxExecutionClient {
                 .transpose()?;
             (account, orders, instrument)
         };
+
         if let Some(instrument) = instrument {
             let mut inner = self.inner.borrow_mut();
             inner.ensure_matching_engine(&instrument);

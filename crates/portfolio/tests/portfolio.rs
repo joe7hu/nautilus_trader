@@ -10234,6 +10234,7 @@ fn reporting_equity_preserves_cash_accounting_and_counts_credited_asset_once(
         None,
     );
     portfolio.update_account(&state);
+
     if btc != "0.00000000" {
         let fill = make_fill_for_account(
             &instrument_btcusdt,

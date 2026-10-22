@@ -2879,6 +2879,7 @@ impl OrderMatchingEngine {
             "unsupported matching engine restoration state"
         );
         let mut executions = 0;
+
         for order in orders {
             anyhow::ensure!(
                 order.instrument_id() == self.instrument.id()
@@ -2910,6 +2911,7 @@ impl OrderMatchingEngine {
                 .count();
         }
         self.ids_generator.restore_execution_count(executions);
+
         for order in orders {
             self.account_ids.insert(order.trader_id(), account_id);
             if order.is_open() {

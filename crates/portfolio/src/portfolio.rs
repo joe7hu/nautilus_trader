@@ -1085,6 +1085,7 @@ impl Portfolio {
                         reporting_currency,
                         price_type,
                     )?;
+
                     if rate <= Decimal::ZERO {
                         return None;
                     }

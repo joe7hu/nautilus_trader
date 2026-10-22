@@ -7285,6 +7285,7 @@ async fn restored_quote_only_cash_preserves_partial_order_and_trade_identity(#[c
         .borrow()
         .try_order_owned(&order.client_order_id())
         .unwrap();
+
     if cancel {
         assert!(fills.is_empty());
         assert_eq!(current.filled_qty(), Quantity::from("0.00040"));
@@ -7340,18 +7341,21 @@ fn quote_only_cash_restoration_rejects_unsupported_state_without_initializing(
 ) {
     let cache = Rc::new(RefCell::new(Cache::default()));
     let clock = Rc::new(RefCell::new(TestClock::new()));
+
     if challenge != 8 {
         cache
             .borrow_mut()
             .add_instrument(currency_pair_btcusdt().into())
             .unwrap();
     }
+
     if challenge == 7 {
         cache
             .borrow_mut()
             .add_instrument(nautilus_model::instruments::stubs::currency_pair_ethusdt().into())
             .unwrap();
     }
+
     if challenge != 6 {
         let event = AccountState::new(
             AccountId::from("BINANCE-001"),
