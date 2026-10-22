@@ -31,7 +31,7 @@ use nautilus_model::{
     orders::{OrderAny, OrderList},
     types::{Currency, Money, Price, Quantity},
 };
-use nautilus_portfolio::Portfolio;
+use nautilus_portfolio::{Portfolio, portfolio::ReportingValuation};
 use rust_decimal::Decimal;
 use ustr::Ustr;
 
@@ -843,15 +843,17 @@ impl<'a> PortfolioApi<'a> {
         self.portfolio.borrow_mut().build_snapshot(account_id)
     }
 
+    /// Builds a native snapshot and its reporting-currency valuation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the portfolio is already borrowed.
     #[must_use]
     pub fn build_reporting_snapshot(
         &self,
         account_id: &AccountId,
         reporting_currency: Currency,
-    ) -> Option<(
-        PortfolioSnapshot,
-        nautilus_portfolio::portfolio::ReportingValuation,
-    )> {
+    ) -> Option<(PortfolioSnapshot, ReportingValuation)> {
         self.portfolio
             .borrow_mut()
             .build_reporting_snapshot(account_id, reporting_currency)
