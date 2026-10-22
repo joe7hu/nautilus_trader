@@ -7548,6 +7548,7 @@ async fn restored_quote_only_margin_preserves_partial_order_and_trade_identity(
         .borrow()
         .try_order_owned(&order.client_order_id())
         .unwrap();
+
     if cancel {
         assert!(fills.is_empty());
         assert_eq!(current.filled_qty(), Quantity::from(partial_size));
@@ -7913,6 +7914,7 @@ async fn perpetual_execution_window_guards_matching_and_queued_invocation(
             .iter()
             .any(|event| matches!(event, OrderEventAny::Filled(_)))
     );
+
     match challenge {
         0 | 3 => clock.borrow_mut().set_time(40_000_000_000.into()),
         1 => {
@@ -7934,6 +7936,7 @@ async fn perpetual_execution_window_guards_matching_and_queued_invocation(
             .iter()
             .any(|event| matches!(event, OrderEventAny::Filled(_)))
     );
+
     if challenge == 3 {
         assert!(
             events

@@ -1134,6 +1134,7 @@ impl SandboxExecutionClient {
             SandboxInner::drain_inbound(&self.inner);
             return Ok(());
         }
+
         if self
             .inner
             .borrow()
@@ -3110,6 +3111,7 @@ impl SandboxInner {
             Self::drain_inbound(inner);
             return;
         }
+
         if inner
             .borrow()
             .minimum_quote_init

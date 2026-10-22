@@ -4369,6 +4369,7 @@ impl OrderMatchingEngine {
                                     == Some(&cached.filled_qty())
                         }))
         });
+
         if resting && let Some(mut order) = self.cache.borrow_mut().order_mut(&client_order_id) {
             order.set_liquidity_side(LiquiditySide::Maker);
         }
