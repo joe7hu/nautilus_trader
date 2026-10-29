@@ -8016,6 +8016,7 @@ fn restored_cash_close_preserves_originals_and_refuses_unsupported_history(#[cas
         .reduce_only(challenge != 2)
         .client_order_id("ORIGINAL-CLOSE".into())
         .build();
+
     for (index, order) in [&mut opening, &mut close].into_iter().enumerate() {
         order
             .apply(TestOrderEventStubs::submitted(order, account_id))
@@ -8027,6 +8028,7 @@ fn restored_cash_close_preserves_originals_and_refuses_unsupported_history(#[cas
                 format!("VENUE-{index}").as_str().into(),
             ))
             .unwrap();
+
         if !(index == 1 && challenge == 5) {
             order
                 .apply(TestOrderEventStubs::filled(
