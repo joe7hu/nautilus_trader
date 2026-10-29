@@ -7948,3 +7948,146 @@ async fn perpetual_execution_window_guards_matching_and_queued_invocation(
     assert_eq!(current.filled_qty(), Quantity::from("0.000"));
     context.client.stop().unwrap();
 }
+
+#[rstest]
+#[case(0)]
+#[case(1)]
+#[case(2)]
+#[case(3)]
+#[case(4)]
+#[case(5)]
+#[case(6)]
+#[case(7)]
+fn restored_cash_close_preserves_originals_and_refuses_unsupported_history(#[case] challenge: u8) {
+    let account_id = AccountId::from("BINANCE-001");
+    let position_id = PositionId::from("ORIGINAL-POSITION");
+    let mut definition = currency_pair_btcusdt();
+    definition.size_precision = 5;
+    definition.size_increment = Quantity::from("0.00001");
+    let instrument: InstrumentAny = definition.into();
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    let event = AccountState::new(
+        account_id,
+        AccountType::Cash,
+        vec![AccountBalance::new(
+            Money::from("9999.83478999 USDT"),
+            Money::from("0 USDT"),
+            Money::from("9999.83478999 USDT"),
+        )],
+        vec![],
+        false,
+        UUID4::new(),
+        1.into(),
+        1.into(),
+        None,
+    );
+    cache
+        .borrow_mut()
+        .add_account(AccountAny::from_events(&[event]).unwrap())
+        .unwrap();
+    let mut opening = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("0.00100"))
+        .price(Price::from("82600.01"))
+        .client_order_id("ORIGINAL-OPEN".into())
+        .build();
+    let mut close = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(if challenge == 1 {
+            OrderSide::Buy
+        } else {
+            OrderSide::Sell
+        })
+        .quantity(Quantity::from(if challenge == 3 {
+            "0.00200"
+        } else {
+            "0.00100"
+        }))
+        .time_in_force(if challenge == 4 {
+            TimeInForce::Gtc
+        } else {
+            TimeInForce::Ioc
+        })
+        .reduce_only(challenge != 2)
+        .client_order_id("ORIGINAL-CLOSE".into())
+        .build();
+    for (index, order) in [&mut opening, &mut close].into_iter().enumerate() {
+        order
+            .apply(TestOrderEventStubs::submitted(order, account_id))
+            .unwrap();
+        order
+            .apply(TestOrderEventStubs::accepted(
+                order,
+                account_id,
+                format!("VENUE-{index}").as_str().into(),
+            ))
+            .unwrap();
+        if !(index == 1 && challenge == 5) {
+            order
+                .apply(TestOrderEventStubs::filled(
+                    order,
+                    &instrument,
+                    Some(format!("TRADE-{index}").as_str().into()),
+                    Some(position_id),
+                    Some(Price::from(if index == 0 {
+                        "82600.01"
+                    } else {
+                        "82600.00"
+                    })),
+                    Some(if index == 0 && challenge == 6 {
+                        Quantity::from("0.00040")
+                    } else {
+                        order.quantity()
+                    }),
+                    Some(LiquiditySide::Taker),
+                    Some(Money::from("0.08260000 USDT")),
+                    Some(2.into()),
+                    Some(account_id),
+                ))
+                .unwrap();
+        }
+    }
+    cache
+        .borrow_mut()
+        .add_order(opening.clone(), Some(position_id), None, false)
+        .unwrap();
+    cache
+        .borrow_mut()
+        .add_order(
+            close.clone(),
+            Some(if challenge == 7 {
+                PositionId::from("OTHER")
+            } else {
+                position_id
+            }),
+            None,
+            false,
+        )
+        .unwrap();
+    let before = cache.borrow().account_owned(&account_id).unwrap();
+    let mut context = restore_cash_context(
+        cache.clone(),
+        Rc::new(RefCell::new(TestClock::new())),
+        |_| {},
+    );
+    let result = context.client.restore_quote_only();
+    assert_eq!(result.is_ok(), challenge == 0, "{result:?}");
+    assert_eq!(
+        cache.borrow().account_owned(&account_id).unwrap().events(),
+        before.events()
+    );
+    assert_eq!(
+        cache.borrow().order(&opening.client_order_id()).unwrap(),
+        &opening
+    );
+    assert_eq!(
+        cache.borrow().order(&close.client_order_id()).unwrap(),
+        &close
+    );
+    assert!(!context.client.is_connected());
+}
