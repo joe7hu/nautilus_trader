@@ -20,7 +20,8 @@ use std::{cell::RefCell, fmt::Debug, rc::Rc};
 use nautilus_common::cache::{Cache, VenueOrderIdOwnershipError};
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
-    enums::OmsType,
+    enums::{OmsType, OrderStatus},
+    events::OrderEventAny,
     identifiers::{
         AccountId, ClientOrderId, InstrumentId, PositionId, TradeId, Venue, VenueOrderId,
     },
@@ -192,6 +193,53 @@ impl IdsGenerator {
             self.venue, self.raw_id
         ))
         .map_err(Into::into)
+    }
+
+    /// Restores deterministic allocations from complete terminal original quote-only orders.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing, foreign or noncontiguous venue allocations.
+    pub fn restore_quote_only_allocations(&mut self, orders: &[OrderAny]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.use_random_ids
+                && self.oms_type == OmsType::Netting
+                && self.position_count == 0
+                && self.order_count == 0,
+            "native original allocation profile unavailable"
+        );
+        let prefix = format!("{}-{}-", self.venue, self.raw_id);
+        let mut allocations = Vec::new();
+
+        for order in orders {
+            anyhow::ensure!(order.is_closed(), "native original allocation still active");
+            if let Some(id) = order.venue_order_id() {
+                let index = id
+                    .as_str()
+                    .strip_prefix(&prefix)
+                    .ok_or_else(|| anyhow::anyhow!("foreign native original venue allocation"))?
+                    .parse::<usize>()?;
+                allocations.push(index);
+            } else {
+                anyhow::ensure!(
+                    matches!(order.status(), OrderStatus::Denied | OrderStatus::Rejected)
+                        && order.filled_qty().is_zero(),
+                    "native original allocation missing"
+                );
+            }
+        }
+        allocations.sort_unstable();
+        anyhow::ensure!(
+            allocations.iter().copied().eq(1..=allocations.len()),
+            "native original allocations incomplete or duplicate"
+        );
+        self.order_count = allocations.len();
+        self.execution_count = orders
+            .iter()
+            .flat_map(|order| order.events())
+            .filter(|event| matches!(event, OrderEventAny::Filled(_)))
+            .count();
+        Ok(())
     }
 
     pub fn restore_execution_count(&mut self, execution_count: usize) {
