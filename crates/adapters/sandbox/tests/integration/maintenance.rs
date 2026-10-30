@@ -31,6 +31,7 @@ use nautilus_common::{
 };
 use nautilus_core::{DurationNanos, UUID4, UnixNanos};
 use nautilus_execution::funding::FundingProgress;
+use nautilus_execution::maintenance::MaintenanceCheckpoint;
 use nautilus_execution::models::latency::{LatencyModelAny, StaticLatencyModel};
 use nautilus_execution::{client::core::ExecutionClientCore, engine::ExecutionEngine};
 use nautilus_live::runner::{AsyncRunner, AsyncTimeEventSender};
@@ -52,6 +53,19 @@ use nautilus_sandbox::{
 };
 use rstest::rstest;
 use rust_decimal::Decimal;
+
+#[rstest]
+fn test_maintenance_checkpoint_bounds_inline_history_size() {
+    // Optional original operator history must not inflate every consumer financial cut
+    assert!(std::mem::size_of::<MaintenanceCheckpoint>() <= 2048);
+    assert!(std::mem::size_of::<SandboxMaintenanceCheckpoint>() <= 3072);
+    let original = MaintenanceCheckpoint::default();
+    let wire = serde_json::to_value(original).unwrap();
+    assert!(wire.get("operator_close").is_none());
+    let restored: MaintenanceCheckpoint = serde_json::from_value(wire.clone()).unwrap();
+    assert!(restored.operator_close().is_none());
+    assert_eq!(serde_json::to_value(restored).unwrap(), wire);
+}
 
 fn make_window_client(
     clock: Rc<RefCell<dyn Clock>>,

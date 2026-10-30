@@ -136,7 +136,7 @@ pub struct MaintenanceCheckpoint {
     max_attempts: Option<usize>,
     opening: Option<(ClientOrderId, InstrumentId, OrderSide, Quantity)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    operator_close: Option<OperatorCloseCheckpoint>,
+    operator_close: Option<Box<OperatorCloseCheckpoint>>,
 }
 
 /// Owns native maintenance decisions, once-only dispatch and application confirmation.
@@ -167,7 +167,7 @@ impl MaintenanceCheckpoint {
 
     /// Returns the original separately approved operator-close lifecycle.
     pub fn operator_close(&self) -> Option<&OperatorCloseCheckpoint> {
-        self.operator_close.as_ref()
+        self.operator_close.as_deref()
     }
 }
 
@@ -430,14 +430,14 @@ impl MaintenanceOwner {
             order_events + 4 + fills <= 256 && account.events().len() + 4 + 2 * fills <= 256,
             "native operator close event headroom exhausted"
         );
-        self.state.operator_close = Some(OperatorCloseCheckpoint {
+        self.state.operator_close = Some(Box::new(OperatorCloseCheckpoint {
             intent: order.clone(),
             before_account: account,
             before_position: position,
             submitted: false,
             receipt: None,
             acknowledged: false,
-        });
+        }));
         Ok(())
     }
 
