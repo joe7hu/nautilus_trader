@@ -884,6 +884,124 @@ fn test_rust_write_trade_ticks() {
     assert_eq!(loaded, trade_ticks);
 }
 
+#[rstest]
+fn test_write_order_book_deltas_preserves_clear_null_orders_and_level_precision() {
+    let (_temp_dir, mut catalog) = create_temp_catalog();
+    let id = InstrumentId::from("BTC/USDT.KRAKEN");
+    let level = |sequence: u64,
+                 timestamp: u64,
+                 action: BookAction,
+                 side: OrderSide,
+                 price: &str,
+                 size: &str| {
+        OrderBookDelta::new(
+            id,
+            action,
+            BookOrder::new(side, Price::from(price), Quantity::from(size), sequence),
+            128,
+            sequence,
+            UnixNanos::from(timestamp - 1),
+            UnixNanos::from(timestamp),
+        )
+    };
+    let original = vec![
+        OrderBookDelta::clear(id, 0, UnixNanos::from(9), UnixNanos::from(10)),
+        level(
+            1,
+            11,
+            BookAction::Add,
+            OrderSide::Buy,
+            "60000.1",
+            "0.10000000",
+        ),
+        level(
+            2,
+            12,
+            BookAction::Add,
+            OrderSide::Sell,
+            "60000.2",
+            "0.20000000",
+        ),
+        level(
+            3,
+            13,
+            BookAction::Delete,
+            OrderSide::Buy,
+            "60000.1",
+            "0.00000000",
+        ),
+        OrderBookDelta::clear(id, 4, UnixNanos::from(13), UnixNanos::from(14)),
+        level(
+            5,
+            15,
+            BookAction::Add,
+            OrderSide::Buy,
+            "59999.9",
+            "0.30000000",
+        ),
+    ];
+
+    catalog
+        .write_to_parquet(&original, None, None, None)
+        .unwrap();
+    let loaded = catalog
+        .order_book_deltas(Some(vec![id.to_string()]), None, None)
+        .unwrap();
+
+    assert_eq!(
+        serde_json::to_value(&loaded).unwrap(),
+        serde_json::to_value(&original).unwrap()
+    );
+    for (actual, expected) in loaded.iter().zip(&original) {
+        assert_eq!(actual.order.price.raw(), expected.order.price.raw());
+        assert_eq!(actual.order.price.precision, expected.order.price.precision);
+        assert_eq!(actual.order.size.raw(), expected.order.size.raw());
+        assert_eq!(actual.order.size.precision, expected.order.size.precision);
+    }
+}
+
+#[rstest]
+#[case::foreign_clear(true)]
+#[case::mixed_level_precision(false)]
+fn test_write_order_book_deltas_rejects_mixed_identity_or_level_precision(
+    #[case] foreign_clear: bool,
+) {
+    let (_temp_dir, catalog) = create_temp_catalog();
+    let id = InstrumentId::from("BTC/USDT.KRAKEN");
+    let mut rows = vec![
+        OrderBookDelta::clear(id, 0, UnixNanos::from(9), UnixNanos::from(10)),
+        OrderBookDelta::new(
+            id,
+            BookAction::Add,
+            BookOrder::new(
+                OrderSide::Buy,
+                Price::from("60000.1"),
+                Quantity::from("0.10000000"),
+                1,
+            ),
+            128,
+            1,
+            UnixNanos::from(10),
+            UnixNanos::from(11),
+        ),
+    ];
+    if foreign_clear {
+        rows[0].instrument_id = InstrumentId::from("ETH/USDT.KRAKEN");
+    } else {
+        let mut changed = rows[1];
+        changed.order.price = Price::from("60000.10");
+        changed.ts_init = UnixNanos::from(12);
+        rows.push(changed);
+    }
+
+    let result = catalog.write_to_parquet(&rows, None, None, None);
+
+    assert!(
+        result.is_err(),
+        "incompatible delta metadata must refuse: {result:?}"
+    );
+}
+
 // Non-ASCII ids are stored percent-encoded on disk; queries must resolve the on-disk name.
 #[rstest]
 fn test_query_round_trip_non_ascii_instrument_id() {

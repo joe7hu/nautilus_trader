@@ -299,6 +299,12 @@ where
     /// Returns the metadata for this data element.
     fn metadata(&self) -> HashMap<String, String>;
 
+    /// Returns whether this data element can use the metadata selected for its chunk.
+    #[must_use]
+    fn metadata_matches(&self, metadata: &HashMap<String, String>) -> bool {
+        self.metadata() == *metadata
+    }
+
     /// Returns the metadata selected for a chunk.
     ///
     /// The default uses the first element. Implementations may override this when leading sentinel
