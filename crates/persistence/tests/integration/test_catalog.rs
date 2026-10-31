@@ -952,6 +952,7 @@ fn test_write_order_book_deltas_preserves_clear_null_orders_and_level_precision(
         serde_json::to_value(&loaded).unwrap(),
         serde_json::to_value(&original).unwrap()
     );
+
     for (actual, expected) in loaded.iter().zip(&original) {
         assert_eq!(actual.order.price.raw(), expected.order.price.raw());
         assert_eq!(actual.order.price.precision, expected.order.price.precision);
@@ -985,6 +986,7 @@ fn test_write_order_book_deltas_rejects_mixed_identity_or_level_precision(
             UnixNanos::from(11),
         ),
     ];
+
     if foreign_clear {
         rows[0].instrument_id = InstrumentId::from("ETH/USDT.KRAKEN");
     } else {
