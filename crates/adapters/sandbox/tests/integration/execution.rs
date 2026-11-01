@@ -8093,3 +8093,222 @@ fn restored_cash_close_preserves_originals_and_refuses_unsupported_history(#[cas
     );
     assert!(!context.client.is_connected());
 }
+
+#[rstest]
+#[case::linear_full(false, 0)]
+#[case::linear_partial(false, 1)]
+#[case::linear_no_fill(false, 2)]
+#[case::linear_denied(false, 3)]
+#[case::inverse_full(true, 0)]
+#[case::inverse_no_fill(true, 2)]
+#[case::inverse_denied(true, 3)]
+#[case::wrong_side(false, 4)]
+#[case::excess_quantity(false, 5)]
+#[case::foreign_position(false, 6)]
+#[case::foreign_allocation(false, 7)]
+#[case::unresolved_close(false, 8)]
+#[case::not_reduce_only(false, 9)]
+#[case::fractional_inverse(true, 10)]
+fn terminal_margin_close_restoration_preserves_original_native_events(
+    #[case] inverse: bool,
+    #[case] outcome: u8,
+) {
+    let account_id = AccountId::from("BINANCE-001");
+    let position_id = PositionId::from("ORIGINAL-MARGIN-POSITION");
+    let instrument = if inverse {
+        InstrumentAny::CryptoPerpetual(inverse_btcusd())
+    } else {
+        InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt())
+    };
+    let currency = if inverse {
+        Currency::BTC()
+    } else {
+        Currency::USDT()
+    };
+    let collateral = if inverse {
+        Money::from("1 BTC")
+    } else {
+        Money::from("10000 USDT")
+    };
+    let quantity = Quantity::from(if inverse { "1" } else { "0.010" });
+    let price = Price::from(if inverse { "40000.0" } else { "4000.00" });
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    let account = AccountState::new(
+        account_id,
+        AccountType::Margin,
+        vec![AccountBalance::new(
+            collateral,
+            Money::zero(currency),
+            collateral,
+        )],
+        vec![],
+        false,
+        UUID4::new(),
+        1.into(),
+        1.into(),
+        Some(currency),
+    );
+    let mut original_account = AccountAny::from_events(&[account]).unwrap();
+    original_account.set_calculate_account_state(true);
+    cache.borrow_mut().add_account(original_account).unwrap();
+    let mut opening = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(quantity)
+        .price(price)
+        .client_order_id("ORIGINAL-MARGIN-OPEN".into())
+        .build();
+    opening
+        .apply(TestOrderEventStubs::submitted(&opening, account_id))
+        .unwrap();
+    opening
+        .apply(TestOrderEventStubs::accepted(
+            &opening,
+            account_id,
+            "BINANCE-0-1".into(),
+        ))
+        .unwrap();
+    opening
+        .apply(TestOrderEventStubs::filled(
+            &opening,
+            &instrument,
+            Some("ORIGINAL-MARGIN-TRADE".into()),
+            Some(position_id),
+            Some(price),
+            Some(quantity),
+            Some(LiquiditySide::Taker),
+            Some(Money::zero(currency)),
+            Some(2.into()),
+            Some(account_id),
+        ))
+        .unwrap();
+    let close_quantity = Quantity::from(if outcome == 5 {
+        "0.020"
+    } else if outcome == 10 {
+        "0.5"
+    } else if inverse {
+        "1"
+    } else {
+        "0.010"
+    });
+    let mut close = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(if outcome == 4 {
+            OrderSide::Buy
+        } else {
+            OrderSide::Sell
+        })
+        .quantity(close_quantity)
+        .time_in_force(TimeInForce::Ioc)
+        .reduce_only(outcome != 9)
+        .client_order_id("ORIGINAL-MARGIN-CLOSE".into())
+        .build();
+
+    if outcome == 3 {
+        let now = UnixNanos::from(3);
+        close
+            .apply(OrderEventAny::Denied(OrderDenied::new(
+                close.trader_id(),
+                close.strategy_id(),
+                close.instrument_id(),
+                close.client_order_id(),
+                "Original supplied native denial".into(),
+                UUID4::new(),
+                now,
+                now,
+            )))
+            .unwrap();
+    } else {
+        close
+            .apply(TestOrderEventStubs::submitted(&close, account_id))
+            .unwrap();
+        close
+            .apply(TestOrderEventStubs::accepted(
+                &close,
+                account_id,
+                if outcome == 7 {
+                    "FOREIGN-ALLOCATION".into()
+                } else {
+                    "BINANCE-0-2".into()
+                },
+            ))
+            .unwrap();
+
+        if !matches!(outcome, 2 | 8) {
+            close
+                .apply(TestOrderEventStubs::filled(
+                    &close,
+                    &instrument,
+                    Some("ORIGINAL-CLOSE-TRADE".into()),
+                    Some(position_id),
+                    Some(price),
+                    Some(if outcome == 1 {
+                        Quantity::from("0.004")
+                    } else {
+                        close_quantity
+                    }),
+                    Some(LiquiditySide::Taker),
+                    Some(Money::zero(currency)),
+                    Some(4.into()),
+                    Some(account_id),
+                ))
+                .unwrap();
+        }
+
+        if matches!(outcome, 1 | 2) {
+            close
+                .apply(TestOrderEventStubs::canceled(
+                    &close,
+                    account_id,
+                    close.venue_order_id(),
+                ))
+                .unwrap();
+        }
+    }
+    cache
+        .borrow_mut()
+        .add_order(opening.clone(), Some(position_id), None, false)
+        .unwrap();
+    cache
+        .borrow_mut()
+        .add_order(
+            close.clone(),
+            Some(if outcome == 6 {
+                "FOREIGN-POSITION".into()
+            } else {
+                position_id
+            }),
+            None,
+            false,
+        )
+        .unwrap();
+    let before_account = serde_json::to_value(cache.borrow().account_owned(&account_id)).unwrap();
+    let mut context = restore_cash_context(
+        cache.clone(),
+        Rc::new(RefCell::new(TestClock::new())),
+        |config| {
+            config.account_type = AccountType::Margin;
+            config.base_currency = Some(currency);
+            config.starting_balances = vec![collateral];
+        },
+    );
+    let result = context.client.restore_quote_only();
+    assert_eq!(result.is_ok(), outcome <= 3, "{result:?}");
+    assert_eq!(
+        serde_json::to_value(cache.borrow().account_owned(&account_id)).unwrap(),
+        before_account
+    );
+    assert_eq!(
+        cache.borrow().order(&opening.client_order_id()).unwrap(),
+        &opening
+    );
+    assert_eq!(
+        cache.borrow().order(&close.client_order_id()).unwrap(),
+        &close
+    );
+    assert!(!context.client.is_connected());
+}

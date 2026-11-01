@@ -31,6 +31,7 @@ use nautilus_common::{
 };
 use nautilus_core::{DurationNanos, UUID4, UnixNanos};
 use nautilus_execution::funding::FundingProgress;
+use nautilus_execution::maintenance::MaintenanceCheckpoint;
 use nautilus_execution::models::latency::{LatencyModelAny, StaticLatencyModel};
 use nautilus_execution::{client::core::ExecutionClientCore, engine::ExecutionEngine};
 use nautilus_live::runner::{AsyncRunner, AsyncTimeEventSender};
@@ -40,6 +41,7 @@ use nautilus_model::{
         BookOrder, FundingRateUpdate, MarkPriceUpdate, OrderBookDelta, OrderBookDeltas, QuoteTick,
     },
     enums::{AccountType, BookAction, BookType, OmsType, OrderSide, OrderType, TimeInForce},
+    events::{OrderDenied, OrderEventAny},
     identifiers::{AccountId, ClientId, OrderListId, TraderId, Venue},
     instruments::{Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt},
     orders::{Order, OrderList, OrderTestBuilder},
@@ -51,6 +53,19 @@ use nautilus_sandbox::{
 };
 use rstest::rstest;
 use rust_decimal::Decimal;
+
+#[rstest]
+fn test_maintenance_checkpoint_bounds_inline_history_size() {
+    // Optional original operator history must not inflate every consumer financial cut
+    assert!(std::mem::size_of::<MaintenanceCheckpoint>() <= 2048);
+    assert!(std::mem::size_of::<SandboxMaintenanceCheckpoint>() <= 3072);
+    let original = MaintenanceCheckpoint::default();
+    let wire = serde_json::to_value(original).unwrap();
+    assert!(wire.get("operator_close").is_none());
+    let restored: MaintenanceCheckpoint = serde_json::from_value(wire.clone()).unwrap();
+    assert!(restored.operator_close().is_none());
+    assert_eq!(serde_json::to_value(restored).unwrap(), wire);
+}
 
 fn make_window_client(
     clock: Rc<RefCell<dyn Clock>>,
@@ -133,9 +148,23 @@ enum CloseCase {
     ResidualRestore,
     DeadlinePending,
     MissingCancellationApplication,
+    OperatorFull,
+    OperatorPartial,
+    OperatorNoBook,
+    OperatorDenied,
+    OperatorMissingApplication,
+    OperatorThenTwoMaintenance,
+    TwoMaintenanceThenOperator,
 }
 
 #[rstest]
+#[case::operator_full(CloseCase::OperatorFull)]
+#[case::operator_partial(CloseCase::OperatorPartial)]
+#[case::operator_no_book(CloseCase::OperatorNoBook)]
+#[case::operator_denied(CloseCase::OperatorDenied)]
+#[case::operator_missing_application(CloseCase::OperatorMissingApplication)]
+#[case::operator_then_two_maintenance(CloseCase::OperatorThenTwoMaintenance)]
+#[case::two_maintenance_then_operator(CloseCase::TwoMaintenanceThenOperator)]
 #[case(CloseCase::Full)]
 #[case(CloseCase::Above)]
 #[case(CloseCase::Partial)]
@@ -165,6 +194,16 @@ enum CloseCase {
 async fn live_maintenance_applies_queued_short_before_equality_and_original_close(
     #[case] close_case: CloseCase,
 ) {
+    let operator = matches!(
+        close_case,
+        CloseCase::OperatorFull
+            | CloseCase::OperatorPartial
+            | CloseCase::OperatorNoBook
+            | CloseCase::OperatorDenied
+            | CloseCase::OperatorMissingApplication
+            | CloseCase::OperatorThenTwoMaintenance
+            | CloseCase::TwoMaintenanceThenOperator
+    );
     let long = matches!(close_case, CloseCase::CoveredLong);
     let buy = long || matches!(close_case, CloseCase::ThinLong);
     let delayed = matches!(close_case, CloseCase::Delayed);
@@ -208,7 +247,14 @@ async fn live_maintenance_applies_queued_short_before_equality_and_original_clos
         | CloseCase::DispatchFailure
         | CloseCase::AttemptBudget
         | CloseCase::ResidualRestore
-        | CloseCase::DeadlinePending => (
+        | CloseCase::DeadlinePending
+        | CloseCase::OperatorFull
+        | CloseCase::OperatorPartial
+        | CloseCase::OperatorNoBook
+        | CloseCase::OperatorDenied
+        | CloseCase::OperatorMissingApplication
+        | CloseCase::OperatorThenTwoMaintenance
+        | CloseCase::TwoMaintenanceThenOperator => (
             "0.100",
             "0.010",
             "9.98000000 USDT",
@@ -498,14 +544,16 @@ async fn live_maintenance_applies_queued_short_before_equality_and_original_clos
     let healthy_time = clock.borrow().timestamp_ns();
     let healthy = QuoteTick::new(
         instrument.id(),
-        Price::from(if remainder {
+        Price::from(if operator {
+            "4000.00"
+        } else if remainder {
             "3999.99"
         } else if buy {
             "3402.01"
         } else {
             "4597.98"
         }),
-        Price::from(healthy_ask),
+        Price::from(if operator { "4000.01" } else { healthy_ask }),
         Quantity::from("0.100"),
         Quantity::from("0.100"),
         healthy_time,
@@ -521,6 +569,409 @@ async fn live_maintenance_applies_queued_short_before_equality_and_original_clos
 
     while let Ok(event) = exec_rx.try_recv() {
         AsyncRunner::handle_exec_event(event);
+    }
+
+    if operator {
+        let account_id = AccountId::from("BINANCE-001");
+        let handle = client.maintenance_handle();
+        assert!(handle.checkpoint().unwrap().operator_close().is_none());
+        let initial_receipts = if matches!(close_case, CloseCase::TwoMaintenanceThenOperator) {
+            for (index, price) in ["4598.00", "4900.00"].into_iter().enumerate() {
+                let fresh = clock.borrow().timestamp_ns();
+                let adverse = QuoteTick::new(
+                    instrument.id(),
+                    Price::from(price),
+                    Price::from(price),
+                    Quantity::from("0.100"),
+                    Quantity::from("0.004"),
+                    fresh,
+                    fresh,
+                );
+                cache.borrow_mut().add_quote(adverse).unwrap();
+                client.process_quote_tick(&adverse).unwrap();
+
+                while let Ok(event) = exec_rx.try_recv() {
+                    AsyncRunner::handle_exec_event(event);
+                }
+                assert_eq!(handle.checkpoint().unwrap().receipts().len(), index + 1);
+                client.acknowledge_maintenance(index + 1).unwrap();
+            }
+            assert_eq!(
+                cache
+                    .borrow()
+                    .positions_open(None, None, None, Some(&account_id), None)[0]
+                    .quantity,
+                Quantity::from("0.002")
+            );
+            assert_eq!(
+                cache
+                    .borrow()
+                    .account_owned(&account_id)
+                    .unwrap()
+                    .balance_total(Some(Currency::USDT())),
+                Some(Money::from("3.96900400 USDT"))
+            );
+            let settled = serde_json::to_value(handle.checkpoint().unwrap()).unwrap();
+            assert!(settled["owner"]["uncertainty"].is_null());
+            assert!(settled["owner"]["deferral"].is_null());
+            2
+        } else {
+            0
+        };
+        let position = cache
+            .borrow()
+            .positions_open(None, None, None, Some(&account_id), None)[0]
+            .cloned();
+        let source_time = clock.borrow().timestamp_ns();
+        let close_quote = QuoteTick::new(
+            instrument.id(),
+            Price::from("4000.00"),
+            Price::from("4000.01"),
+            Quantity::from("0.100"),
+            Quantity::from(if matches!(close_case, CloseCase::OperatorNoBook) {
+                "0.000"
+            } else if matches!(
+                close_case,
+                CloseCase::OperatorPartial | CloseCase::OperatorThenTwoMaintenance
+            ) {
+                "0.004"
+            } else {
+                "0.100"
+            }),
+            source_time,
+            source_time,
+        );
+        cache.borrow_mut().add_quote(close_quote).unwrap();
+        client.process_quote_tick(&close_quote).unwrap();
+
+        while let Ok(event) = exec_rx.try_recv() {
+            AsyncRunner::handle_exec_event(event);
+        }
+        let intent = OrderTestBuilder::new(OrderType::Market)
+            .trader_id(position.trader_id)
+            .strategy_id(position.strategy_id)
+            .instrument_id(position.instrument_id)
+            .side(OrderSide::Buy)
+            .quantity(position.quantity)
+            .time_in_force(TimeInForce::Ioc)
+            .reduce_only(true)
+            .client_order_id("OPERATOR-CLOSE-001".into())
+            .ts_init(source_time)
+            .build();
+        let before_account =
+            serde_json::to_value(cache.borrow().account_owned(&account_id)).unwrap();
+        handle.prepare_operator_close(&intent, position.id).unwrap();
+        assert!(handle.prepare_operator_close(&intent, position.id).is_err());
+        assert!(handle.checkpoint().is_err());
+        assert!(!handle.complete_operator_close().unwrap());
+        assert!(
+            handle
+                .acknowledge_operator_close(intent.client_order_id())
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(cache.borrow().account_owned(&account_id)).unwrap(),
+            before_account
+        );
+        cache
+            .borrow_mut()
+            .add_order(
+                intent.clone(),
+                Some(position.id),
+                Some(client.client_id()),
+                false,
+            )
+            .unwrap();
+
+        if matches!(close_case, CloseCase::OperatorFull) {
+            let mut changed_instrument = SubmitOrder::from_order(
+                &intent,
+                intent.trader_id(),
+                Some(client.client_id()),
+                Some(position.id),
+                UUID4::new(),
+                source_time,
+            );
+            changed_instrument.instrument_id = "FOREIGN.BINANCE".into();
+            assert!(client.submit_order(changed_instrument).is_err());
+            let wrong_position = SubmitOrder::from_order(
+                &intent,
+                intent.trader_id(),
+                Some(client.client_id()),
+                Some("FOREIGN-POSITION".into()),
+                UUID4::new(),
+                source_time,
+            );
+            assert!(client.submit_order(wrong_position).is_err());
+            assert_eq!(
+                serde_json::to_value(cache.borrow().account_owned(&account_id)).unwrap(),
+                before_account
+            );
+        }
+
+        if matches!(close_case, CloseCase::OperatorDenied) {
+            let event = OrderDenied::new(
+                intent.trader_id(),
+                intent.strategy_id(),
+                intent.instrument_id(),
+                intent.client_order_id(),
+                "Controlled original terminal denial".into(),
+                UUID4::new(),
+                source_time,
+                source_time,
+            );
+            engine.borrow_mut().process(&OrderEventAny::Denied(event));
+        } else {
+            if matches!(close_case, CloseCase::OperatorNoBook) {
+                let clear = OrderBookDeltas::new(
+                    instrument.id(),
+                    vec![OrderBookDelta::clear(
+                        instrument.id(),
+                        1,
+                        source_time,
+                        source_time,
+                    )],
+                );
+                client.process_order_book_deltas(&clear).unwrap();
+            }
+
+            if matches!(close_case, CloseCase::OperatorMissingApplication) {
+                drop(portfolio.take());
+            }
+            client
+                .submit_order(SubmitOrder::from_order(
+                    &intent,
+                    intent.trader_id(),
+                    Some(client.client_id()),
+                    Some(position.id),
+                    UUID4::new(),
+                    source_time,
+                ))
+                .unwrap();
+            assert!(
+                client
+                    .submit_order(SubmitOrder::from_order(
+                        &intent,
+                        intent.trader_id(),
+                        Some(client.client_id()),
+                        Some(position.id),
+                        UUID4::new(),
+                        source_time
+                    ))
+                    .is_err()
+            );
+        }
+
+        while let Ok(event) = exec_rx.try_recv() {
+            AsyncRunner::handle_exec_event(event);
+        }
+
+        if matches!(close_case, CloseCase::OperatorMissingApplication) {
+            assert!(handle.complete_operator_close().is_err());
+            assert!(handle.checkpoint().is_err());
+            client.stop().unwrap();
+            return;
+        }
+        assert!(handle.complete_operator_close().unwrap());
+        let original = handle.checkpoint().unwrap();
+        assert_eq!(original.receipts().len(), initial_receipts);
+        let receipt = original.operator_close().unwrap().receipt().unwrap();
+        assert_eq!(receipt.order.client_order_id(), intent.client_order_id());
+        assert_eq!(receipt.position.id, position.id);
+        assert!(!original.operator_close().unwrap().acknowledged());
+        if matches!(close_case, CloseCase::TwoMaintenanceThenOperator) {
+            assert!(receipt.position.is_closed());
+            assert_eq!(receipt.order.quantity(), Quantity::from("0.002"));
+            assert_eq!(
+                receipt.account.balance_total(Some(Currency::USDT())),
+                Some(Money::from("3.96498399 USDT"))
+            );
+        } else if matches!(close_case, CloseCase::OperatorFull) {
+            assert!(receipt.position.is_closed());
+            assert_eq!(
+                receipt.account.balance_total(Some(Currency::USDT())),
+                Some(Money::from("9.95989995 USDT"))
+            );
+        } else if matches!(
+            close_case,
+            CloseCase::OperatorPartial | CloseCase::OperatorThenTwoMaintenance
+        ) {
+            assert_eq!(receipt.order.filled_qty(), Quantity::from("0.004"));
+            assert_eq!(receipt.position.quantity, Quantity::from("0.006"));
+            assert_eq!(
+                receipt.account.balance_total(Some(Currency::USDT())),
+                Some(Money::from("9.97195998 USDT"))
+            );
+        } else {
+            assert_eq!(receipt.order.filled_qty(), Quantity::from("0.000"));
+            assert_eq!(receipt.position.quantity, Quantity::from("0.010"));
+            assert_eq!(
+                receipt.account.balance_total(Some(Currency::USDT())),
+                Some(Money::from("9.98000000 USDT"))
+            );
+        }
+        let order_count = cache.borrow().orders(None, None, None, None, None).len();
+        let blocked_time = clock.borrow().timestamp_ns();
+        let blocked = QuoteTick::new(
+            instrument.id(),
+            Price::from("5999.99"),
+            Price::from("6000.00"),
+            Quantity::from("0.100"),
+            Quantity::from("0.100"),
+            blocked_time,
+            blocked_time,
+        );
+        cache.borrow_mut().add_quote(blocked).unwrap();
+        client.process_quote_tick(&blocked).unwrap();
+
+        while let Ok(event) = exec_rx.try_recv() {
+            AsyncRunner::handle_exec_event(event);
+        }
+        assert_eq!(
+            cache.borrow().orders(None, None, None, None, None).len(),
+            order_count
+        );
+        assert_eq!(
+            handle.checkpoint().unwrap().receipts().len(),
+            initial_receipts
+        );
+        assert!(
+            handle
+                .acknowledge_operator_close("FOREIGN-OPERATOR".into())
+                .is_err()
+        );
+        handle
+            .acknowledge_operator_close(intent.client_order_id())
+            .unwrap();
+        assert!(
+            handle
+                .checkpoint()
+                .unwrap()
+                .operator_close()
+                .unwrap()
+                .acknowledged()
+        );
+        assert!(handle.prepare_operator_close(&intent, position.id).is_err());
+
+        if matches!(close_case, CloseCase::OperatorThenTwoMaintenance) {
+            for (index, ask) in ["6000.00", "6100.00"].into_iter().enumerate() {
+                let fresh = clock.borrow().timestamp_ns();
+                let quote = QuoteTick::new(
+                    instrument.id(),
+                    Price::from(ask),
+                    Price::from(ask),
+                    Quantity::from("0.100"),
+                    Quantity::from("0.002"),
+                    fresh,
+                    fresh,
+                );
+                cache.borrow_mut().add_quote(quote).unwrap();
+                client.process_quote_tick(&quote).unwrap();
+
+                while let Ok(event) = exec_rx.try_recv() {
+                    AsyncRunner::handle_exec_event(event);
+                }
+                assert_eq!(handle.checkpoint().unwrap().receipts().len(), index + 1);
+                client.acknowledge_maintenance(index + 1).unwrap();
+            }
+            assert_eq!(cache.borrow().orders(None, None, None, None, None).len(), 4);
+        }
+        let original = handle.checkpoint().unwrap();
+
+        if matches!(close_case, CloseCase::TwoMaintenanceThenOperator) {
+            assert_eq!(cache.borrow().orders(None, None, None, None, None).len(), 4);
+            assert_eq!(original.receipts().len(), 2);
+            assert!(
+                original
+                    .operator_close()
+                    .unwrap()
+                    .receipt()
+                    .unwrap()
+                    .position
+                    .is_closed()
+            );
+        }
+        let original_json = serde_json::to_value(&original).unwrap();
+        client.stop().unwrap();
+        drop(portfolio.take());
+        let restored_cache = Rc::new(RefCell::new(Cache::default()));
+        restored_cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        restored_cache
+            .borrow_mut()
+            .add_account(cache.borrow().account_owned(&account_id).unwrap())
+            .unwrap();
+
+        for position in cache
+            .borrow()
+            .positions(None, None, None, Some(&account_id), None)
+        {
+            restored_cache
+                .borrow_mut()
+                .add_position(&position, OmsType::Netting)
+                .unwrap();
+        }
+
+        for order in cache.borrow().orders(None, None, None, None, None) {
+            restored_cache
+                .borrow_mut()
+                .add_order(
+                    (*order).clone(),
+                    cache
+                        .borrow()
+                        .position_id(&order.client_order_id())
+                        .copied(),
+                    Some(client.client_id()),
+                    false,
+                )
+                .unwrap();
+        }
+        restored_cache
+            .borrow_mut()
+            .add_funding_rate(update)
+            .unwrap();
+
+        if matches!(close_case, CloseCase::OperatorFull) {
+            let financial_before =
+                serde_json::to_value(restored_cache.borrow().account_owned(&account_id)).unwrap();
+
+            for missing in ["submission", "receipt"] {
+                let mut corrupted = original_json.clone();
+
+                if missing == "submission" {
+                    corrupted["owner"]["operator_close"]["submitted"] = false.into();
+                } else {
+                    corrupted["owner"]["operator_close"]["receipt"] = serde_json::Value::Null;
+                }
+                let corrupted: SandboxMaintenanceCheckpoint =
+                    serde_json::from_value(corrupted).unwrap();
+                let rejected = make_window_client(clock.clone(), restored_cache.clone(), window);
+                assert!(
+                    rejected
+                        .restore_maintenance(corrupted, Decimal::ONE)
+                        .is_err()
+                );
+                assert_eq!(
+                    serde_json::to_value(restored_cache.borrow().account_owned(&account_id))
+                        .unwrap(),
+                    financial_before
+                );
+            }
+        }
+        let mut restored = make_window_client(clock.clone(), restored_cache, window);
+        restored
+            .restore_maintenance(original, Decimal::ONE)
+            .unwrap();
+        restored.restore_quote_only().unwrap();
+        assert!(!restored.is_connected());
+        assert_eq!(
+            serde_json::to_value(restored.maintenance_checkpoint().unwrap()).unwrap(),
+            original_json
+        );
+        assert!(exec_rx.try_recv().is_err());
+        return;
     }
 
     if matches!(close_case, CloseCase::MissingOpeningApplication) {
