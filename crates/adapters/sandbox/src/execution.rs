@@ -450,6 +450,8 @@ impl SandboxExecutionClient {
                 orders.len()
                     <= if self.inner.borrow().maintenance.is_some() {
                         3
+                    } else if self.config.account_type == AccountType::Cash {
+                        2
                     } else {
                         1
                     },
@@ -500,11 +502,12 @@ impl SandboxExecutionClient {
         {
             let mut inner = self.inner.borrow_mut();
             inner.ensure_matching_engine(&instrument);
-            inner
-                .matching_engines
-                .get_mut(&instrument.id())
-                .unwrap()
-                .restore_quote_only_limit_orders(&orders, account_id)?;
+            let engine = inner.matching_engines.get_mut(&instrument.id()).unwrap();
+            if orders.len() == 2 && self.config.account_type == AccountType::Cash {
+                engine.restore_quote_only_cash_close(&orders, account_id)?;
+            } else {
+                engine.restore_quote_only_limit_orders(&orders, account_id)?;
+            }
         }
         self.inner.borrow_mut().balances = account
             .balances()

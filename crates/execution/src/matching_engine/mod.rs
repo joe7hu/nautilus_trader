@@ -2991,6 +2991,67 @@ impl OrderMatchingEngine {
         Ok(())
     }
 
+    /// Restores one terminal cash opening and its original terminal reduce-only IOC close.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported, unresolved or differently scoped original history.
+    pub fn restore_quote_only_cash_close(
+        &mut self,
+        orders: &[OrderAny],
+        account_id: AccountId,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.account_type == AccountType::Cash && orders.len() == 2,
+            "cash close restoration requires two original cash orders"
+        );
+        let opening = orders
+            .iter()
+            .find(|o| o.order_type() == OrderType::Limit)
+            .ok_or_else(|| anyhow::anyhow!("original cash opening unavailable"))?;
+        let close = orders
+            .iter()
+            .find(|o| o.order_type() == OrderType::Market)
+            .ok_or_else(|| anyhow::anyhow!("original cash close unavailable"))?;
+        let cache = self.cache.borrow();
+        anyhow::ensure!(
+            opening.is_closed()
+                && opening.order_side() == OrderSide::Buy
+                && opening.filled_qty().is_positive()
+                && !opening.is_reduce_only()
+                && close.instrument_id() == self.instrument.id()
+                && (close.account_id() == Some(account_id)
+                    || (close.status() == OrderStatus::Denied && close.account_id().is_none()))
+                && close.trader_id() == opening.trader_id()
+                && close.strategy_id() == opening.strategy_id()
+                && close.order_side() == OrderSide::Sell
+                && close.time_in_force() == TimeInForce::Ioc
+                && close.is_reduce_only()
+                && !close.is_quote_quantity()
+                && close.is_closed()
+                && (close.venue_order_id().is_some()
+                    || matches!(close.status(), OrderStatus::Denied | OrderStatus::Rejected))
+                && close.contingency_type().is_none()
+                && !close.is_emulated()
+                && close.quantity().precision == self.instrument.size_precision()
+                && close.quantity() <= opening.filled_qty()
+                && close.filled_qty() <= close.quantity()
+                && cache.position_id(&opening.client_order_id()).is_some()
+                && cache.position_id(&opening.client_order_id())
+                    == cache.position_id(&close.client_order_id()),
+            "unsupported original cash close history"
+        );
+        drop(cache);
+        self.restore_quote_only_limit_orders(std::slice::from_ref(opening), account_id)?;
+        let executions = orders
+            .iter()
+            .flat_map(|o| o.events())
+            .filter(|event| matches!(event, OrderEventAny::Filled(_)))
+            .count();
+        self.ids_generator.restore_execution_count(executions);
+        Ok(())
+    }
+
     /// Restores the complete original limit-order history into an empty quote-only engine.
     ///
     /// # Errors
