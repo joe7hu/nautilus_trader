@@ -22,7 +22,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use nautilus_model::{
-    data::{BookOrder, OrderBookDelta},
+    data::{BookOrder, NULL_ORDER, OrderBookDelta},
     enums::{BookAction, FromU8, OrderSide},
     types::fixed::PRECISION_BYTES,
 };
@@ -120,6 +120,23 @@ impl EncodeToRecordBatch for OrderBookDelta {
         )
     }
 
+    fn metadata_matches(&self, metadata: &HashMap<String, String>) -> bool {
+        if self.action == BookAction::Clear
+            && self.order.side.is_none()
+            && self.order.price.raw() == 0
+            && self.order.size.raw() == 0
+            && self.order.order_id == 0
+        {
+            self.order.price.precision == NULL_ORDER.price.precision
+                && self.order.size.precision == NULL_ORDER.size.precision
+                && metadata
+                    .get("instrument_id")
+                    .is_some_and(|id| id == &self.instrument_id.to_string())
+        } else {
+            self.metadata() == *metadata
+        }
+    }
+
     /// Extracts metadata from the first non-clear delta, falling back to the first clear.
     ///
     /// Clear deltas use sentinel values whose precision does not describe the following book data.
@@ -190,6 +207,21 @@ impl DecodeFromRecordBatch for OrderBookDelta {
                 let size =
                     decode_quantity_with_sentinel(size_values.value(i), size_precision, "size", i)?;
                 let order_id = order_id_values.value(i);
+                let order = if action == BookAction::Clear
+                    && side.is_none()
+                    && price.raw() == 0
+                    && size.raw() == 0
+                    && order_id == 0
+                {
+                    NULL_ORDER
+                } else {
+                    BookOrder {
+                        side,
+                        price,
+                        size,
+                        order_id,
+                    }
+                };
                 let flags = flags_values.value(i);
                 let sequence = sequence_values.value(i);
                 let ts_event = ts_event_values.value(i).into();
@@ -198,12 +230,7 @@ impl DecodeFromRecordBatch for OrderBookDelta {
                 Ok(Self {
                     instrument_id,
                     action,
-                    order: BookOrder {
-                        side,
-                        price,
-                        size,
-                        order_id,
-                    },
+                    order,
                     flags,
                     sequence,
                     ts_event,

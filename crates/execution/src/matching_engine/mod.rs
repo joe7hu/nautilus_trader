@@ -2919,7 +2919,7 @@ impl OrderMatchingEngine {
         self.ids_generator.checkpoint()
     }
 
-    /// Restores one original opening order and at most two terminal native liquidation closes.
+    /// Restores one opening, bounded liquidation closes and its proven operator close.
     ///
     /// # Errors
     ///
@@ -2929,9 +2929,11 @@ impl OrderMatchingEngine {
         orders: &[OrderAny],
         account_id: AccountId,
         ids: &ids_generator::IdsCheckpoint,
+        operator: Option<ClientOrderId>,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
-            orders.len() <= 3 && self.core.iter_orders().next().is_none(),
+            orders.len() <= 3 + usize::from(operator.is_some())
+                && self.core.iter_orders().next().is_none(),
             "unsupported native order history"
         );
         let opening: Vec<_> = orders
@@ -2950,18 +2952,28 @@ impl OrderMatchingEngine {
         {
             anyhow::ensure!(
                 close.instrument_id() == self.instrument.id()
-                    && close.account_id() == Some(account_id)
+                    && (close.account_id() == Some(account_id)
+                        || (Some(close.client_order_id()) == operator
+                            && close.status() == OrderStatus::Denied
+                            && close.account_id().is_none()))
                     && close.order_type() == OrderType::Market
                     && close.time_in_force() == TimeInForce::Ioc
                     && close.is_reduce_only()
                     && close.is_closed()
-                    && close.venue_order_id().is_some()
+                    && (close.venue_order_id().is_some()
+                        || (Some(close.client_order_id()) == operator
+                            && matches!(
+                                close.status(),
+                                OrderStatus::Denied | OrderStatus::Rejected
+                            )))
                     && close.contingency_type().is_none()
                     && !close.is_emulated()
-                    && close.client_order_id().as_str().starts_with("LIQUIDATION-")
-                    && close.tags().is_some_and(|tags| tags
-                        .iter()
-                        .any(|tag| tag.as_str() == format!("LIQUIDATION_{}_CLOSE", self.venue)))
+                    && (Some(close.client_order_id()) == operator
+                        || (close.client_order_id().as_str().starts_with("LIQUIDATION-")
+                            && close
+                                .tags()
+                                .is_some_and(|tags| tags.iter().any(|tag| tag.as_str()
+                                    == format!("LIQUIDATION_{}_CLOSE", self.venue)))))
                     && opening
                         .first()
                         .is_some_and(|o| o.trader_id() == close.trader_id()
@@ -2975,7 +2987,12 @@ impl OrderMatchingEngine {
                 "unsupported original native liquidation close"
             );
         }
-        ids.validate_history(orders)?;
+        let allocated = orders
+            .iter()
+            .filter(|order| order.venue_order_id().is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        ids.validate_history(&allocated)?;
         self.restore_quote_only_limit_orders(&opening, account_id)?;
         let execution_count = orders
             .iter()
@@ -2991,32 +3008,34 @@ impl OrderMatchingEngine {
         Ok(())
     }
 
-    /// Restores one terminal cash opening and its original terminal reduce-only IOC close.
+    /// Restores one terminal opening and its original terminal reduce-only IOC close.
     ///
     /// # Errors
     ///
     /// Returns an error for unsupported, unresolved or differently scoped original history.
-    pub fn restore_quote_only_cash_close(
+    pub fn restore_quote_only_terminal_close(
         &mut self,
         orders: &[OrderAny],
         account_id: AccountId,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.account_type == AccountType::Cash && orders.len() == 2,
-            "cash close restoration requires two original cash orders"
+            matches!(self.account_type, AccountType::Cash | AccountType::Margin)
+                && orders.len() == 2,
+            "terminal close restoration requires two original orders"
         );
         let opening = orders
             .iter()
             .find(|o| o.order_type() == OrderType::Limit)
-            .ok_or_else(|| anyhow::anyhow!("original cash opening unavailable"))?;
+            .ok_or_else(|| anyhow::anyhow!("original terminal opening unavailable"))?;
         let close = orders
             .iter()
             .find(|o| o.order_type() == OrderType::Market)
-            .ok_or_else(|| anyhow::anyhow!("original cash close unavailable"))?;
+            .ok_or_else(|| anyhow::anyhow!("original terminal close unavailable"))?;
         let cache = self.cache.borrow();
         anyhow::ensure!(
             opening.is_closed()
-                && opening.order_side() == OrderSide::Buy
+                && (self.account_type != AccountType::Cash
+                    || opening.order_side() == OrderSide::Buy)
                 && opening.filled_qty().is_positive()
                 && !opening.is_reduce_only()
                 && close.instrument_id() == self.instrument.id()
@@ -3024,7 +3043,7 @@ impl OrderMatchingEngine {
                     || (close.status() == OrderStatus::Denied && close.account_id().is_none()))
                 && close.trader_id() == opening.trader_id()
                 && close.strategy_id() == opening.strategy_id()
-                && close.order_side() == OrderSide::Sell
+                && close.order_side() != opening.order_side()
                 && close.time_in_force() == TimeInForce::Ioc
                 && close.is_reduce_only()
                 && !close.is_quote_quantity()
@@ -3039,7 +3058,7 @@ impl OrderMatchingEngine {
                 && cache.position_id(&opening.client_order_id()).is_some()
                 && cache.position_id(&opening.client_order_id())
                     == cache.position_id(&close.client_order_id()),
-            "unsupported original cash close history"
+            "unsupported original terminal close history"
         );
         drop(cache);
         self.restore_quote_only_limit_orders(std::slice::from_ref(opening), account_id)?;
@@ -3048,7 +3067,12 @@ impl OrderMatchingEngine {
             .flat_map(|o| o.events())
             .filter(|event| matches!(event, OrderEventAny::Filled(_)))
             .count();
-        self.ids_generator.restore_execution_count(executions);
+
+        if self.account_type == AccountType::Margin {
+            self.ids_generator.restore_quote_only_allocations(orders)?;
+        } else {
+            self.ids_generator.restore_execution_count(executions);
+        }
         Ok(())
     }
 

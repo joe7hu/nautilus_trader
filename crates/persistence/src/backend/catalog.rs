@@ -594,16 +594,15 @@ impl ParquetDataCatalog {
         let type_name = to_snake_case(std::any::type_name::<T>());
         Self::check_ascending_timestamps(data, &type_name)?;
 
-        // The write directory and schema metadata come from the first element,
-        // so mixed identities would silently re-label everything after it
-        let first_metadata = data[0].metadata();
+        // Sentinel rows may defer metadata selection to the first meaningful element
+        let selected_metadata = T::chunk_metadata(data);
         if let Some(position) = data
             .iter()
-            .position(|item| item.metadata() != first_metadata)
+            .position(|item| !item.metadata_matches(&selected_metadata))
         {
             anyhow::bail!(
                 "Cannot write {type_name} data with mixed identities: element {position} has \
-                 metadata {:?} but the first element has {first_metadata:?}; write each \
+                 metadata {:?} but the chunk selected {selected_metadata:?}; write each \
                  instrument or bar type separately",
                 data[position].metadata(),
             );

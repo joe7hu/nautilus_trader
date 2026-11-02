@@ -55,6 +55,7 @@ use nautilus_execution::{
     },
     maintenance::{
         MaintenanceCheckpoint, MaintenanceOwner, MaintenanceReceipt, MaintenanceThreshold,
+        OperatorCloseCheckpoint,
     },
     matching_engine::{
         OrderMatchingEngine, ids_generator::IdsCheckpoint, inflight::InflightOrders,
@@ -72,7 +73,8 @@ use nautilus_model::{
         OrderCancelRejected, OrderEventAny, OrderModifyRejected, OrderRejected, PositionEvent,
     },
     identifiers::{
-        AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId, Venue, VenueOrderId,
+        AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, TraderId, Venue,
+        VenueOrderId,
     },
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
@@ -211,6 +213,90 @@ impl SandboxMaintenanceHandle {
         })
     }
 
+    /// Prepares one exact original reduce-only close before native risk submission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unavailable authority, source, lifecycle or changed original scope.
+    pub fn prepare_operator_close(
+        &self,
+        order: &OrderAny,
+        position: PositionId,
+    ) -> anyhow::Result<()> {
+        let mut inner = self
+            .inner
+            .try_borrow_mut()
+            .map_err(|_| anyhow::anyhow!("native maintenance owner borrowed"))?;
+        anyhow::ensure!(
+            inner.maintenance_active
+                && !inner.maintenance_in_flight
+                && inner.config.latency_model.is_none()
+                && inner.config.fill_model.is_none()
+                && inner.config.fee_model.is_none()
+                && inner.execution_authorized(order.instrument_id(), None),
+            "native operator close authority unavailable"
+        );
+        let now = inner.clock.borrow().timestamp_ns();
+        inner
+            .maintenance
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("native maintenance disabled"))?
+            .prepare_operator_close(order, position, now)
+    }
+
+    /// Completes an already submitted original only from terminal native application.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for pending FIFO work or inconsistent original financial scope.
+    pub fn complete_operator_close(&self) -> anyhow::Result<bool> {
+        let mut inner = self
+            .inner
+            .try_borrow_mut()
+            .map_err(|_| anyhow::anyhow!("native maintenance owner borrowed"))?;
+        anyhow::ensure!(
+            !inner.maintenance_in_flight,
+            "native operator FIFO application pending"
+        );
+        inner
+            .maintenance
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("native maintenance disabled"))?
+            .complete_operator_close()
+    }
+
+    /// Releases only the exact captured original operator close to fresh-source continuation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before terminal application or for a different original identity.
+    pub fn acknowledge_operator_close(&self, original: ClientOrderId) -> anyhow::Result<()> {
+        let mut inner = self
+            .inner
+            .try_borrow_mut()
+            .map_err(|_| anyhow::anyhow!("native maintenance owner borrowed"))?;
+        anyhow::ensure!(
+            !inner.maintenance_in_flight,
+            "native operator FIFO application pending"
+        );
+
+        if inner
+            .maintenance
+            .as_ref()
+            .is_some_and(|owner| owner.operator_acknowledged(original))
+        {
+            return Ok(());
+        }
+        inner
+            .maintenance
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("native maintenance disabled"))?
+            .acknowledge_operator_close(original)?;
+        let now = inner.clock.borrow().timestamp_ns();
+        inner.minimum_quote_init = Some(now);
+        Ok(())
+    }
+
     /// Reads the same native exit-quote threshold without changing money, orders or counters.
     ///
     /// # Errors
@@ -269,6 +355,11 @@ impl SandboxMaintenanceCheckpoint {
     /// Returns the complete original native maintenance receipt prefix.
     pub fn receipts(&self) -> &[MaintenanceReceipt] {
         self.owner.receipts()
+    }
+
+    /// Returns the separately approved original operator close without relabeling liquidation.
+    pub fn operator_close(&self) -> Option<&OperatorCloseCheckpoint> {
+        self.owner.operator_close()
     }
 }
 
@@ -448,12 +539,10 @@ impl SandboxExecutionClient {
                 .collect::<Vec<_>>();
             anyhow::ensure!(
                 orders.len()
-                    <= if self.inner.borrow().maintenance.is_some() {
-                        3
-                    } else if self.config.account_type == AccountType::Cash {
-                        2
+                    <= if let Some(owner) = self.inner.borrow().maintenance.as_ref() {
+                        3 + usize::from(owner.checkpoint().operator_close().is_some())
                     } else {
-                        1
+                        2
                     },
                 "restoration exceeds the original bounded order history"
             );
@@ -503,8 +592,8 @@ impl SandboxExecutionClient {
             let mut inner = self.inner.borrow_mut();
             inner.ensure_matching_engine(&instrument);
             let engine = inner.matching_engines.get_mut(&instrument.id()).unwrap();
-            if orders.len() == 2 && self.config.account_type == AccountType::Cash {
-                engine.restore_quote_only_cash_close(&orders, account_id)?;
+            if orders.len() == 2 {
+                engine.restore_quote_only_terminal_close(&orders, account_id)?;
             } else {
                 engine.restore_quote_only_limit_orders(&orders, account_id)?;
             }
@@ -1047,19 +1136,26 @@ impl SandboxExecutionClient {
             "unsupported native maintenance destination"
         );
 
+        let operator = original
+            .owner
+            .operator_close()
+            .map(OperatorCloseCheckpoint::client_order_id);
+        inner
+            .maintenance
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("native maintenance owner absent"))?
+            .restore(original.owner)?;
         for (instrument_id, ids) in &original.engines {
             let (instrument, orders) = {
                 let cache = self.cache.borrow();
                 let instrument = cache.try_instrument(instrument_id)?.clone();
                 let orders = cache
-                    .orders(
-                        None,
-                        Some(instrument_id),
-                        None,
-                        Some(&inner.account_id),
-                        None,
-                    )
+                    .orders(None, Some(instrument_id), None, None, None)
                     .into_iter()
+                    .filter(|order| {
+                        order.account_id() == Some(inner.account_id)
+                            || Some(order.client_order_id()) == operator
+                    })
                     .map(|order| (*order).clone())
                     .collect::<Vec<_>>();
                 (instrument, orders)
@@ -1070,13 +1166,8 @@ impl SandboxExecutionClient {
                 .matching_engines
                 .get_mut(instrument_id)
                 .ok_or_else(|| anyhow::anyhow!("native matcher absent"))?
-                .restore_quote_only_history(&orders, account_id, ids)?;
+                .restore_quote_only_history(&orders, account_id, ids, operator)?;
         }
-        inner
-            .maintenance
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("native maintenance owner absent"))?
-            .restore(original.owner)?;
         inner.maintenance_restore = MaintenanceRestore::Restored;
         Ok(())
     }
@@ -1558,7 +1649,9 @@ impl ExecutionClient for SandboxExecutionClient {
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.inner.borrow().execution_open(cmd.instrument_id, None),
+            self.inner
+                .borrow()
+                .execution_order_open(cmd.instrument_id, cmd.client_order_id),
             "sandbox execution window expired"
         );
         let order = self.get_order(&cmd.client_order_id)?;
@@ -1569,7 +1662,11 @@ impl ExecutionClient for SandboxExecutionClient {
         }
 
         if let Some(owner) = self.inner.borrow_mut().maintenance.as_mut() {
-            owner.claim_opening(&order)?;
+            if owner.operator_pending() == Some(order.client_order_id()) {
+                owner.claim_operator_submission(&order, cmd.position_id)?;
+            } else {
+                owner.claim_opening(&order)?;
+            }
         }
         let ts_init = self.clock.borrow().timestamp_ns();
         let event = self.factory.generate_order_submitted(&order, ts_init);
@@ -2220,8 +2317,19 @@ impl SandboxInner {
             .ok_or_else(|| anyhow::anyhow!("native maintenance owner missing"))?;
         let result = (|| {
             if stage == 2 {
-                owner.complete()?;
+                if owner.operator_pending().is_some() {
+                    anyhow::ensure!(
+                        owner.complete_operator_close()?,
+                        "native operator close still unresolved"
+                    );
+                } else {
+                    owner.complete()?;
+                }
                 return Ok(None);
+            }
+
+            if owner.operator_pending().is_some() {
+                return Ok(Some(2));
             }
 
             if stage == 0 {
@@ -2286,6 +2394,27 @@ impl SandboxInner {
             }
             Err(e) => Err(e),
         }
+    }
+
+    fn execution_order_open(&self, instrument: InstrumentId, original: ClientOrderId) -> bool {
+        if self
+            .maintenance
+            .as_ref()
+            .is_some_and(|owner| owner.operator_pending() == Some(original))
+        {
+            return self.maintenance_active
+                && !self.maintenance_in_flight
+                && !self.maintenance_source_fault
+                && self.maintenance.as_ref().is_some_and(|owner| {
+                    owner.operator_execution_ready(
+                        original,
+                        instrument,
+                        self.clock.borrow().timestamp_ns(),
+                    )
+                })
+                && self.execution_authorized(instrument, None);
+        }
+        self.execution_open(instrument, None)
     }
 
     fn execution_open(&self, instrument: InstrumentId, event_ns: Option<UnixNanos>) -> bool {
@@ -2857,7 +2986,7 @@ impl SandboxInner {
 
     fn apply_submit_order(&mut self, cmd: &SubmitOrder) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.execution_open(cmd.instrument_id, None),
+            self.execution_order_open(cmd.instrument_id, cmd.client_order_id),
             "sandbox execution window expired"
         );
         let mut order = self.cache.borrow().try_order_owned(&cmd.client_order_id)?;

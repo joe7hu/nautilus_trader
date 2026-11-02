@@ -23,7 +23,8 @@ use nautilus_model::{
     accounts::{Account, AccountAny},
     data::QuoteTick,
     enums::{OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce},
-    identifiers::{AccountId, ClientOrderId, InstrumentId},
+    events::OrderEventAny,
+    identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId},
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
     position::Position,
@@ -81,6 +82,45 @@ pub struct MaintenanceThreshold {
     pub maximum: Price,
 }
 
+/// One original explicit close and its native application, distinct from liquidation attempts.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OperatorCloseCheckpoint {
+    intent: OrderAny,
+    before_account: AccountAny,
+    before_position: Position,
+    submitted: bool,
+    receipt: Option<OperatorCloseReceipt>,
+    acknowledged: bool,
+}
+
+/// The original terminal operator order and its actual native financial cut.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OperatorCloseReceipt {
+    /// Original terminal native order, including denied or unfilled outcomes.
+    pub order: OrderAny,
+    /// Actual original native account after the order settled.
+    pub account: AccountAny,
+    /// Actual original native position, including any residual quantity.
+    pub position: Position,
+}
+
+impl OperatorCloseCheckpoint {
+    /// Returns the one original operator command identity.
+    pub fn client_order_id(&self) -> ClientOrderId {
+        self.intent.client_order_id()
+    }
+
+    /// Returns only an actual complete native application.
+    pub fn receipt(&self) -> Option<&OperatorCloseReceipt> {
+        self.receipt.as_ref()
+    }
+
+    /// Returns whether the exact original outcome has a durable acknowledgement.
+    pub fn acknowledged(&self) -> bool {
+        self.acknowledged
+    }
+}
+
 /// Retained bounded original actions; incomplete application never permits another attempt.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MaintenanceCheckpoint {
@@ -95,6 +135,8 @@ pub struct MaintenanceCheckpoint {
     ratio: Option<Decimal>,
     max_attempts: Option<usize>,
     opening: Option<(ClientOrderId, InstrumentId, OrderSide, Quantity)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operator_close: Option<Box<OperatorCloseCheckpoint>>,
 }
 
 /// Owns native maintenance decisions, once-only dispatch and application confirmation.
@@ -121,6 +163,11 @@ impl MaintenanceCheckpoint {
     /// Returns the bounded complete original maintenance receipts.
     pub fn receipts(&self) -> &[MaintenanceReceipt] {
         &self.receipts
+    }
+
+    /// Returns the original separately approved operator-close lifecycle.
+    pub fn operator_close(&self) -> Option<&OperatorCloseCheckpoint> {
+        self.operator_close.as_deref()
     }
 }
 
@@ -173,6 +220,11 @@ impl MaintenanceOwner {
     pub fn can_capture(&self) -> bool {
         self.state.pending.is_none()
             && self.state.uncertainty.is_none()
+            && self
+                .state
+                .operator_close
+                .as_ref()
+                .is_none_or(|close| close.receipt.is_some())
             && self.positions_applied()
             && self.orders_applied()
     }
@@ -219,11 +271,22 @@ impl MaintenanceOwner {
         self.can_capture()
             && self.state.deferral.is_none()
             && self.state.acknowledged == self.state.receipts.len()
+            && self
+                .state
+                .operator_close
+                .as_ref()
+                .is_none_or(|close| close.acknowledged)
     }
 
     /// Returns whether a fresh source may resolve a no-effect deferral.
     pub fn can_observe(&self) -> bool {
-        self.can_capture() && self.state.acknowledged == self.state.receipts.len()
+        self.can_capture()
+            && self.state.acknowledged == self.state.receipts.len()
+            && self
+                .state
+                .operator_close
+                .as_ref()
+                .is_none_or(|close| close.acknowledged)
     }
 
     /// Closes exposure ingress until another valid original source cut is observed.
@@ -286,6 +349,358 @@ impl MaintenanceOwner {
         Ok(())
     }
 
+    /// Retains one original operator close before it is handed to native risk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for repeated intent, unresolved maintenance or a changed original scope.
+    pub fn prepare_operator_close(
+        &mut self,
+        order: &OrderAny,
+        position_id: PositionId,
+        now: UnixNanos,
+    ) -> anyhow::Result<()> {
+        let cache = self.cache.borrow();
+        let position = cache
+            .position(&position_id)
+            .map(|position| position.cloned())
+            .ok_or_else(|| anyhow::anyhow!("original operator position unavailable"))?;
+        let account = cache
+            .account_owned(&self.account_id)
+            .ok_or_else(|| anyhow::anyhow!("original operator account unavailable"))?;
+        let instrument = cache.try_instrument(&position.instrument_id)?;
+        let originals = cache.orders(None, None, None, Some(&self.account_id), None);
+        anyhow::ensure!(
+            self.state.operator_close.is_none()
+                && self.opening_ready(position.instrument_id, now)
+                && self
+                    .state
+                    .opening
+                    .is_some_and(|(id, instrument, side, _)| id == position.opening_order_id
+                        && instrument == position.instrument_id
+                        && side == position.entry
+                        && cache.position_id(&id).copied() == Some(position.id)
+                        && cache.order(&id).is_some_and(|opening| opening.is_closed()
+                            && opening.filled_qty() >= position.quantity
+                            && opening.strategy_id() == position.strategy_id
+                            && opening.trader_id() == position.trader_id))
+                && position.account_id == self.account_id
+                && position.is_open()
+                && cache
+                    .positions(None, None, None, Some(&self.account_id), None)
+                    .len()
+                    == 1
+                && cache.order(&order.client_order_id()).is_none()
+                && order.status() == OrderStatus::Initialized
+                && order.account_id().is_none()
+                && order.instrument_id() == position.instrument_id
+                && order.strategy_id() == position.strategy_id
+                && order.trader_id() == position.trader_id
+                && Some(order.order_side()) == position.closing_order_side()
+                && order.quantity() == position.quantity
+                && order.quantity().precision == instrument.size_precision()
+                && (order.quantity().as_decimal() % instrument.size_increment().as_decimal())
+                    .is_zero()
+                && order.order_type() == OrderType::Market
+                && order.time_in_force() == TimeInForce::Ioc
+                && order.is_reduce_only()
+                && !order.is_quote_quantity()
+                && !order.is_emulated()
+                && order.contingency_type().is_none()
+                && originals.len() <= 3
+                && originals.iter().all(|original| original.is_closed()),
+            "native operator close scope or lifecycle unavailable"
+        );
+        let quantum = Decimal::new(1, u32::from(position.size_precision));
+        let lots = position
+            .quantity
+            .as_decimal()
+            .checked_div(quantum)
+            .ok_or_else(|| anyhow::anyhow!("native operator close headroom overflow"))?;
+        anyhow::ensure!(
+            lots.fract().is_zero() && lots <= Decimal::from(256),
+            "native operator close fill headroom exceeds bound"
+        );
+        let fills = usize::try_from(lots.normalize().mantissa())?;
+        let order_events = originals
+            .iter()
+            .map(|original| original.events().len())
+            .sum::<usize>();
+        anyhow::ensure!(
+            order_events + 4 + fills <= 256 && account.events().len() + 4 + 2 * fills <= 256,
+            "native operator close event headroom exhausted"
+        );
+        self.state.operator_close = Some(Box::new(OperatorCloseCheckpoint {
+            intent: order.clone(),
+            before_account: account,
+            before_position: position,
+            submitted: false,
+            receipt: None,
+            acknowledged: false,
+        }));
+        Ok(())
+    }
+
+    /// Identifies only the prepared original which may pass the closed ingress barrier.
+    fn operator_submission_ready(&self, order: &OrderAny, position: Option<PositionId>) -> bool {
+        self.state.operator_close.as_ref().is_some_and(|close| {
+            !close.submitted
+                && position == Some(close.before_position.id)
+                && self.cache.try_borrow().is_ok_and(|cache| {
+                    cache.position_id(&order.client_order_id()).copied() == position
+                })
+                && close.receipt.is_none()
+                && serde_json::to_value(order).is_ok_and(|value| {
+                    serde_json::to_value(&close.intent).is_ok_and(|intent| value == intent)
+                })
+        }) && self.state.uncertainty.is_none()
+            && self.state.pending.is_none()
+            && self.state.acknowledged == self.state.receipts.len()
+    }
+
+    /// Returns only the original prepared close which can still reach its terminal outcome.
+    pub fn operator_pending(&self) -> Option<ClientOrderId> {
+        self.state
+            .operator_close
+            .as_ref()
+            .filter(|close| close.receipt.is_none())
+            .map(|close| close.intent.client_order_id())
+    }
+
+    /// Rechecks the original execution source while allowing only its already prepared identity.
+    pub fn operator_execution_ready(
+        &self,
+        original: ClientOrderId,
+        instrument: InstrumentId,
+        now: UnixNanos,
+    ) -> bool {
+        self.operator_pending() == Some(original)
+            && self
+                .state
+                .operator_close
+                .as_ref()
+                .is_some_and(|close| close.intent.instrument_id() == instrument)
+            && self.state.uncertainty.is_none()
+            && self.state.pending.is_none()
+            && self.state.deferral.is_none()
+            && self.state.acknowledged == self.state.receipts.len()
+            && self.quote.is_some_and(|quote| {
+                quote.ts_init <= now
+                    && quote.ts_event <= now
+                    && now.as_u64().saturating_sub(quote.ts_init.as_u64()) <= 5_000_000_000
+                    && now.as_u64().saturating_sub(quote.ts_event.as_u64()) <= 5_000_000_000
+            })
+    }
+
+    /// Claims the exact prepared original once, before any submitted event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a different or already claimed native order.
+    pub fn claim_operator_submission(
+        &mut self,
+        order: &OrderAny,
+        position: Option<PositionId>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.operator_submission_ready(order, position),
+            "native operator close already claimed or changed"
+        );
+        self.state
+            .operator_close
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("native operator close missing"))?
+            .submitted = true;
+        Ok(())
+    }
+
+    /// Completes only actual terminal original order and account/position application.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for changed scope or an inconsistent native application.
+    pub fn complete_operator_close(&mut self) -> anyhow::Result<bool> {
+        let Some(close) = self.state.operator_close.as_ref() else {
+            return Ok(false);
+        };
+
+        if close.receipt.is_some() {
+            return Ok(true);
+        }
+        let cache = self.cache.borrow();
+        let Some(order) = cache
+            .order(&close.intent.client_order_id())
+            .map(|order| order.clone())
+        else {
+            return Ok(false);
+        };
+
+        if !order.is_closed() {
+            return Ok(false);
+        }
+        let account = cache
+            .account_owned(&self.account_id)
+            .ok_or_else(|| anyhow::anyhow!("native operator result account missing"))?;
+        let position = cache
+            .position(&close.before_position.id)
+            .map(|position| position.cloned())
+            .ok_or_else(|| anyhow::anyhow!("native operator result position missing"))?;
+        let receipt = OperatorCloseReceipt {
+            order,
+            account,
+            position,
+        };
+        Self::validate_operator_close(close, &receipt, &cache, true)?;
+        drop(cache);
+        self.state
+            .operator_close
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("native operator intent missing"))?
+            .receipt = Some(receipt);
+        Ok(true)
+    }
+
+    fn validate_operator_close(
+        close: &OperatorCloseCheckpoint,
+        receipt: &OperatorCloseReceipt,
+        cache: &Cache,
+        require_application: bool,
+    ) -> anyhow::Result<()> {
+        let order = &receipt.order;
+        let before = &close.before_position;
+        let position = &receipt.position;
+        let fills = order
+            .events()
+            .iter()
+            .filter_map(|event| {
+                if let OrderEventAny::Filled(fill) = event {
+                    Some(fill)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            order.is_closed()
+                && close.intent.status() == OrderStatus::Initialized
+                && close.intent.account_id().is_none()
+                && close.intent.venue_order_id().is_none()
+                && close.intent.events().len() == 1
+                && close.intent.filled_qty().is_zero()
+                && before.is_open()
+                && close.before_account.id() == before.account_id
+                && !close.before_account.events().is_empty()
+                && (fills.is_empty() || close.submitted)
+                && order.client_order_id() == close.intent.client_order_id()
+                && order.events().starts_with(&close.intent.events())
+                && order.instrument_id() == before.instrument_id
+                && order.strategy_id() == before.strategy_id
+                && order.trader_id() == before.trader_id
+                && Some(order.order_side()) == before.closing_order_side()
+                && order.quantity() == before.quantity
+                && order.filled_qty() <= order.quantity()
+                && order.order_type() == OrderType::Market
+                && order.time_in_force() == TimeInForce::Ioc
+                && order.is_reduce_only()
+                && !order.is_quote_quantity()
+                && !order.is_emulated()
+                && order.contingency_type().is_none()
+                && (order.account_id() == Some(before.account_id)
+                    || (order.status() == OrderStatus::Denied && order.account_id().is_none()))
+                && (order.venue_order_id().is_some()
+                    || matches!(order.status(), OrderStatus::Denied | OrderStatus::Rejected))
+                && cache.position_id(&order.client_order_id()).copied() == Some(before.id)
+                && position.id == before.id
+                && position.account_id == before.account_id
+                && position.instrument_id == before.instrument_id
+                && position.strategy_id == before.strategy_id
+                && position.entry == before.entry
+                && position.quantity <= before.quantity
+                && position.events.starts_with(&before.events)
+                && position.events.len() == before.events.len() + fills.len()
+                && position.events[before.events.len()..]
+                    .iter()
+                    .all(|event| fills.contains(&event))
+                && serde_json::to_value(&position.adjustments)?
+                    == serde_json::to_value(&before.adjustments)?
+                && receipt.account.id() == before.account_id
+                && receipt
+                    .account
+                    .events()
+                    .starts_with(&close.before_account.events())
+                && serde_json::to_value(cache.try_order_owned(&order.client_order_id())?)?
+                    == serde_json::to_value(order)?
+                && cache
+                    .position(&before.id)
+                    .is_some_and(|current| current.events.starts_with(&position.events))
+                && cache
+                    .account_owned(&before.account_id)
+                    .is_some_and(|current| current.events().starts_with(&receipt.account.events())),
+            "native operator original result scope mismatch"
+        );
+
+        if require_application {
+            anyhow::ensure!(
+                serde_json::to_value(cache.position(&before.id).map(|position| position.cloned()))?
+                    == serde_json::to_value(Some(position))?
+                    && serde_json::to_value(cache.account_owned(&before.account_id))?
+                        == serde_json::to_value(Some(&receipt.account))?,
+                "native operator completion cut changed"
+            );
+        }
+
+        if fills.is_empty() {
+            anyhow::ensure!(
+                serde_json::to_value(position)? == serde_json::to_value(before)?,
+                "unfilled native operator close changed position"
+            );
+            anyhow::ensure!(
+                serde_json::to_value(&receipt.account)?
+                    == serde_json::to_value(&close.before_account)?
+                    || !require_application
+                    || cache.order_account_applied(order, Some(&close.before_account)),
+                "unfilled native operator account application missing"
+            );
+        } else if require_application {
+            anyhow::ensure!(
+                cache.position_account_applied(position, Some(&close.before_account)),
+                "native operator position account application missing"
+            );
+        }
+        Ok(())
+    }
+
+    /// Returns whether this same original operator receipt already has its acknowledgement.
+    pub fn operator_acknowledged(&self, original: ClientOrderId) -> bool {
+        self.state
+            .operator_close
+            .as_ref()
+            .is_some_and(|close| close.client_order_id() == original && close.acknowledged)
+    }
+
+    /// Acknowledges the exact operator original after its durable financial capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before a terminal application or for a different original identity.
+    pub fn acknowledge_operator_close(&mut self, original: ClientOrderId) -> anyhow::Result<()> {
+        let close = self
+            .state
+            .operator_close
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("native operator close absent"))?;
+        anyhow::ensure!(
+            close.intent.client_order_id() == original
+                && close.receipt.is_some()
+                && self.state.pending.is_none()
+                && self.state.uncertainty.is_none()
+                && self.state.acknowledged == self.state.receipts.len(),
+            "native operator acknowledgement mismatch"
+        );
+        close.acknowledged = true;
+        Ok(())
+    }
+
     /// Checks that a modification cannot increase the one originally admitted exposure.
     pub fn modification_allowed(&self, id: ClientOrderId, quantity: Option<Quantity>) -> bool {
         self.ready()
@@ -323,6 +738,7 @@ impl MaintenanceOwner {
     pub fn restore(&mut self, original: MaintenanceCheckpoint) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.state.receipts.is_empty()
+                && self.state.operator_close.is_none()
                 && self.state.pending.is_none()
                 && original.pending.is_none()
                 && original.uncertainty.is_none()
@@ -391,6 +807,18 @@ impl MaintenanceOwner {
                     "native maintenance original close mismatch"
                 );
             }
+        }
+
+        if let Some(close) = &original.operator_close {
+            let receipt = close
+                .receipt
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("native operator close unresolved"))?;
+            Self::validate_operator_close(close, receipt, &self.cache.borrow(), false)?;
+            anyhow::ensure!(
+                actions.insert(close.intent.client_order_id()),
+                "native operator close duplicates liquidation"
+            );
         }
         anyhow::ensure!(
             closes.iter().all(|id| actions.contains(id)),
@@ -622,7 +1050,8 @@ impl MaintenanceOwner {
                     .ok_or_else(|| anyhow::anyhow!("native account headroom overflow"))?;
             }
             anyhow::ensure!(
-                decision.original_orders.len() < 3
+                decision.original_orders.len()
+                    < 3 + usize::from(self.state.operator_close.is_some())
                     && order_events
                         .checked_add(reserved_orders)
                         .is_some_and(|events| events <= 256)
