@@ -252,6 +252,11 @@ fn parse_book_level(
     let size = Quantity::from_decimal_dp(level.qty, size_precision)
         .with_context(|| format!("Failed to construct Quantity with precision {size_precision}"))?;
 
+    anyhow::ensure!(
+        price.as_decimal() == level.price && size.as_decimal() == level.qty,
+        "Kraken L2 level exceeds instrument precision",
+    );
+
     let action = if is_snapshot {
         if size.is_zero() {
             return Ok(None);
