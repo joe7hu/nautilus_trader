@@ -687,6 +687,22 @@ impl KrakenSpotDataClient {
             KrakenSpotWsMessage::L3Update(_) => {}
             KrakenSpotWsMessage::Reconnected => {
                 log::info!("Spot WebSocket reconnected");
+                let instrument_ids: Vec<_> = l2_books.books.keys().copied().collect();
+                for instrument_id in instrument_ids {
+                    let sequence = context.book_sequence.load(Ordering::Relaxed);
+                    let (deltas, next_sequence) =
+                        l2_books.invalidate(instrument_id, sequence, ts_init);
+                    context
+                        .book_sequence
+                        .store(next_sequence, Ordering::Relaxed);
+
+                    if let Err(e) = context
+                        .sender
+                        .send(DataEvent::Data(Data::BookDeltas(Box::new(deltas))))
+                    {
+                        log::error!("Failed to send Kraken L2 clear on reconnect: {e}");
+                    }
+                }
             }
         }
     }
@@ -1265,9 +1281,11 @@ struct SpotMessageContext<'a> {
 mod tests {
     use nautilus_common::{live::runner::set_data_event_sender, messages::DataEvent};
     use nautilus_model::{
-        enums::{BookAction, RecordFlag},
+        data::OrderBookDeltas,
+        enums::{BookAction, BookType, RecordFlag},
         identifiers::Symbol,
         instruments::{InstrumentAny, currency_pair::CurrencyPair},
+        orderbook::OrderBook,
         types::{Currency, Price, Quantity},
     };
     use rstest::rstest;
@@ -1279,8 +1297,9 @@ mod tests {
         common::consts::KRAKEN_CLIENT_ID,
         config::KrakenDataClientConfig,
         websocket::spot_v2::{
+            enums::KrakenWsMessageType,
             level_3::messages::KrakenL3Snapshot,
-            messages::{KrakenWsBookData, KrakenWsBookLevel},
+            messages::{KrakenWsBookData, KrakenWsBookLevel, KrakenWsRawMessage},
         },
     };
 
@@ -1445,7 +1464,7 @@ mod tests {
                     .map(|i| book_level(Decimal::from(101 + i), Decimal::ONE))
                     .collect(),
             ),
-            checksum: Some(0),
+            checksum: Some(3_289_024_467),
             timestamp: "2024-01-01T00:00:00Z".parse().unwrap(),
         };
         KrakenSpotDataClient::handle_ws_message(
@@ -1470,7 +1489,7 @@ mod tests {
             symbol: Ustr::from("BTC/USD"),
             bids: Some(vec![book_level(dec!(100.5), Decimal::ONE)]),
             asks: Some(vec![]),
-            checksum: Some(0),
+            checksum: Some(1_047_620_678),
             timestamp: "2024-01-01T00:00:01Z".parse().unwrap(),
         };
         KrakenSpotDataClient::handle_ws_message(
@@ -1497,7 +1516,7 @@ mod tests {
             symbol: Ustr::from("BTC/USD"),
             bids: Some(vec![]),
             asks: Some(vec![book_level(dec!(100.6), Decimal::ONE)]),
-            checksum: Some(0),
+            checksum: Some(1_062_281_192),
             timestamp: "2024-01-01T00:00:02Z".parse().unwrap(),
         };
         KrakenSpotDataClient::handle_ws_message(
@@ -1532,6 +1551,187 @@ mod tests {
         assert_eq!(book.best_bid_price(), Some(Price::from("100.5")));
         assert_eq!(book.best_ask_price(), Some(Price::from("100.6")));
         assert!(receiver.try_recv().is_err());
+    }
+
+    fn decode_l2(text: &str) -> KrakenSpotWsMessage {
+        let message: KrakenWsRawMessage = serde_json::from_str(text).unwrap();
+        KrakenSpotWsMessage::Book {
+            is_snapshot: message.event_type == KrakenWsMessageType::Snapshot,
+            data: message
+                .data
+                .iter()
+                .map(|data| serde_json::from_str(data.get()).unwrap())
+                .collect(),
+        }
+    }
+
+    fn replay_l2(messages: &[KrakenSpotWsMessage]) -> Vec<OrderBookDeltas> {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let instruments = Arc::new(AtomicMap::new());
+        let instrument = make_instrument();
+        let instrument_id = instrument.id();
+        instruments.insert(instrument_id, instrument);
+        let book_sequence = Arc::new(AtomicU64::new(0));
+        let l2_depths = L2Depths::default();
+        l2_depths.insert("BTC/USD", 10);
+        let ohlc_buffer = Arc::new(Mutex::new(AHashMap::new()));
+        let context = SpotMessageContext {
+            sender: &sender,
+            instruments: &instruments,
+            book_sequence: &book_sequence,
+            l2_depths: &l2_depths,
+            ohlc_buffer: &ohlc_buffer,
+            clock: get_atomic_clock_realtime(),
+        };
+        let mut state = L2BookState::default();
+        let mut batches = Vec::new();
+
+        for message in messages {
+            KrakenSpotDataClient::handle_ws_message(message.clone(), &context, &mut state);
+
+            while let Ok(event) = receiver.try_recv() {
+                let DataEvent::Data(Data::BookDeltas(deltas)) = event else {
+                    panic!("expected book deltas");
+                };
+                batches.push(*deltas);
+            }
+        }
+        batches
+    }
+
+    // Kraken's published snapshot, with a timestamp added for the wire model
+    // https://docs.kraken.com/exchange/guides/websockets/book-checksum-v2
+    const L2_SNAPSHOT: &str = include_str!("../../test_data/ws_book_checksum_snapshot.json");
+
+    // Numeric snapshot and invented updates are controlled, independently checksummed fixtures
+    const L2_NUMERIC_SNAPSHOT: &str =
+        include_str!("../../test_data/ws_book_checksum_snapshot_numeric.json");
+    const L2_UPDATE: &str = include_str!("../../test_data/ws_book_checksum_update.json");
+    const L2_AFTER: &str = include_str!("../../test_data/ws_book_checksum_update_after.json");
+
+    #[rstest]
+    fn test_l2_checksum_original_tokens_and_whole_message_reach_consumer() {
+        let numeric = decode_l2(L2_NUMERIC_SNAPSHOT);
+        let KrakenSpotWsMessage::Book { data, .. } = &numeric else {
+            unreachable!()
+        };
+        assert_eq!(data[0].checksum, Some(3_310_070_434));
+        assert_eq!(
+            data[0].bids.as_ref().unwrap()[0].qty.to_string(),
+            "0.10000000"
+        );
+        assert_eq!(
+            data[0].bids.as_ref().unwrap()[3].price.to_string(),
+            "45281.0"
+        );
+        let batches = replay_l2(&[
+            decode_l2(L2_SNAPSHOT),
+            numeric,
+            decode_l2(L2_UPDATE),
+            decode_l2(L2_AFTER),
+        ]);
+        assert_eq!(batches.len(), 4);
+        let mut consumer = OrderBook::new(make_instrument().id(), BookType::L2_MBP);
+
+        for batch in &batches {
+            assert!(RecordFlag::F_LAST.matches(batch.deltas.last().unwrap().flags));
+            consumer.apply_deltas(batch).unwrap();
+        }
+        assert_eq!(consumer.bids(None).count(), 10);
+        assert_eq!(consumer.asks(None).count(), 10);
+        assert_eq!(consumer.best_bid_price(), Some(Price::from("45283.7")));
+        assert_eq!(consumer.best_ask_price(), Some(Price::from("45285.2")));
+        assert_eq!(consumer.best_ask_size(), Some(Quantity::from("0.00200000")));
+        assert!(
+            batches[2]
+                .deltas
+                .iter()
+                .any(|delta| delta.action == BookAction::Delete
+                    && delta.order.price == Price::from("45299.5"))
+        );
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_l2_checksum_corruption_or_lost_update_clears_consumer_until_snapshot(
+        #[case] lost_update: bool,
+    ) {
+        let invalid = if lost_update {
+            decode_l2(L2_AFTER)
+        } else {
+            decode_l2(include_str!(
+                "../../test_data/ws_book_checksum_corrupt.json"
+            ))
+        };
+        let batches = replay_l2(&[
+            decode_l2(L2_NUMERIC_SNAPSHOT),
+            invalid,
+            decode_l2(L2_AFTER),
+            decode_l2(L2_NUMERIC_SNAPSHOT),
+            decode_l2(L2_UPDATE),
+        ]);
+        assert_eq!(batches.len(), 5);
+        let mut consumer = OrderBook::new(make_instrument().id(), BookType::L2_MBP);
+        consumer.apply_deltas(&batches[0]).unwrap();
+        assert!(consumer.best_bid_price().is_some());
+
+        for batch in &batches[1..3] {
+            assert_eq!(batch.deltas.len(), 1);
+            assert_eq!(batch.deltas[0].action, BookAction::Clear);
+            assert_eq!(batch.deltas[0].flags, RecordFlag::F_LAST as u8);
+            consumer.apply_deltas(batch).unwrap();
+            assert!(consumer.best_bid_price().is_none());
+            assert!(consumer.best_ask_price().is_none());
+        }
+        consumer.apply_deltas(&batches[3]).unwrap();
+        consumer.apply_deltas(&batches[4]).unwrap();
+        assert_eq!(consumer.best_bid_price(), Some(Price::from("45283.6")));
+    }
+
+    #[rstest]
+    fn test_l2_checksum_missing_bad_and_update_before_snapshot_fail_closed() {
+        let missing =
+            L2_NUMERIC_SNAPSHOT.replace("\"checksum\": 3310070434", "\"ignored\": 3310070434");
+        let bad = L2_NUMERIC_SNAPSHOT.replace("3310070434", "\"invalid\"");
+        let initial_bad_crc = L2_NUMERIC_SNAPSHOT.replace("3310070434", "1");
+        let batches = replay_l2(&[
+            decode_l2(&initial_bad_crc),
+            decode_l2(L2_UPDATE),
+            decode_l2(L2_SNAPSHOT),
+            decode_l2(&missing),
+            decode_l2(L2_UPDATE),
+            decode_l2(L2_SNAPSHOT),
+            decode_l2(&bad),
+            decode_l2(L2_UPDATE),
+            decode_l2(L2_SNAPSHOT),
+            decode_l2(
+                r#"{"channel":"book","type":"update","data":[{"symbol":"BTC/USD","bids":[],"asks":[],"checksum":3310070434,"timestamp":"2024-01-01T00:00:01Z"}]}"#,
+            ),
+            KrakenSpotWsMessage::Reconnected,
+            decode_l2(L2_UPDATE),
+        ]);
+        assert_eq!(batches.len(), 11);
+
+        for index in [0, 1, 3, 4, 6, 7, 9, 10] {
+            assert_eq!(batches[index].deltas.len(), 1);
+            assert_eq!(batches[index].deltas[0].action, BookAction::Clear);
+            assert_eq!(batches[index].deltas[0].flags, RecordFlag::F_LAST as u8);
+        }
+
+        for index in [2, 5, 8] {
+            assert_eq!(batches[index].deltas.len(), 21);
+            assert!(
+                batches[index]
+                    .deltas
+                    .iter()
+                    .all(|delta| RecordFlag::F_SNAPSHOT.matches(delta.flags))
+            );
+        }
+
+        for pair in batches.windows(2) {
+            assert!(pair[0].deltas.last().unwrap().sequence < pair[1].deltas[0].sequence);
+        }
     }
 
     #[rstest]
