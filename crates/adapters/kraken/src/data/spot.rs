@@ -1695,7 +1695,9 @@ mod tests {
         let missing =
             L2_NUMERIC_SNAPSHOT.replace("\"checksum\": 3310070434", "\"ignored\": 3310070434");
         let bad = L2_NUMERIC_SNAPSHOT.replace("3310070434", "\"invalid\"");
+        let initial_bad_crc = L2_NUMERIC_SNAPSHOT.replace("3310070434", "1");
         let batches = replay_l2(&[
+            decode_l2(&initial_bad_crc),
             decode_l2(L2_UPDATE),
             decode_l2(L2_SNAPSHOT),
             decode_l2(&missing),
@@ -1710,15 +1712,15 @@ mod tests {
             KrakenSpotWsMessage::Reconnected,
             decode_l2(L2_UPDATE),
         ]);
-        assert_eq!(batches.len(), 10);
+        assert_eq!(batches.len(), 11);
 
-        for index in [0, 2, 3, 5, 6, 8, 9] {
+        for index in [0, 1, 3, 4, 6, 7, 9, 10] {
             assert_eq!(batches[index].deltas.len(), 1);
             assert_eq!(batches[index].deltas[0].action, BookAction::Clear);
             assert_eq!(batches[index].deltas[0].flags, RecordFlag::F_LAST as u8);
         }
 
-        for index in [1, 4, 7] {
+        for index in [2, 5, 8] {
             assert_eq!(batches[index].deltas.len(), 21);
             assert!(
                 batches[index]
