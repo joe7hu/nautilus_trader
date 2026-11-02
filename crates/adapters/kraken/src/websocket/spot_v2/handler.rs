@@ -33,6 +33,7 @@ use nautilus_network::{
 use serde::Deserialize;
 use serde_json::{Value, value::RawValue};
 use tokio_tungstenite::tungstenite::Message;
+use ustr::Ustr;
 
 use super::{
     enums::{KrakenWsChannel, KrakenWsMessageType},
@@ -214,7 +215,7 @@ impl SpotFeedHandler {
         }
     }
 
-    fn parse_message(&self, text: &str) -> Option<KrakenSpotWsMessage> {
+    fn parse_message(&mut self, text: &str) -> Option<KrakenSpotWsMessage> {
         // Fast pre-filter for high-frequency control messages (no JSON parsing)
         if text.len() < 50 && text.starts_with("{\"channel\":\"") {
             if text.contains("heartbeat") {
@@ -323,7 +324,7 @@ impl SpotFeedHandler {
         }
     }
 
-    fn handle_data_message(&self, msg: KrakenWsRawMessage) -> Option<KrakenSpotWsMessage> {
+    fn handle_data_message(&mut self, msg: KrakenWsRawMessage) -> Option<KrakenSpotWsMessage> {
         match msg.channel {
             KrakenWsChannel::Book => self.handle_book_message(msg),
             KrakenWsChannel::Ticker => self.handle_ticker_message(msg),
@@ -340,7 +341,12 @@ impl SpotFeedHandler {
         }
     }
 
-    fn handle_book_message(&self, msg: KrakenWsRawMessage) -> Option<KrakenSpotWsMessage> {
+    fn handle_book_message(&mut self, msg: KrakenWsRawMessage) -> Option<KrakenSpotWsMessage> {
+        #[derive(Deserialize)]
+        struct BookSymbol {
+            symbol: Ustr,
+        }
+
         let is_snapshot = msg.event_type == KrakenWsMessageType::Snapshot;
         let mut book_data = Vec::new();
 
@@ -352,18 +358,35 @@ impl SpotFeedHandler {
                     }
                     book_data.push(bd);
                 }
-                Err(e) => log::error!("Failed to deserialize book data: {e}"),
+                Err(e) => {
+                    log::error!("Failed to deserialize book data: {e}");
+                    let Ok(BookSymbol { symbol }) = serde_json::from_str(data.get()) else {
+                        continue;
+                    };
+
+                    if !self.is_subscribed(&format!("book:{symbol}")) {
+                        continue;
+                    }
+
+                    if !book_data.is_empty() {
+                        self.pending_messages.push_back(KrakenSpotWsMessage::Book {
+                            data: std::mem::take(&mut book_data),
+                            is_snapshot,
+                        });
+                    }
+                    self.pending_messages
+                        .push_back(KrakenSpotWsMessage::BookDecodeError { symbol });
+                }
             }
         }
 
-        if book_data.is_empty() {
-            None
-        } else {
-            Some(KrakenSpotWsMessage::Book {
+        if !book_data.is_empty() {
+            self.pending_messages.push_back(KrakenSpotWsMessage::Book {
                 data: book_data,
                 is_snapshot,
-            })
+            });
         }
+        self.pending_messages.pop_front()
     }
 
     fn handle_ticker_message(&self, msg: KrakenWsRawMessage) -> Option<KrakenSpotWsMessage> {
@@ -511,7 +534,7 @@ mod tests {
 
     #[rstest]
     fn test_ticker_message_filtered_without_quotes_subscription() {
-        let handler = create_test_handler();
+        let mut handler = create_test_handler();
 
         let json = r#"{
             "channel": "ticker",
@@ -542,7 +565,7 @@ mod tests {
 
     #[rstest]
     fn test_ticker_message_passes_with_quotes_subscription() {
-        let handler = create_test_handler();
+        let mut handler = create_test_handler();
         handler.subscriptions.mark_subscribe("quotes:BTC/USD");
         handler.subscriptions.confirm_subscribe("quotes:BTC/USD");
 
@@ -582,7 +605,7 @@ mod tests {
 
     #[rstest]
     fn test_ticker_message_passes_with_ticker_subscription() {
-        let handler = create_test_handler();
+        let mut handler = create_test_handler();
         handler.subscriptions.mark_subscribe("ticker:BTC/USD");
         handler.subscriptions.confirm_subscribe("ticker:BTC/USD");
 
@@ -622,7 +645,7 @@ mod tests {
 
     #[rstest]
     fn test_ticker_message_preserves_decimal_precision() {
-        let handler = create_test_handler();
+        let mut handler = create_test_handler();
         handler.subscriptions.mark_subscribe("ticker:BTC/USD");
         handler.subscriptions.confirm_subscribe("ticker:BTC/USD");
         let json = include_str!("../../../test_data/ws_ticker_precision.json");
@@ -655,7 +678,7 @@ mod tests {
 
     #[rstest]
     fn test_malformed_book_checksum_reaches_validation_gate() {
-        let handler = create_test_handler();
+        let mut handler = create_test_handler();
         handler.subscriptions.mark_subscribe("book:BTC/USD");
         handler.subscriptions.confirm_subscribe("book:BTC/USD");
         let text = include_str!("../../../test_data/ws_book_checksum_snapshot_numeric.json")
@@ -675,8 +698,45 @@ mod tests {
     }
 
     #[rstest]
+    fn test_book_decode_rejection_preserves_subscription_filter_and_order() {
+        let rejected = include_str!("../../../test_data/ws_book_decode_rejected_update.json");
+        let mut handler = create_test_handler();
+        assert!(handler.parse_message(rejected).is_none());
+        assert!(handler.pending_messages.is_empty());
+        handler.subscriptions.mark_subscribe("book:BTC/USD");
+        handler.subscriptions.confirm_subscribe("book:BTC/USD");
+        let update: KrakenWsRawMessage = serde_json::from_str(include_str!(
+            "../../../test_data/ws_book_checksum_update.json"
+        ))
+        .unwrap();
+        let rejected: KrakenWsRawMessage = serde_json::from_str(rejected).unwrap();
+        let combined = format!(
+            r#"{{"channel":"book","type":"update","data":[{},{},{}]}}"#,
+            update.data[0].get(),
+            rejected.data[0].get(),
+            update.data[0].get(),
+        );
+        assert!(matches!(
+            handler.parse_message(&combined),
+            Some(KrakenSpotWsMessage::Book { .. })
+        ));
+        assert!(
+            matches!(handler.pending_messages.pop_front(), Some(KrakenSpotWsMessage::BookDecodeError { symbol }) if symbol == "BTC/USD")
+        );
+        assert!(matches!(
+            handler.pending_messages.pop_front(),
+            Some(KrakenSpotWsMessage::Book { .. })
+        ));
+        assert!(handler.pending_messages.is_empty());
+        handler.subscriptions.mark_unsubscribe("book:BTC/USD");
+        handler.subscriptions.confirm_unsubscribe("book:BTC/USD");
+        let rejected = include_str!("../../../test_data/ws_book_decode_rejected_update.json");
+        assert!(handler.parse_message(rejected).is_none());
+    }
+
+    #[rstest]
     fn test_book_message_filtered_without_book_subscription() {
-        let handler = create_test_handler();
+        let mut handler = create_test_handler();
 
         let json = r#"{
             "channel": "book",
@@ -699,7 +759,7 @@ mod tests {
 
     #[rstest]
     fn test_book_message_passes_with_book_subscription() {
-        let handler = create_test_handler();
+        let mut handler = create_test_handler();
         handler.subscriptions.mark_subscribe("book:BTC/USD");
         handler.subscriptions.confirm_subscribe("book:BTC/USD");
 
@@ -788,7 +848,7 @@ mod tests {
 
     #[rstest]
     fn test_quotes_and_book_subscriptions_independent() {
-        let handler = create_test_handler();
+        let mut handler = create_test_handler();
         handler.subscriptions.mark_subscribe("quotes:BTC/USD");
         handler.subscriptions.confirm_subscribe("quotes:BTC/USD");
 
@@ -841,7 +901,7 @@ mod tests {
     fn test_parse_message_routes_add_order_response_to_order_response_variant() {
         use super::super::enums::KrakenWsMethod;
 
-        let handler = create_test_handler();
+        let mut handler = create_test_handler();
         let json = r#"{"method":"add_order","req_id":42,"success":true,"time_in":"2026-05-05T10:00:00.123Z","time_out":"2026-05-05T10:00:00.125Z","result":{"order_id":"OABCDE-12345-FGHIJ","cl_ord_id":"O-20260505-000001","order_userref":0}}"#;
 
         let result = handler.parse_message(json);
@@ -857,7 +917,7 @@ mod tests {
 
     #[rstest]
     fn test_parse_level3_snapshot_with_subscription_passes() {
-        let handler = create_test_handler();
+        let mut handler = create_test_handler();
         handler.subscriptions.mark_subscribe("level3:BTC/USD");
         handler.subscriptions.confirm_subscribe("level3:BTC/USD");
 
@@ -879,7 +939,7 @@ mod tests {
 
     #[rstest]
     fn test_parse_level3_update_without_subscription_filtered() {
-        let handler = create_test_handler();
+        let mut handler = create_test_handler();
         let json = r#"{
             "channel": "level3",
             "type": "update",
@@ -898,7 +958,7 @@ mod tests {
 
     #[rstest]
     fn test_parse_level3_snapshot_compact_json() {
-        let handler = create_test_handler();
+        let mut handler = create_test_handler();
         handler.subscriptions.mark_subscribe("level3:BTC/USD");
         handler.subscriptions.confirm_subscribe("level3:BTC/USD");
         let json = r#"{"channel":"level3","type":"snapshot","data":[{"symbol":"BTC/USD","bids":[],"asks":[],"checksum":0,"timestamp":"2024-01-01T00:00:00Z"}]}"#;
@@ -910,7 +970,7 @@ mod tests {
 
     #[rstest]
     fn test_parse_level3_snapshot_preserves_raw_decimal() {
-        let handler = create_test_handler();
+        let mut handler = create_test_handler();
         handler.subscriptions.mark_subscribe("level3:BTC/USD");
         handler.subscriptions.confirm_subscribe("level3:BTC/USD");
 
