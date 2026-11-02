@@ -252,6 +252,17 @@ impl SpotFeedHandler {
             return None;
         }
 
+        if value.get("channel").and_then(Value::as_str) == Some("book")
+            && value.get("data").is_some()
+            && log::log_enabled!(log::Level::Trace)
+        {
+            // Only public book data is captured, with the original JSON escaped for recovery
+            log::trace!(
+                "Kraken L2 raw: {}",
+                serde_json::to_string(text).expect("string serialization")
+            );
+        }
+
         if value.get("channel").is_some() && value.get("data").is_some() {
             match serde_json::from_str::<KrakenWsRawMessage>(text) {
                 Ok(msg) => return self.handle_data_message(msg),
@@ -639,6 +650,27 @@ mod tests {
             "2022-12-25T09:30:59.123456Z"
                 .parse::<jiff::Timestamp>()
                 .unwrap()
+        );
+    }
+
+    #[rstest]
+    fn test_malformed_book_checksum_reaches_validation_gate() {
+        let handler = create_test_handler();
+        handler.subscriptions.mark_subscribe("book:BTC/USD");
+        handler.subscriptions.confirm_subscribe("book:BTC/USD");
+        let text = include_str!("../../../test_data/ws_book_checksum_snapshot_numeric.json")
+            .replace("3310070434", "\"invalid\"");
+        let message = handler
+            .parse_message(&text)
+            .expect("book must reach checksum gate");
+        let KrakenSpotWsMessage::Book { data, is_snapshot } = message else {
+            panic!("expected book message");
+        };
+        assert!(is_snapshot);
+        assert_eq!(data[0].checksum, None);
+        assert_eq!(
+            data[0].bids.as_ref().unwrap()[0].qty.to_string(),
+            "0.10000000"
         );
     }
 

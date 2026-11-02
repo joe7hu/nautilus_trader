@@ -465,8 +465,18 @@ pub struct KrakenWsBookData {
     pub bids: Option<Vec<KrakenWsBookLevel>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub asks: Option<Vec<KrakenWsBookLevel>>,
+    #[serde(default, deserialize_with = "deserialize_book_checksum")]
     pub checksum: Option<u32>,
     pub timestamp: Timestamp,
+}
+
+// Invalid checksum fields must reach the L2 gate as missing rather than leave a stale book
+fn deserialize_book_checksum<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<Box<RawValue>>::deserialize(deserializer)?;
+    Ok(raw.and_then(|raw| serde_json::from_str(raw.get()).ok()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
