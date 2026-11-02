@@ -45,6 +45,10 @@ pub enum KrakenSpotWsMessage {
         data: Vec<KrakenWsBookData>,
         is_snapshot: bool,
     },
+    /// Identifies subscribed book data rejected by the wire decoder.
+    BookDecodeError {
+        symbol: Ustr,
+    },
     Ohlc(Vec<KrakenWsOhlcData>),
     Execution(Vec<KrakenWsExecutionData>),
     OrderResponse(KrakenWsOrderResponse),

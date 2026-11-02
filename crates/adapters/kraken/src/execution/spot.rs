@@ -816,6 +816,7 @@ impl KrakenSpotExecutionClient {
             KrakenSpotWsMessage::Ticker(_)
             | KrakenSpotWsMessage::Trade(_)
             | KrakenSpotWsMessage::Book { .. }
+            | KrakenSpotWsMessage::BookDecodeError { .. }
             | KrakenSpotWsMessage::Ohlc(_)
             | KrakenSpotWsMessage::L3Snapshot(_)
             | KrakenSpotWsMessage::L3Update(_) => {}
