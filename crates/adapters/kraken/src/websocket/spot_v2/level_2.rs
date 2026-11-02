@@ -210,7 +210,7 @@ impl L2BookState {
         self.books.remove(&instrument_id);
         self.levels.remove(&instrument_id);
         let mut clear = OrderBookDelta::clear(instrument_id, sequence, ts_init, ts_init);
-        clear.flags |= RecordFlag::F_LAST as u8;
+        clear.flags = RecordFlag::F_LAST as u8;
         (
             OrderBookDeltas::new(instrument_id, vec![clear]),
             sequence + 1,
