@@ -1680,7 +1680,7 @@ mod tests {
         for batch in &batches[1..3] {
             assert_eq!(batch.deltas.len(), 1);
             assert_eq!(batch.deltas[0].action, BookAction::Clear);
-            assert!(RecordFlag::F_LAST.matches(batch.deltas[0].flags));
+            assert_eq!(batch.deltas[0].flags, RecordFlag::F_LAST as u8);
             consumer.apply_deltas(batch).unwrap();
             assert!(consumer.best_bid_price().is_none());
             assert!(consumer.best_ask_price().is_none());
@@ -1715,10 +1715,17 @@ mod tests {
         for index in [0, 2, 3, 5, 6, 8, 9] {
             assert_eq!(batches[index].deltas.len(), 1);
             assert_eq!(batches[index].deltas[0].action, BookAction::Clear);
+            assert_eq!(batches[index].deltas[0].flags, RecordFlag::F_LAST as u8);
         }
 
         for index in [1, 4, 7] {
             assert_eq!(batches[index].deltas.len(), 21);
+            assert!(
+                batches[index]
+                    .deltas
+                    .iter()
+                    .all(|delta| RecordFlag::F_SNAPSHOT.matches(delta.flags))
+            );
         }
 
         for pair in batches.windows(2) {
