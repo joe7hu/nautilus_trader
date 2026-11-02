@@ -646,6 +646,34 @@ impl KrakenSpotDataClient {
                     }
                 }
             }
+            KrakenSpotWsMessage::BookDecodeError { symbol } => {
+                let instruments = context.instruments.load();
+                let Some(instrument) = lookup_instrument_in_snapshot(&instruments, symbol.as_str())
+                else {
+                    log::warn!("No instrument for rejected book symbol: {symbol}");
+                    return;
+                };
+
+                if context.l2_depths.get(symbol.as_str()).is_none() {
+                    return;
+                }
+                let sequence = context.book_sequence.load(Ordering::Relaxed);
+                log::warn!(
+                    "Invalidating Kraken L2 book after decode failure: symbol={symbol}, sequence={sequence}; awaiting snapshot"
+                );
+                let (deltas, next_sequence) =
+                    l2_books.invalidate(instrument.id(), sequence, ts_init);
+                context
+                    .book_sequence
+                    .store(next_sequence, Ordering::Relaxed);
+
+                if let Err(e) = context
+                    .sender
+                    .send(DataEvent::Data(Data::BookDeltas(Box::new(deltas))))
+                {
+                    log::error!("Failed to send Kraken L2 clear after decode failure: {e}");
+                }
+            }
             KrakenSpotWsMessage::Ohlc(ohlc_data) => {
                 let mut buffer = context.ohlc_buffer.lock();
 
@@ -1279,22 +1307,34 @@ struct SpotMessageContext<'a> {
 
 #[cfg(test)]
 mod tests {
-    use nautilus_common::{live::runner::set_data_event_sender, messages::DataEvent};
+    use std::io::Write;
+
+    use aws_lc_rs::digest;
+    use futures_util::SinkExt;
+    use nautilus_common::{
+        live::runner::set_data_event_sender,
+        logging::{config::LoggerConfig, init_logging, writer::FileWriterConfig},
+        messages::DataEvent,
+    };
+    use nautilus_core::UUID4;
     use nautilus_model::{
         data::OrderBookDeltas,
         enums::{BookAction, BookType, RecordFlag},
-        identifiers::Symbol,
+        identifiers::{Symbol, TraderId},
         instruments::{InstrumentAny, currency_pair::CurrencyPair},
         orderbook::OrderBook,
-        types::{Currency, Price, Quantity},
+        types::{Currency, Price, Quantity, fixed::HIGH_PRECISION_MODE},
     };
     use rstest::rstest;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
+    use serde::{Deserialize, Serialize};
+    use serde_json::value::RawValue;
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
 
     use super::*;
     use crate::{
-        common::consts::KRAKEN_CLIENT_ID,
+        common::{consts::KRAKEN_CLIENT_ID, parse::get_currency},
         config::KrakenDataClientConfig,
         websocket::spot_v2::{
             enums::KrakenWsMessageType,
@@ -1597,6 +1637,248 @@ mod tests {
             }
         }
         batches
+    }
+
+    #[derive(Serialize)]
+    struct DecodeProofBatch {
+        deltas: OrderBookDeltas,
+        native_stream_received_ns: String,
+        processing_before_ns: String,
+        processing_after_ns: String,
+    }
+
+    async fn replay_decode_failure_through_websocket(
+        instrument: InstrumentAny,
+        snapshot: &str,
+        rejected: &str,
+    ) -> Vec<DecodeProofBatch> {
+        let raw: KrakenWsRawMessage = serde_json::from_str(rejected).unwrap();
+        let decode_error = serde_json::from_str::<KrakenWsBookData>(raw.data[0].get()).unwrap_err();
+        eprintln!("CONTROLLED decode rejection: {decode_error}");
+        eprintln!(
+            "CONTROLLED original frame JSON string: {}",
+            serde_json::to_string(rejected).unwrap()
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (frame_tx, mut frame_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(socket).await.unwrap();
+            let subscription = websocket.next().await.unwrap().unwrap();
+            assert!(subscription.to_text().unwrap().contains("subscribe"));
+
+            while let Some(frame) = frame_rx.recv().await {
+                websocket.send(Message::Text(frame.into())).await.unwrap();
+            }
+        });
+        let config = KrakenDataClientConfig {
+            ws_public_url: Some(format!("ws://{address}")),
+            ..Default::default()
+        };
+        let mut websocket = KrakenSpotWebSocketClient::new(config, CancellationToken::new(), None);
+        websocket.connect().await.unwrap();
+        websocket.wait_until_active(5.0).await.unwrap();
+        let instrument_id = instrument.id();
+        websocket
+            .subscribe_book(instrument_id, Some(10))
+            .await
+            .unwrap();
+        let mut stream = Box::pin(websocket.stream().unwrap());
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+        let instruments = Arc::new(AtomicMap::new());
+        instruments.insert(instrument_id, instrument);
+        let book_sequence = Arc::new(AtomicU64::new(0));
+        let ohlc_buffer = Arc::new(Mutex::new(AHashMap::new()));
+        let depths = websocket.l2_depths_handle();
+        let context = SpotMessageContext {
+            sender: &sender,
+            instruments: &instruments,
+            book_sequence: &book_sequence,
+            l2_depths: &depths,
+            ohlc_buffer: &ohlc_buffer,
+            clock: get_atomic_clock_realtime(),
+        };
+        let mut state = L2BookState::default();
+        let mut consumer = OrderBook::new(instrument_id, BookType::L2_MBP);
+        frame_tx.send(snapshot.to_string()).unwrap();
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        let received = context.clock.get_time_ns().to_string();
+        let before = context.clock.get_time_ns().to_string();
+        KrakenSpotDataClient::handle_ws_message(snapshot, &context, &mut state);
+        let after = context.clock.get_time_ns().to_string();
+        let DataEvent::Data(Data::BookDeltas(snapshot)) = receiver.try_recv().unwrap() else {
+            panic!("expected snapshot deltas");
+        };
+        consumer.apply_deltas(&snapshot).unwrap();
+        assert!(consumer.best_bid_price().is_some());
+        assert!(consumer.best_ask_price().is_some());
+        assert!(RecordFlag::F_SNAPSHOT.matches(snapshot.deltas[0].flags));
+        let mut batches = vec![DecodeProofBatch {
+            deltas: *snapshot,
+            native_stream_received_ns: received,
+            processing_before_ns: before,
+            processing_after_ns: after,
+        }];
+
+        frame_tx.send(rejected.to_string()).unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .ok()
+            .flatten();
+        let received = context.clock.get_time_ns().to_string();
+        let before = context.clock.get_time_ns().to_string();
+        let emitted = output.is_some();
+
+        if let Some(message) = output {
+            KrakenSpotDataClient::handle_ws_message(message, &context, &mut state);
+        }
+        let after = context.clock.get_time_ns().to_string();
+        let mut observed = Vec::new();
+
+        while let Ok(event) = receiver.try_recv() {
+            let DataEvent::Data(Data::BookDeltas(deltas)) = event else {
+                panic!("expected book deltas");
+            };
+            consumer.apply_deltas(&deltas).unwrap();
+            observed.extend(deltas.deltas.iter().copied());
+            batches.push(DecodeProofBatch {
+                deltas: *deltas,
+                native_stream_received_ns: received.clone(),
+                processing_before_ns: before.clone(),
+                processing_after_ns: after.clone(),
+            });
+        }
+        eprintln!(
+            "CONTROLLED handler_emitted={emitted}, deltas={}, retained_bid={:?}, retained_ask={:?}",
+            observed.len(),
+            consumer.best_bid_price(),
+            consumer.best_ask_price()
+        );
+        websocket.disconnect().await.unwrap();
+        server.abort();
+        let _ = server.await;
+
+        assert!(
+            consumer.best_bid_price().is_none(),
+            "decode-rejected subscribed book update retained stale native consumer bid"
+        );
+        assert!(consumer.best_ask_price().is_none());
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].action, BookAction::Clear);
+        assert_eq!(observed[0].flags, RecordFlag::F_LAST as u8);
+        assert!(!state.books.contains_key(&instrument_id));
+        assert_eq!(batches.len(), 2);
+        batches
+    }
+
+    #[tokio::test]
+    async fn test_l2_book_decode_rejection_clears_actual_consumer() {
+        replay_decode_failure_through_websocket(
+            make_instrument(),
+            L2_NUMERIC_SNAPSHOT,
+            include_str!("../../test_data/ws_book_decode_rejected_update.json"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_export_l2_book_decode_invalidation() {
+        #[derive(Deserialize)]
+        struct ProofInput {
+            classification: String,
+            definition: Box<RawValue>,
+            snapshot: String,
+            update: String,
+            decode_invalid_update: String,
+            original_manifest: serde_json::Value,
+        }
+
+        fn sha256(bytes: &[u8]) -> String {
+            digest::digest(&digest::SHA256, bytes)
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        }
+
+        let input = std::env::var_os("NAUTILUS_KRAKEN_DECODE_PROOF_INPUT");
+        let output = std::env::var_os("NAUTILUS_KRAKEN_DECODE_PROOF_OUTPUT");
+        let (input, output) = match (input, output) {
+            (None, None) => {
+                eprintln!(
+                    "INACTIVE optional decode-proof export: no input/output paths; not coverage"
+                );
+                return;
+            }
+            (Some(input), Some(output)) => (input, output),
+            _ => panic!("Both decode-proof input and output paths are required"),
+        };
+        assert_eq!(
+            HIGH_PRECISION_MODE, 1,
+            "decode proof must match the high-precision product graph"
+        );
+        let _logger = init_logging(
+            TraderId::from("KRKN-DECODE"),
+            UUID4::new(),
+            LoggerConfig::from_spec(concat!(
+                "stdout=Trace;is_colored=false;log_components_only=true;",
+                "nautilus_kraken::websocket::spot_v2::handler=Trace;",
+                "nautilus_kraken::websocket::spot_v2::level_2=Trace;",
+                "nautilus_kraken::data::spot=Trace",
+            ))
+            .unwrap(),
+            FileWriterConfig::default(),
+        )
+        .unwrap();
+
+        let input_bytes = std::fs::read(input).unwrap();
+        let input: ProofInput = serde_json::from_slice(&input_bytes).unwrap();
+        assert_eq!(
+            input.decode_invalid_update,
+            input
+                .update
+                .replacen("\"qty\":0.00000000", "\"qty\":\"not-a-decimal\"", 1)
+        );
+        let definition: serde_json::Value = serde_json::from_str(input.definition.get()).unwrap();
+
+        // Match the existing Kraken definition decoder without aliasing the retained definition
+        let _ = get_currency("XXBT");
+        let instrument: InstrumentAny = serde_json::from_str(input.definition.get()).unwrap();
+        assert_eq!(instrument.id(), InstrumentId::from("BTC/USDT.KRAKEN"));
+        assert_eq!(serde_json::to_value(&instrument).unwrap(), definition);
+        let batches = replay_decode_failure_through_websocket(
+            instrument.clone(),
+            &input.snapshot,
+            &input.decode_invalid_update,
+        )
+        .await;
+        let result = serde_json::json!({
+            "classification": input.classification,
+            "high_precision": HIGH_PRECISION_MODE == 1,
+            "definition": instrument,
+            "input_sha256": sha256(&input_bytes),
+            "raw_sha256": {
+                "snapshot": sha256(input.snapshot.as_bytes()),
+                "update": sha256(input.update.as_bytes()),
+                "decode_invalid_update": sha256(input.decode_invalid_update.as_bytes()),
+            },
+            "original_manifest": input.original_manifest,
+            "batches": batches,
+        });
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output)
+            .unwrap();
+        file.write_all(&serde_json::to_vec_pretty(&result).unwrap())
+            .unwrap();
+        file.sync_all().unwrap();
     }
 
     // Kraken's published snapshot, with a timestamp added for the wire model
