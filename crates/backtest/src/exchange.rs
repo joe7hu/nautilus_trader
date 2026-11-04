@@ -696,7 +696,7 @@ impl SimulatedExchange {
                 self.margin_account_config().apply(margin_account)?;
             }
             AccountAny::Cash(cash_account) => {
-                cash_account.allow_borrowing = self.allow_cash_borrowing
+                cash_account.allow_borrowing = self.allow_cash_borrowing;
             }
             AccountAny::Betting(_) | AccountAny::Wallet(_) => {}
         }
