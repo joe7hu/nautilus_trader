@@ -492,7 +492,8 @@ pub fn parse_ws_asset_context(
             let mark_price_update =
                 MarkPriceUpdate::new(instrument_id, mark_price, ts_init, ts_init);
 
-            let index_price = parse_price(ctx.oracle_px, instrument, "ctx.oracle_px")?;
+            let index_price =
+                Price::from_decimal(ctx.oracle_px).context("Invalid Hyperliquid oracle price")?;
             let index_price_update =
                 IndexPriceUpdate::new(instrument_id, index_price, ts_init, ts_init);
 
@@ -1085,7 +1086,9 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_ws_asset_context_perp() {
+    #[case(dec!(50005.0))]
+    #[case(dec!(60000.55))]
+    fn test_parse_ws_asset_context_perp(#[case] oracle: Decimal) {
         let instrument = create_test_instrument();
         let ts_init = UnixNanos::default();
 
@@ -1102,7 +1105,7 @@ mod tests {
                 },
                 funding: dec!(0.0001),
                 open_interest: dec!(100000.0),
-                oracle_px: dec!(50005.0),
+                oracle_px: oracle,
                 premium: Some(dec!(-0.0001)),
             },
         };
@@ -1118,7 +1121,7 @@ mod tests {
         assert!(index_price.is_some());
         let index = index_price.unwrap();
         assert_eq!(index.instrument_id, instrument.id());
-        assert_eq!(index.value.as_f64(), 50_005.0);
+        assert_eq!(index.value.as_decimal(), oracle);
 
         assert!(funding_rate.is_some());
         let funding = funding_rate.unwrap();

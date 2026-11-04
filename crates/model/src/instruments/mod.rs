@@ -236,7 +236,9 @@ pub trait Instrument: 'static + Send {
         if self.is_inverse() {
             self.base_currency()
                 .expect("inverse instrument without base_currency")
-        } else if self.is_quanto() {
+        } else if self.is_quanto()
+            || currencies_equivalent_for_quanto(self.settlement_currency(), self.quote_currency())
+        {
             self.settlement_currency()
         } else {
             self.quote_currency()
@@ -584,10 +586,8 @@ pub trait Instrument: 'static + Send {
                     anyhow::anyhow!("inverse instrument {} has no base currency", self.id())
                 })?
             }
-        } else if self.is_quanto() {
-            self.settlement_currency()
         } else {
-            self.quote_currency()
+            self.cost_currency()
         };
 
         try_notional_value(
@@ -770,6 +770,19 @@ mod tests {
         instruments::stubs::*,
         types::{ERROR_PRICE, Money, PRICE_ERROR, PRICE_UNDEF, QUANTITY_UNDEF},
     };
+
+    #[rstest]
+    fn cross_stable_perpetual_preserves_settlement_precision() {
+        let mut instrument = crypto_perpetual_ethusdt();
+        instrument.quote_currency = Currency::USDT();
+        instrument.settlement_currency = Currency::USDC();
+        let instrument = InstrumentAny::CryptoPerpetual(instrument);
+        assert_eq!(instrument.cost_currency(), Currency::USDC());
+        let notional = instrument
+            .try_calculate_notional_value(Quantity::from("0.00025"), Price::from("60001.0"), None)
+            .unwrap();
+        assert_eq!(notional.to_string(), "15.00025000 USDC");
+    }
 
     pub(super) fn default_price_increment(precision: u8) -> Price {
         let step = 10f64.powi(-i32::from(precision));
@@ -1585,8 +1598,8 @@ mod tests {
         let notional = instrument.calculate_notional_value(quantity, price, None);
 
         assert!(!instrument.is_quanto());
-        assert_eq!(instrument.cost_currency(), quote_currency);
-        assert_eq!(notional, Money::new(5000.0, quote_currency));
+        assert_eq!(instrument.cost_currency(), settlement_currency);
+        assert_eq!(notional, Money::new(5000.0, settlement_currency));
     }
 
     #[rstest]

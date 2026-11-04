@@ -1165,12 +1165,17 @@ impl RiskEngine {
         full_position_exit: bool,
     ) -> bool {
         let mut max_notional: Option<Money> = None;
+        let notional_currency = if instrument.is_inverse() {
+            instrument.quote_currency()
+        } else {
+            instrument.cost_currency()
+        };
 
         // Determine max notional
         let max_notional_setting = self.max_notional_per_order.get(&instrument.id());
         if let Some(max_notional_setting_val) = max_notional_setting.copied() {
             let Ok(max_notional_value) =
-                Money::from_decimal(max_notional_setting_val, instrument.quote_currency())
+                Money::from_decimal(max_notional_setting_val, notional_currency)
             else {
                 for order in orders {
                     self.deny_order(
@@ -1595,7 +1600,7 @@ impl RiskEngine {
             // Check MAX notional per order limit
             if !full_position_exit
                 && let Some(max_notional_value) = max_notional
-                && notional > max_notional_value
+                && notional.as_decimal() > max_notional_value.as_decimal()
             {
                 self.deny_order(
                     order,
@@ -1613,35 +1618,61 @@ impl RiskEngine {
             if !order.is_reduce_only()
                 && !full_position_exit
                 && let Some(min_notional) = instrument.min_notional()
-                && notional.currency == min_notional.currency
-                && notional < min_notional
             {
-                self.deny_order(
-                    order,
-                    &OrderDeniedReason::NotionalBelowMinimum {
-                        min_notional,
-                        notional,
-                    }
-                    .to_string(),
-                );
-                return false; // Denied
+                if notional.currency != min_notional.currency {
+                    self.deny_order(
+                        order,
+                        &OrderDeniedReason::NotionalCalculationFailed {
+                            detail: format!(
+                                "minimum notional currency {} differs from order notional currency {}",
+                                min_notional.currency, notional.currency,
+                            ),
+                        }
+                        .to_string(),
+                    );
+                    return false;
+                }
+
+                if notional.as_decimal() < min_notional.as_decimal() {
+                    self.deny_order(
+                        order,
+                        &OrderDeniedReason::NotionalBelowMinimum {
+                            min_notional,
+                            notional,
+                        }
+                        .to_string(),
+                    );
+                    return false;
+                }
             }
 
             // Check MAX notional instrument limit
-            if !full_position_exit
-                && let Some(max_notional) = instrument.max_notional()
-                && notional.currency == max_notional.currency
-                && notional > max_notional
-            {
-                self.deny_order(
-                    order,
-                    &OrderDeniedReason::NotionalExceedsMaximum {
-                        max_notional,
-                        notional,
-                    }
-                    .to_string(),
-                );
-                return false; // Denied
+            if !full_position_exit && let Some(max_notional) = instrument.max_notional() {
+                if notional.currency != max_notional.currency {
+                    self.deny_order(
+                        order,
+                        &OrderDeniedReason::NotionalCalculationFailed {
+                            detail: format!(
+                                "maximum notional currency {} differs from order notional currency {}",
+                                max_notional.currency, notional.currency,
+                            ),
+                        }
+                        .to_string(),
+                    );
+                    return false;
+                }
+
+                if notional.as_decimal() > max_notional.as_decimal() {
+                    self.deny_order(
+                        order,
+                        &OrderDeniedReason::NotionalExceedsMaximum {
+                            max_notional,
+                            notional,
+                        }
+                        .to_string(),
+                    );
+                    return false;
+                }
             }
 
             if is_margin {

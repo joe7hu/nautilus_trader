@@ -32,7 +32,7 @@ use nautilus_common::{
 use nautilus_core::{DurationNanos, UUID4, UnixNanos};
 use nautilus_model::{
     accounts::AccountAny,
-    data::{FundingRateUpdate, MarkPriceUpdate},
+    data::{FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate},
     enums::PositionAdjustmentType,
     events::{AccountState, FundingSettlement, PositionAdjusted, PositionEvent},
     identifiers::{AccountId, InstrumentId, Venue},
@@ -82,6 +82,7 @@ impl<T: ExecutionClient + ?Sized> FundingAccountPublisher for T {
 /// Original native price input selected before the execution barrier.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum FundingPriceCut {
+    Index(IndexPriceUpdate),
     /// Original mark update.
     Mark(MarkPriceUpdate),
     /// Matching-engine bid and ask at the boundary cut.
@@ -99,6 +100,7 @@ impl FundingPriceCut {
     #[must_use]
     pub fn price(&self) -> Option<Price> {
         match self {
+            Self::Index(index) => Some(index.value),
             Self::Mark(mark) => Some(mark.value),
             Self::Midpoint { bid, ask, .. } => {
                 let value = bid
@@ -311,6 +313,36 @@ impl FundingOwner {
             && cut.as_u64().saturating_sub(ts_init.as_u64()) <= 5_000_000_000
     }
 
+    fn settlement_observation_fresh(
+        instrument: InstrumentId,
+        price: Option<&FundingPriceCut>,
+        boundary: UnixNanos,
+    ) -> bool {
+        match price {
+            Some(FundingPriceCut::Index(index)) if instrument.venue.as_str() == "HYPERLIQUID" => {
+                index.instrument_id == instrument
+                    && index.value.as_decimal() > Decimal::ZERO
+                    && Self::observation_fresh(index.ts_event, index.ts_init, boundary)
+            }
+            Some(FundingPriceCut::Mark(mark)) if instrument.venue.as_str() != "HYPERLIQUID" => {
+                mark.instrument_id == instrument
+                    && Self::observation_fresh(mark.ts_event, mark.ts_init, boundary)
+            }
+            _ => false,
+        }
+    }
+
+    fn settlement_inputs_valid(
+        rate: &FundingRateUpdate,
+        price: Option<&FundingPriceCut>,
+        boundary: UnixNanos,
+    ) -> bool {
+        rate.instrument_id.venue.as_str() != "HYPERLIQUID"
+            || (Self::boundary(rate) == Some(boundary)
+                && Self::observation_fresh(rate.ts_event, rate.ts_init, boundary)
+                && Self::settlement_observation_fresh(rate.instrument_id, price, boundary))
+    }
+
     /// Queues an original rate update without repeating a consumed boundary.
     pub fn queue(&mut self, update: FundingRateUpdate) -> Option<UnixNanos> {
         let boundary = Self::boundary(&update)?;
@@ -351,6 +383,23 @@ impl FundingOwner {
         publisher: Option<&P>,
         require_application: bool,
     ) -> bool {
+        self.process_replay_with_price_cut(
+            instrument,
+            boundary,
+            price.map(FundingPriceCut::Replay),
+            publisher,
+            require_application,
+        )
+    }
+
+    pub fn process_replay_with_price_cut<P: FundingAccountPublisher + ?Sized>(
+        &mut self,
+        instrument: InstrumentId,
+        boundary: UnixNanos,
+        price: Option<FundingPriceCut>,
+        publisher: Option<&P>,
+        require_application: bool,
+    ) -> bool {
         let Some(rate) = self.pending.get(&(boundary, instrument)).copied() else {
             return self.poisoned.is_none()
                 && (!require_application
@@ -365,13 +414,7 @@ impl FundingOwner {
                         }));
         };
 
-        if self.settle_replay(
-            &rate,
-            boundary,
-            price.map(FundingPriceCut::Replay),
-            publisher,
-            require_application,
-        ) {
+        if self.settle_replay(&rate, boundary, price, publisher, require_application) {
             self.pending.remove(&(boundary, instrument));
             true
         } else {
@@ -387,6 +430,13 @@ impl FundingOwner {
     }
     /// Resolves the original explicit or interval-aligned native boundary.
     pub fn boundary(rate: &FundingRateUpdate) -> Option<UnixNanos> {
+        if rate.instrument_id.venue.as_str() == "HYPERLIQUID" {
+            let hour = DurationNanos::try_from_mins(60).ok()?;
+            return (rate.interval == Some(60)
+                && rate.next_funding_ns == Some(rate.ts_event)
+                && rate.ts_event.floor(hour) == rate.ts_event)
+                .then_some(rate.ts_event);
+        }
         rate.next_funding_ns.or_else(|| {
             let interval = DurationNanos::try_from_mins(u64::from(rate.interval?)).ok()?;
             (!interval.is_zero() && rate.ts_event.floor(interval) == rate.ts_event)
@@ -474,6 +524,9 @@ impl FundingOwner {
             return true;
         }
 
+        if !Self::settlement_inputs_valid(funding_rate, price_cut.as_ref(), ts_event) {
+            return false;
+        }
         let Some(settlement_price) = price_cut.as_ref().and_then(FundingPriceCut::price) else {
             log::warn!(
                 "Cannot settle funding for {}: no mark price or top-of-book price",
@@ -921,7 +974,7 @@ impl FundingOwner {
         }
 
         if self.window.is_some()
-            && !matches!(&price, Some(FundingPriceCut::Mark(mark)) if Self::observation_fresh(mark.ts_event, mark.ts_init, boundary))
+            && !Self::settlement_observation_fresh(instrument, price.as_ref(), boundary)
         {
             return FundingProgress::Deferred;
         }
@@ -940,6 +993,12 @@ impl FundingOwner {
         }
 
         if price.as_ref().is_some_and(|cut| match cut {
+            FundingPriceCut::Index(index) => {
+                instrument.venue.as_str() != "HYPERLIQUID"
+                    || index.instrument_id != instrument
+                    || index.value.as_decimal() <= Decimal::ZERO
+                    || !Self::observation_fresh(index.ts_event, index.ts_init, boundary)
+            }
             FundingPriceCut::Mark(mark) => {
                 mark.instrument_id != instrument
                     || mark.ts_event > boundary
@@ -1091,6 +1150,17 @@ impl FundingOwner {
                 "invalid consumed funding identity"
             );
 
+            if receipt.progress == FundingProgress::Applied {
+                anyhow::ensure!(
+                    Self::settlement_inputs_valid(
+                        &receipt.original_rate,
+                        receipt.price_cut.as_ref(),
+                        key.0
+                    ),
+                    "Invalid original funding settlement inputs"
+                );
+            }
+
             if let Some(window) = self.window {
                 anyhow::ensure!(
                     key.0 >= window.first_boundary
@@ -1105,7 +1175,11 @@ impl FundingOwner {
 
                 if receipt.progress == FundingProgress::Applied {
                     anyhow::ensure!(
-                        matches!(&receipt.price_cut, Some(FundingPriceCut::Mark(mark)) if mark.instrument_id == key.1 && Self::observation_fresh(mark.ts_event, mark.ts_init, key.0)),
+                        Self::settlement_observation_fresh(
+                            key.1,
+                            receipt.price_cut.as_ref(),
+                            key.0
+                        ),
                         "bounded funding requires its original fresh mark"
                     );
                 }
@@ -1224,5 +1298,112 @@ impl FundingOwner {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod hyperliquid_tests {
+    use super::*;
+    use rstest::rstest;
+    use std::str::FromStr;
+
+    #[rstest]
+    fn context_predictions_cannot_become_final_hourly_rates() {
+        let instrument = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
+        let boundary = UnixNanos::from(3_600_000_000_000);
+        let prediction = FundingRateUpdate::new(
+            instrument,
+            Decimal::ZERO,
+            Some(60),
+            None,
+            boundary,
+            boundary,
+        );
+        assert_eq!(FundingOwner::boundary(&prediction), None);
+        let mut settled = prediction;
+        settled.next_funding_ns = Some(boundary);
+        assert_eq!(FundingOwner::boundary(&settled), Some(boundary));
+        settled.ts_event = UnixNanos::from(3_600_000_000_001);
+        assert_eq!(FundingOwner::boundary(&settled), None);
+    }
+
+    #[rstest]
+    fn oracle_cut_preserves_precision_and_refuses_mark_substitution() {
+        let instrument = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
+        let boundary = UnixNanos::from(3_600_000_000_000);
+        let cut = FundingPriceCut::Index(IndexPriceUpdate::new(
+            instrument,
+            Price::from("60000.55"),
+            boundary,
+            boundary,
+        ));
+        assert!(FundingOwner::settlement_observation_fresh(
+            instrument,
+            Some(&cut),
+            boundary
+        ));
+        assert_eq!(
+            cut.price().unwrap().as_decimal() * Decimal::from_str("0.0001").unwrap(),
+            Decimal::from_str("6.000055").unwrap()
+        );
+        let mark = FundingPriceCut::Mark(MarkPriceUpdate::new(
+            instrument,
+            Price::from("61000.0"),
+            boundary,
+            boundary,
+        ));
+        assert!(!FundingOwner::settlement_observation_fresh(
+            instrument,
+            Some(&mark),
+            boundary
+        ));
+    }
+    #[rstest]
+    #[case("0")]
+    #[case("-60000.55")]
+    fn nonpositive_oracle_cannot_settle(#[case] value: &str) {
+        let instrument = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
+        let boundary = UnixNanos::from(3_600_000_000_000);
+        let cut = FundingPriceCut::Index(IndexPriceUpdate::new(
+            instrument,
+            Price::from(value),
+            boundary,
+            boundary,
+        ));
+        assert!(!FundingOwner::settlement_observation_fresh(
+            instrument,
+            Some(&cut),
+            boundary
+        ));
+    }
+    #[rstest]
+    fn late_history_does_not_become_timely_final_knowledge() {
+        let instrument = InstrumentId::from("BTC-USD-PERP.HYPERLIQUID");
+        let boundary = UnixNanos::from(3_600_000_000_000);
+        let mut rate = FundingRateUpdate::new(
+            instrument,
+            Decimal::ZERO,
+            Some(60),
+            Some(boundary),
+            boundary,
+            boundary,
+        );
+        let cut = FundingPriceCut::Index(IndexPriceUpdate::new(
+            instrument,
+            Price::from("60000.55"),
+            boundary,
+            boundary,
+        ));
+        assert!(FundingOwner::settlement_inputs_valid(
+            &rate,
+            Some(&cut),
+            boundary
+        ));
+        rate.ts_init = UnixNanos::from(boundary.as_u64() + 1);
+        assert!(!FundingOwner::settlement_inputs_valid(
+            &rate,
+            Some(&cut),
+            boundary
+        ));
     }
 }

@@ -29,7 +29,7 @@ use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use crate::{
-    common::parse::normalize_order,
+    common::parse::{millis_to_nanos, normalize_order},
     http::{
         models::{HyperliquidL2Book, HyperliquidLevel},
         parse::get_currency,
@@ -248,7 +248,7 @@ impl HyperliquidDataConverter {
         ts_init: UnixNanos,
     ) -> Result<OrderBookDeltas, ConversionError> {
         let config = self.configs.get(&data.coin);
-        let ts_event = UnixNanos::from(data.time * 1_000_000);
+        let ts_event = millis_to_nanos(data.time)?;
         let mut deltas = Vec::with_capacity(1 + data.levels[0].len() + data.levels[1].len());
 
         // Add a clear delta first to reset the book
@@ -308,7 +308,7 @@ impl HyperliquidDataConverter {
         ts_init: UnixNanos,
     ) -> Result<OrderBookDeltas, ConversionError> {
         let config = self.configs.get(&data.coin);
-        let ts_event = UnixNanos::from(data.time * 1_000_000);
+        let ts_event = millis_to_nanos(data.time)?;
         let mut deltas = Vec::with_capacity(1 + data.levels[0].len() + data.levels[1].len());
 
         // Add a clear delta first to reset the book
@@ -856,6 +856,30 @@ mod tests {
 
     fn sample_ws_book() -> WsBookData {
         load_test_data("ws_book_data.json")
+    }
+
+    #[rstest]
+    #[case(u64::MAX / 1_000_000 + 1)]
+    #[case(u64::MAX)]
+    fn test_snapshot_conversion_rejects_timestamp_overflow(#[case] millis: u64) {
+        let converter = HyperliquidDataConverter::new();
+        let mut http_book = sample_http_book();
+        http_book.time = millis;
+        let mut ws_book = sample_ws_book();
+        ws_book.time = millis;
+        let instrument_id = test_instrument_id();
+        let ts_init = UnixNanos::default();
+
+        assert!(
+            converter
+                .convert_http_snapshot(&http_book, instrument_id, ts_init)
+                .is_err()
+        );
+        assert!(
+            converter
+                .convert_ws_snapshot(&ws_book, instrument_id, ts_init)
+                .is_err()
+        );
     }
 
     #[rstest]

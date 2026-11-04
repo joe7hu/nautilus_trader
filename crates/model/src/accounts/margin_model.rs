@@ -226,8 +226,10 @@ fn margin_currency(
                 instrument.id()
             )
         })
-    } else {
+    } else if instrument.is_inverse() {
         Ok(instrument.quote_currency())
+    } else {
+        Ok(instrument.cost_currency())
     }
 }
 

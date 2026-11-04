@@ -36,7 +36,7 @@ use nautilus_core::{
     correctness::{CorrectnessResultExt, FAILED, check_equal},
 };
 use nautilus_execution::{
-    funding::FundingOwner,
+    funding::{FundingOwner, FundingPriceCut},
     maintenance::MaintenanceOwner,
     matching_core::RestingOrder,
     matching_engine::{
@@ -1284,7 +1284,7 @@ impl SimulatedExchange {
             }
         }
         let price = self.funding_settlement_price(funding_rate.instrument_id);
-        self.funding.process_replay(
+        self.funding.process_replay_with_price_cut(
             funding_rate.instrument_id,
             ts_event,
             price,
@@ -1293,15 +1293,26 @@ impl SimulatedExchange {
         )
     }
 
-    fn funding_settlement_price(&self, instrument_id: InstrumentId) -> Option<Price> {
+    fn funding_settlement_price(&self, instrument_id: InstrumentId) -> Option<FundingPriceCut> {
+        if instrument_id.venue.as_str() == "HYPERLIQUID" {
+            return self
+                .cache
+                .borrow()
+                .index_price(&instrument_id)
+                .copied()
+                .map(FundingPriceCut::Index);
+        }
+
         if let Some(mark_price) = self.cache.borrow().mark_price(&instrument_id) {
-            return Some(mark_price.value);
+            return Some(FundingPriceCut::Replay(mark_price.value));
         }
 
         let bid = self.best_bid_price(instrument_id)?;
         let ask = self.best_ask_price(instrument_id)?;
         let midpoint = (bid.as_decimal() + ask.as_decimal()) / Decimal::from(2);
-        Price::from_decimal_dp(midpoint, bid.precision.max(ask.precision)).ok()
+        Price::from_decimal_dp(midpoint, bid.precision.max(ask.precision))
+            .ok()
+            .map(FundingPriceCut::Replay)
     }
 
     fn funding_boundary(rate: &FundingRateUpdate) -> Option<UnixNanos> {
