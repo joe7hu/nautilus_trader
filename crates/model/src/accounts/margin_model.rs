@@ -18,11 +18,22 @@
 use std::{fmt::Debug, sync::Arc};
 
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     instruments::Instrument,
     types::{Money, Price, Quantity},
 };
+
+/// Selects the portfolio price and reserve semantics required by a margin model.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MarginAccounting {
+    /// Reserves order initial margin plus position maintenance at entry prices.
+    #[default]
+    Legacy,
+    /// Reserves position and order initial margin at the current mark, tracking maintenance separately.
+    CurrentMark,
+}
 
 /// Determines how margin requirements are calculated for leveraged positions.
 pub trait MarginModel: Send + Sync {
@@ -30,7 +41,12 @@ pub trait MarginModel: Send + Sync {
     #[must_use]
     fn name(&self) -> &'static str;
 
-    /// Calculates the initial (order) margin requirement.
+    /// Returns the accounting semantics required by this model.
+    fn accounting(&self) -> MarginAccounting {
+        MarginAccounting::Legacy
+    }
+
+    /// Calculates the initial margin requirement for a new opening.
     ///
     /// # Errors
     ///
@@ -43,6 +59,22 @@ pub trait MarginModel: Send + Sync {
         leverage: Decimal,
         use_quote_for_inverse: Option<bool>,
     ) -> anyhow::Result<Money>;
+
+    /// Calculates reserved initial margin for existing exposure, excluding new-opening eligibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the requirement cannot be computed.
+    fn calculate_reserved_initial_margin(
+        &self,
+        instrument: &dyn Instrument,
+        quantity: Quantity,
+        price: Price,
+        leverage: Decimal,
+        use_quote_for_inverse: Option<bool>,
+    ) -> anyhow::Result<Money> {
+        self.calculate_initial_margin(instrument, quantity, price, leverage, use_quote_for_inverse)
+    }
 
     /// Calculates the maintenance (position) margin requirement.
     ///
@@ -89,6 +121,10 @@ impl Debug for MarginModelHandle {
 }
 
 impl MarginModel for MarginModelHandle {
+    fn accounting(&self) -> MarginAccounting {
+        self.0.accounting()
+    }
+
     fn name(&self) -> &'static str {
         self.0.name()
     }
@@ -102,6 +138,23 @@ impl MarginModel for MarginModelHandle {
         use_quote_for_inverse: Option<bool>,
     ) -> anyhow::Result<Money> {
         self.0.calculate_initial_margin(
+            instrument,
+            quantity,
+            price,
+            leverage,
+            use_quote_for_inverse,
+        )
+    }
+
+    fn calculate_reserved_initial_margin(
+        &self,
+        instrument: &dyn Instrument,
+        quantity: Quantity,
+        price: Price,
+        leverage: Decimal,
+        use_quote_for_inverse: Option<bool>,
+    ) -> anyhow::Result<Money> {
+        self.0.calculate_reserved_initial_margin(
             instrument,
             quantity,
             price,

@@ -43,7 +43,7 @@ use crate::{
     accounts::{
         Account,
         base::BaseAccount,
-        margin_model::{MarginModel, MarginModelHandle},
+        margin_model::{MarginAccounting, MarginModel, MarginModelHandle},
     },
     enums::{AccountType, InstrumentClass, OrderSide},
     events::{AccountState, OrderFilled},
@@ -80,6 +80,8 @@ pub struct MarginAccount {
     pub account_margins: IndexMap<Currency, MarginBalance>,
     /// The leverage applied to any instrument absent from `leverages`.
     pub default_leverage: Decimal,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    margin_model_pin: Option<MarginModelPin>,
     #[serde(skip, default = "MarginModelHandle::default")]
     margin_model: MarginModelHandle,
 }
@@ -96,6 +98,7 @@ impl MarginAccount {
             margins,
             account_margins,
             default_leverage: Decimal::ONE,
+            margin_model_pin: None,
             margin_model: MarginModelHandle::default(),
         }
     }
@@ -108,12 +111,46 @@ impl MarginAccount {
             margins: self.margins.clone(),
             account_margins: self.account_margins.clone(),
             default_leverage: self.default_leverage,
+            margin_model_pin: self.margin_model_pin.clone(),
             margin_model: self.margin_model.clone(),
         }
     }
 
-    pub fn set_margin_model(&mut self, model: MarginModelHandle) {
+    /// Installs a model, preserving the accounting contract pinned by an existing account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the model does not match the persisted accounting contract.
+    pub fn set_margin_model(&mut self, model: MarginModelHandle) -> anyhow::Result<()> {
+        if let Some(pin) = &self.margin_model_pin {
+            anyhow::ensure!(
+                pin.name == model.name() && pin.accounting == model.accounting(),
+                "Margin model does not match the account's persisted model pin"
+            );
+        } else if model.accounting() != MarginAccounting::Legacy {
+            self.margin_model_pin = Some(MarginModelPin {
+                name: model.name().to_owned(),
+                accounting: model.accounting(),
+            });
+        }
         self.margin_model = model;
+        Ok(())
+    }
+
+    /// Returns the account's persisted accounting semantics, including while disarmed.
+    #[must_use]
+    pub fn margin_accounting(&self) -> MarginAccounting {
+        self.margin_model_pin
+            .as_ref()
+            .map_or(MarginAccounting::Legacy, |pin| pin.accounting)
+    }
+
+    /// Returns whether the installed model satisfies the persisted accounting contract.
+    #[must_use]
+    pub fn is_margin_model_ready(&self) -> bool {
+        self.margin_model_pin.as_ref().is_none_or(|pin| {
+            pin.name == self.margin_model.name() && pin.accounting == self.margin_model.accounting()
+        })
     }
 
     #[must_use]
@@ -395,12 +432,41 @@ impl MarginAccount {
         price: Price,
         use_quote_for_inverse: Option<bool>,
     ) -> anyhow::Result<Money> {
+        anyhow::ensure!(
+            self.is_margin_model_ready(),
+            "Pinned margin model is not installed"
+        );
         let leverage = self.get_leverage(&instrument.id());
         self.margin_model.calculate_initial_margin(
             instrument,
             quantity,
             price,
             leverage,
+            use_quote_for_inverse,
+        )
+    }
+
+    /// Calculates reserved initial margin for existing exposure without new-opening eligibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pinned model is unavailable or the requirement cannot be computed.
+    pub fn calculate_reserved_initial_margin<T: Instrument>(
+        &self,
+        instrument: &T,
+        quantity: Quantity,
+        price: Price,
+        use_quote_for_inverse: Option<bool>,
+    ) -> anyhow::Result<Money> {
+        anyhow::ensure!(
+            self.is_margin_model_ready(),
+            "Pinned margin model is not installed"
+        );
+        self.margin_model.calculate_reserved_initial_margin(
+            instrument,
+            quantity,
+            price,
+            self.get_leverage(&instrument.id()),
             use_quote_for_inverse,
         )
     }
@@ -419,6 +485,10 @@ impl MarginAccount {
         price: Price,
         use_quote_for_inverse: Option<bool>,
     ) -> anyhow::Result<Money> {
+        anyhow::ensure!(
+            self.is_margin_model_ready(),
+            "Pinned margin model is not installed"
+        );
         let leverage = self.get_leverage(&instrument.id());
         self.margin_model.calculate_maintenance_margin(
             instrument,
@@ -446,17 +516,23 @@ impl MarginAccount {
 
         // An untotalable margin set is venue-reported data, not a local invariant, so the
         // balance degrades to fully reserved rather than taking the trading node down.
-        let total_margin_raw = self
-            .margins_in(currency)
-            .try_fold(0, |raw: MoneyRaw, margin| {
-                raw.checked_add(margin.initial.raw())?
-                    .checked_add(margin.maintenance.raw())
-            });
+        let total_margin_raw = if !self.is_margin_model_ready() {
+            None
+        } else {
+            self.margins_in(currency)
+                .try_fold(0, |raw: MoneyRaw, margin| {
+                    let initial = raw.checked_add(margin.initial.raw())?;
+                    match self.margin_accounting() {
+                        MarginAccounting::Legacy => initial.checked_add(margin.maintenance.raw()),
+                        MarginAccounting::CurrentMark => Some(initial),
+                    }
+                })
+        };
 
         let total_margin = total_margin_raw.map_or_else(
             || {
                 log::error!(
-                    "Cannot total {currency} margins: the sum exceeded Money bounds; reserving the full balance"
+                    "Cannot qualify or total {currency} margins; reserving the full balance"
                 );
                 MONEY_RAW_MAX
             },
@@ -476,6 +552,12 @@ impl MarginAccount {
         let new_balance = AccountBalance::new(current_balance.total, total_margin, total_free);
         self.balances.insert(currency, new_balance);
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MarginModelPin {
+    name: String,
+    accounting: MarginAccounting,
 }
 
 /// Selects one of the two amounts a [`MarginBalance`] carries.
@@ -1149,7 +1231,9 @@ mod tests {
         mut margin_account: MarginAccount,
         audusd_sim: CurrencyPair,
     ) {
-        margin_account.set_margin_model(MarginModelHandle::new(CustomMarginModel));
+        margin_account
+            .set_margin_model(MarginModelHandle::new(CustomMarginModel))
+            .unwrap();
 
         let initial = margin_account
             .calculate_initial_margin(

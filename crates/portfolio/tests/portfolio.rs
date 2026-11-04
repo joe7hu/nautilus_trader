@@ -7594,18 +7594,18 @@ fn test_portfolio_valuation_uses_instrument_cost_currency(
         .unwrap();
 
     assert!(!instrument.is_quanto());
-    assert_eq!(instrument.cost_currency(), Currency::USD());
+    assert_eq!(instrument.cost_currency(), Currency::USDT());
     assert_eq!(instrument.settlement_currency(), Currency::USDT());
     assert_eq!(
         mark_values,
-        IndexMap::from([(Currency::USD(), Money::from("220.00 USD"))])
+        IndexMap::from([(Currency::USDT(), Money::from("220.00000000 USDT"))])
     );
     assert_eq!(
         net_exposures,
-        IndexMap::from([(Currency::USD(), Money::from("220.00 USD"))])
+        IndexMap::from([(Currency::USDT(), Money::from("220.00000000 USDT"))])
     );
-    assert_eq!(net_exposure, Money::from("220.00 USD"));
-    assert_eq!(unrealized_pnl, Money::from("20.00 USD"));
+    assert_eq!(net_exposure, Money::from("220.00000000 USDT"));
+    assert_eq!(unrealized_pnl, Money::from("20.00000000 USDT"));
 
     let closing_fill = make_fill_for_account(
         &instrument,
@@ -7628,7 +7628,7 @@ fn test_portfolio_valuation_uses_instrument_cost_currency(
         .realized_pnl_for_account(&instrument.id(), Some(&account_id), None)
         .unwrap();
 
-    assert_eq!(realized_pnl, Money::from("40.00 USD"));
+    assert_eq!(realized_pnl, Money::from("40.00000000 USDT"));
 }
 
 #[rstest]
@@ -7640,7 +7640,7 @@ fn test_portfolio_valuation_converts_from_instrument_cost_currency(
     let instrument = instrument_usd_usdt_future;
     let account_id = AccountId::new("SIM-001");
     simple_cache.add_instrument(instrument.clone()).unwrap();
-    simple_cache.set_mark_xrate(Currency::USD(), Currency::EUR(), 0.9);
+    simple_cache.set_mark_xrate(Currency::USDT(), Currency::EUR(), 0.9);
     let config = PortfolioConfig::builder()
         .use_mark_xrates(true)
         .build()

@@ -39,7 +39,7 @@ use nautilus_common::{
 };
 use nautilus_core::{DurationNanos, UUID4, UnixNanos, WeakCell};
 use nautilus_model::{
-    accounts::{Account, AccountAny},
+    accounts::{Account, AccountAny, margin_model::MarginAccounting},
     data::{Bar, MarkPriceUpdate, QuoteTick},
     enums::{OmsType, OrderType, PositionSide, PriceType},
     events::{AccountState, OrderEventAny, PortfolioSnapshot, position::PositionEvent},
@@ -306,13 +306,17 @@ impl Portfolio {
             TypedHandler::from(move |mark_price: &MarkPriceUpdate| {
                 if let Some(inner_rc) = inner.upgrade() {
                     let inner_rc: Rc<RefCell<PortfolioState>> = inner_rc.into();
-                    update_instrument_id(
-                        &cache,
-                        &clock,
-                        &inner_rc,
-                        config,
-                        &mark_price.instrument_id,
-                    );
+                    update_current_mark_accounts(&cache, &clock, &inner_rc, mark_price);
+
+                    if config.use_mark_prices {
+                        update_instrument_id(
+                            &cache,
+                            &clock,
+                            &inner_rc,
+                            config,
+                            &mark_price.instrument_id,
+                        );
+                    }
                 }
             })
         };
@@ -360,7 +364,7 @@ impl Portfolio {
             msgbus::subscribe_bars("data.bars.*EXTERNAL".into(), update_bar_handler, Some(10));
         }
 
-        if config.use_mark_prices {
+        {
             msgbus::subscribe_mark_prices(
                 "data.mark_prices.*".into(),
                 update_mark_price_handler,
@@ -3315,6 +3319,58 @@ fn wallet_reservation_orders(
         .filter(|order| wallet_order_reserves_balance(order))
         .map(|order| (*order).clone())
         .collect()
+}
+
+fn update_current_mark_accounts(
+    cache: &Rc<RefCell<Cache>>,
+    clock: &Rc<RefCell<dyn Clock>>,
+    inner: &Rc<RefCell<PortfolioState>>,
+    mark: &MarkPriceUpdate,
+) {
+    let accounts = {
+        let cache_ref = cache.borrow();
+        let mut ids = AHashSet::new();
+
+        for position in cache_ref.positions_open(None, Some(&mark.instrument_id), None, None, None)
+        {
+            ids.insert(position.account_id);
+        }
+
+        for order in cache_ref.orders_open(None, Some(&mark.instrument_id), None, None, None) {
+            if let Some(account_id) = order.account_id() {
+                ids.insert(account_id);
+            }
+        }
+
+        if let Some(account_id) = cache_ref.account_id(&mark.instrument_id.venue) {
+            ids.insert(*account_id);
+        }
+        ids.into_iter()
+            .filter(|id| {
+                cache_ref.account(id).is_some_and(|account| {
+                    matches!(&*account, AccountAny::Margin(account)
+                    if account.base.calculate_account_state
+                        && account.margin_accounting() == MarginAccounting::CurrentMark)
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for account_id in accounts {
+        let mut coherent = false;
+
+        if let Some(state) = recompute_margin_account(
+            cache,
+            clock,
+            inner,
+            account_id,
+            &mark.instrument_id,
+            &mut coherent,
+        ) && coherent
+        {
+            msgbus::publish_account_state(format!("events.account.{account_id}").into(), &state);
+        }
+    }
 }
 
 fn update_instrument_id(

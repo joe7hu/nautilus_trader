@@ -32,15 +32,15 @@ use nautilus_common::{
 use nautilus_core::{Params, UnixNanos, WeakCell};
 use nautilus_execution::client::core::ExecutionClientCore;
 use nautilus_model::{
-    accounts::AccountAny,
-    enums::OmsType,
+    accounts::{Account, AccountAny, MarginAccount, margin_model::MarginAccounting},
+    enums::{AccountType, OmsType},
     events::OrderEventAny,
     identifiers::{AccountId, ClientId, ClientOrderId, TraderId, Venue},
     orders::OrderAny,
     types::{AccountBalance, MarginBalance},
 };
 
-use crate::exchange::SimulatedExchange;
+use crate::exchange::{MarginAccountConfig, SimulatedExchange};
 
 /// Execution client implementation for backtesting trading operations.
 ///
@@ -63,7 +63,8 @@ pub struct BacktestExecutionClient {
     /// and drained by the engine after the execute borrow is released.
     queued_events: Rc<RefCell<Vec<OrderEventAny>>>,
     routing: bool,
-    _frozen_account: bool,
+    frozen_account: bool,
+    margin_account_config: MarginAccountConfig,
 }
 
 impl Debug for BacktestExecutionClient {
@@ -92,6 +93,7 @@ impl BacktestExecutionClient {
         let exchange_id = exchange.borrow().id;
         let account_type = exchange.borrow().account_type;
         let base_currency = exchange.borrow().base_currency;
+        let margin_account_config = exchange.borrow().margin_account_config();
 
         let core = ExecutionClientCore::new(
             trader_id,
@@ -114,7 +116,8 @@ impl BacktestExecutionClient {
             clock,
             queued_events: Rc::new(RefCell::new(Vec::new())),
             routing,
-            _frozen_account: frozen_account,
+            frozen_account,
+            margin_account_config,
         }
     }
 
@@ -175,6 +178,40 @@ impl ExecutionClient for BacktestExecutionClient {
         let state = self
             .factory
             .generate_account_state(balances, margins, reported, ts_event, ts_init, info);
+        let current_mark = self.margin_account_config.uses_current_mark()
+            || self
+                .cache
+                .borrow()
+                .account(&self.core.account_id)
+                .is_some_and(|account| {
+                    matches!(&*account, AccountAny::Margin(account)
+                    if account.margin_accounting() == MarginAccounting::CurrentMark)
+                });
+
+        if current_mark {
+            anyhow::ensure!(
+                state.account_type == AccountType::Margin,
+                "Current-mark configuration requires a margin account state"
+            );
+            let cached_account = self.cache.borrow().account_owned(&self.core.account_id);
+            let existed = cached_account.is_some();
+            let mut account = match cached_account {
+                Some(AccountAny::Margin(account)) => account,
+                Some(_) => anyhow::bail!("Current-mark configuration requires a margin account"),
+                None => MarginAccount::new(state.clone(), !self.frozen_account),
+            };
+            self.margin_account_config.apply(&mut account)?;
+            if existed {
+                account.apply(state.clone())?;
+                self.cache
+                    .borrow_mut()
+                    .update_account_owned(AccountAny::Margin(account))?;
+            } else {
+                self.cache
+                    .borrow_mut()
+                    .add_account(AccountAny::Margin(account))?;
+            }
+        }
         let endpoint = MessagingSwitchboard::portfolio_update_account();
         msgbus::send_account_state(endpoint, &state);
         Ok(())

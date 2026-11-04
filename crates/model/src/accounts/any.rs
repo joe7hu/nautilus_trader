@@ -308,7 +308,9 @@ mod tests {
             AccountAny::Margin(account) => {
                 account.set_default_leverage(Decimal::new(7, 0));
                 account.set_leverage(instrument_id, Decimal::new(3, 0));
-                account.set_margin_model(MarginModelAny::Standard(StandardMarginModel).into());
+                account
+                    .set_margin_model(MarginModelAny::Standard(StandardMarginModel).into())
+                    .unwrap();
             }
             AccountAny::Cash(account) => {
                 account.allow_borrowing = true;
@@ -459,6 +461,24 @@ mod tests {
         };
         assert_eq!(variant, expected_variant);
         assert_eq!(account.event_count(), 1);
+    }
+
+    #[rstest]
+    fn test_legacy_margin_serialization_and_reserves_are_unchanged() {
+        let original: serde_json::Value =
+            serde_json::from_str(include_str!("../../test_data/account_legacy_margin.json"))
+                .unwrap();
+        let mut account: AccountAny = serde_json::from_value(original.clone()).unwrap();
+        let AccountAny::Margin(margin) = &mut account else {
+            panic!("Margin account required")
+        };
+        assert!(margin.is_margin_model_ready());
+        assert_eq!(
+            margin.margin_accounting(),
+            crate::accounts::margin_model::MarginAccounting::Legacy
+        );
+        margin.recalculate_balance(crate::types::Currency::USD());
+        assert_eq!(serde_json::to_value(account).unwrap(), original);
     }
 
     fn invalid_wallet_state() -> AccountState {
