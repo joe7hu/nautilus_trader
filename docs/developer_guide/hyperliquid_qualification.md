@@ -21,7 +21,9 @@ a qualified trading fee schedule.
 Hyperliquid funding selects the full-precision positive oracle, with no mark or
 BBO fallback. Receipt-timed context predictions cannot become final hourly rates.
 Historical responses preserve their actual knowledge clock separately from venue
-event time; late history cannot impersonate timely settlement input. A final
+event time; late history cannot impersonate timely settlement input. A historical
+row timestamp does not establish the next funding boundary; that field stays
+unknown. A final
 rate, exact boundary, contemporaneous oracle and original position/account cut
 remain necessary. Public historical rates do not supply an oracle, and active
 asset context does not supply a venue boundary clock. These changes do not

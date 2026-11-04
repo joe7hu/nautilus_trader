@@ -167,6 +167,7 @@ fn assert_event_types(events: &[ExecutionEvent], expected: &[&str]) {
         .iter()
         .map(|e| match e {
             ExecutionEvent::FundingBoundary(_) => "FundingBoundary",
+            ExecutionEvent::SimulationBoundary(_) => "SimulationBoundary",
             ExecutionEvent::Order(OrderEventAny::Accepted(_)) => "Accepted",
             ExecutionEvent::Order(OrderEventAny::Canceled(_)) => "Canceled",
             ExecutionEvent::Order(OrderEventAny::Updated(_)) => "Updated",

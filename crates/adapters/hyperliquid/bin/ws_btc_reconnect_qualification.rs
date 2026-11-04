@@ -132,10 +132,21 @@ impl Qualification {
     }
 }
 
+#[derive(Clone, Copy)]
 struct SocketObservation {
     state: SocketState,
     callback_time: SystemTime,
     callback_elapsed: Duration,
+}
+
+#[derive(Serialize)]
+struct OutputRecord<'a> {
+    schema: &'static str,
+    sequence: u64,
+    kind: &'a str,
+    phase: Phase,
+    local_receipt_ns: String,
+    payload: Value,
 }
 
 struct Recorder {
@@ -154,14 +165,14 @@ impl Recorder {
         self.sequence += 1;
         serde_json::to_writer(
             &mut self.output,
-            &json!({
-                "schema": "hyperliquid_btc_reconnect_v1",
-                "sequence": self.sequence,
-                "kind": kind,
-                "phase": phase,
-                "local_receipt_ns": received.to_string(),
-                "payload": payload,
-            }),
+            &OutputRecord {
+                schema: "hyperliquid_btc_reconnect_v1",
+                sequence: self.sequence,
+                kind,
+                phase,
+                local_receipt_ns: received.to_string(),
+                payload,
+            },
         )?;
         self.output.write_all(b"\n")?;
         self.output.flush()?;

@@ -2316,8 +2316,6 @@ pub(crate) fn parse_book_precision_params(
     Ok((read_u32("n_sig_figs")?, read_u32("mantissa")?))
 }
 
-// Hyperliquid funds perpetuals hourly, so `interval` is fixed at 60 mins;
-// `time` from the venue marks the end of the funding interval in ms.
 pub(crate) fn funding_entry_to_update(
     entry: &HyperliquidFundingHistoryEntry,
     instrument_id: InstrumentId,
@@ -2329,7 +2327,7 @@ pub(crate) fn funding_entry_to_update(
         instrument_id,
         rate,
         Some(60),
-        Some(ts),
+        None,
         ts,
         ts_init,
     ))
@@ -2944,10 +2942,7 @@ mod tests {
         assert_eq!(update.instrument_id, instrument_id);
         assert_eq!(update.rate, dec!(0.0000125));
         assert_eq!(update.interval, Some(60));
-        assert_eq!(
-            update.next_funding_ns,
-            Some(UnixNanos::from(1_769_908_800_000_000_000))
-        );
+        assert_eq!(update.next_funding_ns, None);
         assert_eq!(update.ts_event, UnixNanos::from(1_769_908_800_000_000_000));
         assert_eq!(update.ts_init, UnixNanos::from(2_000_000_000_000_000_000));
     }
@@ -2987,7 +2982,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(update.ts_event.as_u64(), nanos);
-        assert_eq!(update.next_funding_ns, Some(update.ts_event));
+        assert_eq!(update.next_funding_ns, None);
         assert_eq!(update.ts_init, UnixNanos::from(2_000_000_000_000_000_000));
     }
 
