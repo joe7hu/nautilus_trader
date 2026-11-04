@@ -516,9 +516,7 @@ impl MarginAccount {
 
         // An untotalable margin set is venue-reported data, not a local invariant, so the
         // balance degrades to fully reserved rather than taking the trading node down.
-        let total_margin_raw = if !self.is_margin_model_ready() {
-            None
-        } else {
+        let total_margin_raw = if self.is_margin_model_ready() {
             self.margins_in(currency)
                 .try_fold(0, |raw: MoneyRaw, margin| {
                     let initial = raw.checked_add(margin.initial.raw())?;
@@ -527,6 +525,8 @@ impl MarginAccount {
                         MarginAccounting::CurrentMark => Some(initial),
                     }
                 })
+        } else {
+            None
         };
 
         let total_margin = total_margin_raw.map_or_else(

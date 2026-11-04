@@ -187,7 +187,7 @@ impl AccountsManager {
                     return self.update_current_mark_margin(
                         margin_account,
                         instrument,
-                        positions.iter().map(|p| &**p).collect(),
+                        &positions.iter().map(|p| &**p).collect::<Vec<_>>(),
                         orders_open,
                         ts_event,
                     );
@@ -256,7 +256,7 @@ impl AccountsManager {
             return self.update_current_mark_margin(
                 account,
                 instrument,
-                positions,
+                &positions,
                 &orders.iter().map(|o| &**o).collect::<Vec<_>>(),
                 ts_event,
             );
@@ -418,7 +418,7 @@ impl AccountsManager {
         &self,
         account: &mut MarginAccount,
         instrument: &InstrumentAny,
-        positions: Vec<&Position>,
+        positions: &[&Position],
         orders: &[&OrderAny],
         ts_event: UnixNanos,
     ) -> Option<AccountState> {
