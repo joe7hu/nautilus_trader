@@ -209,11 +209,25 @@ pub(crate) fn parse_perp_instruments_with_settlement(
 
         let raw_symbol: Ustr = asset.name.as_str().into();
 
+        let mut raw_data = serde_json::to_value(asset).unwrap_or_default();
+        if let Some(table) = asset.margin_table_id.and_then(|id| {
+            meta.margin_tables
+                .iter()
+                .find(|(key, _)| *key == id)
+                .map(|(_, table)| table)
+        }) {
+            raw_data["marginTable"] = serde_json::to_value(table).unwrap_or_default();
+        }
         let def = HyperliquidInstrumentDef {
             symbol: symbol.into(),
             raw_symbol,
             base: asset.name.clone().into(),
-            quote: "USD".into(),
+            quote: if asset_index_base == 0 && asset.name == "BTC" {
+                "USDT"
+            } else {
+                "USD"
+            }
+            .into(),
             settlement: Some(settlement_currency.into()),
             market_type: HyperliquidMarketType::Perp,
             asset_index: asset_index_base + index as u32,
@@ -226,7 +240,7 @@ pub(crate) fn parse_perp_instruments_with_settlement(
             is_hip3: asset_index_base > 0,
             active: !is_delisted,
             outcome: None,
-            raw_data: serde_json::to_string(asset).unwrap_or_default(),
+            raw_data: raw_data.to_string(),
         };
 
         defs.push(def);
@@ -834,7 +848,8 @@ pub fn create_instrument_from_def(
             } else {
                 get_currency(settlement_code)
             };
-            let min_notional = Some(min_order_notional(quote_currency)?);
+            let min_notional = Some(min_order_notional(settlement_currency)?);
+            let info = serde_json::from_str::<Params>(&def.raw_data).ok();
 
             Some(InstrumentAny::CryptoPerpetual(
                 CryptoPerpetual::builder()
@@ -849,7 +864,7 @@ pub fn create_instrument_from_def(
                     .price_increment(price_increment)
                     .size_increment(size_increment)
                     .maybe_min_notional(min_notional)
-                    .info(info_with_asset_index(None, def.asset_index))
+                    .info(info_with_asset_index(info, def.asset_index))
                     // Identical to ts_init for now
                     .ts_event(ts_init)
                     .ts_init(ts_init)
@@ -983,7 +998,7 @@ pub fn parse_order_status_report_from_basic(
     let filled_qty = Quantity::from_decimal_dp(filled_sz, size_precision)
         .map_err(|e| anyhow::anyhow!("Failed to create quantity from filled_sz: {e}"))?;
 
-    let ts_accepted = UnixNanos::from(order.timestamp * 1_000_000);
+    let ts_accepted = millis_to_nanos(order.timestamp)?;
     let ts_last = ts_accepted;
     let report_id = UUID4::new();
 
@@ -1214,7 +1229,7 @@ pub fn parse_fill_report(
         LiquiditySide::Maker
     };
 
-    let ts_event = UnixNanos::from(fill.time * 1_000_000);
+    let ts_event = millis_to_nanos(fill.time)?;
     let report_id = UUID4::new();
 
     let report = FillReport::new(
@@ -1378,7 +1393,7 @@ mod tests {
         let btc = &defs[0];
         assert_eq!(btc.symbol, "BTC-USD-PERP");
         assert_eq!(btc.base, "BTC");
-        assert_eq!(btc.quote, "USD");
+        assert_eq!(btc.quote, "USDT");
         assert_eq!(btc.settlement.as_ref().unwrap(), "USDC");
         assert_eq!(btc.market_type, HyperliquidMarketType::Perp);
         assert_eq!(btc.price_decimals, 1); // 6 - 5 = 1
@@ -1410,7 +1425,7 @@ mod tests {
         let btc = &defs[0];
         assert_eq!(btc.symbol, "BTC-USD-PERP");
         assert_eq!(btc.base, "BTC");
-        assert_eq!(btc.quote, "USD");
+        assert_eq!(btc.quote, "USDT");
         assert_eq!(btc.settlement.as_ref().unwrap(), "USDC");
         assert_eq!(btc.market_type, HyperliquidMarketType::Perp);
         assert_eq!(btc.size_decimals, 5);
@@ -1483,7 +1498,7 @@ mod tests {
         match instrument {
             InstrumentAny::CryptoPerpetual(perp) => {
                 let min_notional = perp.min_notional.unwrap();
-                assert_eq!(min_notional.currency, Currency::USD());
+                assert_eq!(min_notional.currency, Currency::USDC());
                 assert_eq!(min_notional.as_decimal(), dec!(10));
                 assert_eq!(perp.settlement_currency.code, "USDC");
             }
@@ -1602,7 +1617,7 @@ mod tests {
 
         match instrument {
             InstrumentAny::CryptoPerpetual(perp) => {
-                assert_eq!(perp.quote_currency.code, "USD");
+                assert_eq!(perp.quote_currency.code, "USDT");
                 assert_eq!(perp.settlement_currency.code, "USDC");
             }
             other => panic!("Expected CryptoPerpetual, was {other:?}"),
@@ -1881,6 +1896,7 @@ mod tests {
                     is_delisted: None,
                     growth_mode: Some("enabled".to_string()),
                     margin_mode: Some("strictIsolated".to_string()),
+                    margin_table_id: None,
                 },
                 PerpAsset {
                     name: "xyz:NVDA".to_string(),
@@ -1890,6 +1906,7 @@ mod tests {
                     is_delisted: None,
                     growth_mode: None,
                     margin_mode: None,
+                    margin_table_id: None,
                 },
             ],
             margin_tables: vec![],
@@ -1981,6 +1998,7 @@ mod tests {
                 is_delisted: None,
                 growth_mode: None,
                 margin_mode: None,
+                margin_table_id: None,
             }],
             margin_tables: vec![],
             collateral_token: None,

@@ -170,6 +170,219 @@ fn test_deny_order_on_price_precision_exceeded(
     matches!(saved_events[0], OrderEventAny::Denied(_));
 }
 
+fn cross_stable_perpetual() -> CryptoPerpetual {
+    CryptoPerpetual::builder()
+        .instrument_id(InstrumentId::from("BTC-USDT-PERP.HYPERLIQUID"))
+        .raw_symbol(Symbol::from("BTC"))
+        .base_currency(Currency::BTC())
+        .quote_currency(Currency::USDT())
+        .settlement_currency(Currency::USDC())
+        .is_inverse(false)
+        .price_precision(1)
+        .size_precision(5)
+        .price_increment(Price::from("0.1"))
+        .size_increment(Quantity::from("0.00001"))
+        .min_notional(Money::from("10 USDC"))
+        .margin_init(dec!(0.1))
+        .ts_event(UnixNanos::default())
+        .ts_init(UnixNanos::default())
+        .build()
+        .unwrap()
+}
+
+fn submit_notional_limit_order(
+    instrument: &InstrumentAny,
+    quantity: Quantity,
+    price: Price,
+    max_notional: Option<Decimal>,
+) -> (Vec<OrderEventAny>, Vec<TradingCommand>) {
+    let process_handler = process_order_event_handler();
+    let execute_handler = execute_order_event_handler();
+    let account_type = if matches!(instrument, InstrumentAny::CurrencyPair(_)) {
+        AccountType::Cash
+    } else {
+        AccountType::Margin
+    };
+    let balance_currency = instrument.cost_currency();
+    let free = Money::from_decimal(dec!(100_000), balance_currency).unwrap();
+    let state = AccountState::new(
+        AccountId::new(format!("{}-001", instrument.id().venue)),
+        account_type,
+        vec![AccountBalance::new(
+            free,
+            Money::zero(balance_currency),
+            free,
+        )],
+        vec![],
+        true,
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        Some(balance_currency),
+    );
+    let account = if account_type == AccountType::Cash {
+        AccountAny::Cash(CashAccount::new(state, true, false))
+    } else {
+        AccountAny::Margin(MarginAccount::new(state, true))
+    };
+    let mut cache = Cache::default();
+    cache.add_instrument(instrument.clone()).unwrap();
+    cache.add_account(account).unwrap();
+    let mut risk_engine = get_risk_engine(Some(Rc::new(RefCell::new(cache))), None, None, false);
+
+    if let Some(max_notional) = max_notional {
+        risk_engine.set_max_notional_per_order(instrument.id(), max_notional);
+    }
+
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(quantity)
+        .price(price)
+        .build();
+    let client_id = ClientId::from(instrument.id().venue.as_str());
+    risk_engine
+        .cache()
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(client_id), false)
+        .unwrap();
+
+    let command = SubmitOrder::new(
+        order.trader_id(),
+        Some(client_id),
+        order.strategy_id(),
+        instrument.id(),
+        order.client_order_id(),
+        order.init_event().clone(),
+        None,
+        None,
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+    );
+    risk_engine.execute(TradingCommand::SubmitOrder(command));
+
+    (
+        get_process_order_event_handler_messages(&process_handler),
+        get_execute_order_event_handler_messages(&execute_handler),
+    )
+}
+
+#[rstest]
+#[case::cross_stable_cap_exceeded(
+    InstrumentAny::CryptoPerpetual(cross_stable_perpetual()),
+    "0.00025", "60001.0", "15.00025000 USDC", dec!(10), true,
+)]
+#[case::cross_stable_below_cap(
+    InstrumentAny::CryptoPerpetual(cross_stable_perpetual()),
+    "0.00025", "60001.0", "15.00025000 USDC", dec!(20), false,
+)]
+#[case::cash_cap_exceeded(
+    InstrumentAny::CurrencyPair(currency_pair_btcusdt()),
+    "0.001000", "60000.00", "60 USDT", dec!(50), true,
+)]
+#[case::cash_below_cap(
+    InstrumentAny::CurrencyPair(currency_pair_btcusdt()),
+    "0.001000", "60000.00", "60 USDT", dec!(100), false,
+)]
+#[case::inverse_cap_exceeded(
+    InstrumentAny::CryptoPerpetual(xbtusd_bitmex()),
+    "100", "60000.0", "100 USD", dec!(50), true,
+)]
+#[case::inverse_below_cap(
+    InstrumentAny::CryptoPerpetual(xbtusd_bitmex()),
+    "100", "60000.0", "100 USD", dec!(200), false,
+)]
+fn test_submit_order_configured_notional_cap_uses_risk_currency(
+    #[case] instrument: InstrumentAny,
+    #[case] quantity: &str,
+    #[case] price: &str,
+    #[case] expected_notional: &str,
+    #[case] cap: Decimal,
+    #[case] should_deny: bool,
+) {
+    let quantity = Quantity::from(quantity);
+    let price = Price::from(price);
+    let expected_notional = Money::from(expected_notional);
+    let notional = instrument.calculate_notional_value(quantity, price, Some(true));
+    let (process_messages, execute_messages) =
+        submit_notional_limit_order(&instrument, quantity, price, Some(cap));
+
+    assert_eq!(notional, expected_notional);
+    assert_eq!(execute_messages.len(), usize::from(!should_deny));
+
+    if should_deny {
+        let expected_reason = OrderDeniedReason::NotionalExceedsMaxPerOrder {
+            max_notional: Money::from_decimal(cap, expected_notional.currency).unwrap(),
+            notional: expected_notional,
+        };
+        assert_eq!(process_messages.len(), 1);
+        assert_eq!(process_messages[0].event_type(), OrderEventType::Denied);
+        assert_eq!(
+            process_messages[0].message(),
+            Some(Ustr::from(&expected_reason.to_string()))
+        );
+    } else {
+        assert!(process_messages.is_empty());
+    }
+}
+
+#[rstest]
+fn test_submit_order_cross_stable_minimum_notional_uses_settlement_currency() {
+    let instrument = InstrumentAny::CryptoPerpetual(cross_stable_perpetual());
+    let quantity = Quantity::from("0.00010");
+    let price = Price::from("60001.0");
+    let notional = instrument.calculate_notional_value(quantity, price, Some(true));
+    let (process_messages, execute_messages) =
+        submit_notional_limit_order(&instrument, quantity, price, Some(dec!(20)));
+    let expected_reason = OrderDeniedReason::NotionalBelowMinimum {
+        min_notional: Money::from("10 USDC"),
+        notional: Money::from("6.00010000 USDC"),
+    };
+
+    assert_eq!(notional, Money::from("6.00010000 USDC"));
+    assert!(execute_messages.is_empty());
+    assert_eq!(process_messages.len(), 1);
+    assert_eq!(process_messages[0].event_type(), OrderEventType::Denied);
+    assert_eq!(
+        process_messages[0].message(),
+        Some(Ustr::from(&expected_reason.to_string()))
+    );
+}
+
+#[rstest]
+#[case::minimum(true)]
+#[case::maximum(false)]
+fn test_submit_order_mismatched_notional_limit_currency_denies(#[case] minimum: bool) {
+    let mut instrument = cross_stable_perpetual();
+
+    if minimum {
+        instrument.min_notional = Some(Money::from("1 USDT"));
+    } else {
+        instrument.max_notional = Some(Money::from("100 USDT"));
+    }
+
+    let (process_messages, execute_messages) = submit_notional_limit_order(
+        &InstrumentAny::CryptoPerpetual(instrument),
+        Quantity::from("0.00025"),
+        Price::from("60001.0"),
+        None,
+    );
+    let limit = if minimum { "minimum" } else { "maximum" };
+    let expected_reason = OrderDeniedReason::NotionalCalculationFailed {
+        detail: format!("{limit} notional currency USDT differs from order notional currency USDC"),
+    };
+
+    assert!(execute_messages.is_empty());
+    assert_eq!(process_messages.len(), 1);
+    assert_eq!(process_messages[0].event_type(), OrderEventType::Denied);
+    assert_eq!(
+        process_messages[0].message(),
+        Some(Ustr::from(&expected_reason.to_string()))
+    );
+}
+
 #[rstest]
 fn test_deny_order_exceeding_max_notional(
     strategy_id_ema_cross: StrategyId,

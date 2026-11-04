@@ -59,12 +59,12 @@
 //! Hyperliquid uses **mark price** for all trigger evaluations (TP/SL orders).
 
 use anyhow::Context;
-use nautilus_core::UnixNanos;
 pub use nautilus_core::serialization::{
     deserialize_decimal_from_str, deserialize_optional_decimal_from_str,
     deserialize_vec_decimal_from_str, serialize_decimal_as_str, serialize_optional_decimal_as_str,
     serialize_vec_decimal_as_str,
 };
+use nautilus_core::{UnixNanos, datetime::NANOSECONDS_IN_MILLISECOND};
 use nautilus_model::{
     data::{bar::BarType, quote::QuoteTick},
     enums::{
@@ -285,7 +285,9 @@ pub fn normalize_order(
 /// Converts millisecond timestamp to [`UnixNanos`].
 #[inline]
 pub fn millis_to_nanos(millis: u64) -> anyhow::Result<UnixNanos> {
-    let value = nautilus_core::datetime::millis_to_nanos(millis as f64)?;
+    let value = millis
+        .checked_mul(NANOSECONDS_IN_MILLISECOND)
+        .with_context(|| format!("millisecond timestamp {millis} overflows nanoseconds"))?;
     Ok(UnixNanos::from(value))
 }
 
@@ -1161,6 +1163,22 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
+
+    #[rstest]
+    #[case(0, 0)]
+    #[case(1, 1_000_000)]
+    #[case(1_793_761_380_771, 1_793_761_380_771_000_000)]
+    #[case(u64::MAX / 1_000_000, 18_446_744_073_709_000_000)]
+    fn test_millis_to_nanos_exact(#[case] millis: u64, #[case] expected: u64) {
+        assert_eq!(millis_to_nanos(millis).unwrap().as_u64(), expected);
+    }
+
+    #[rstest]
+    #[case(u64::MAX / 1_000_000 + 1)]
+    #[case(u64::MAX)]
+    fn test_millis_to_nanos_rejects_overflow(#[case] millis: u64) {
+        assert!(millis_to_nanos(millis).is_err());
+    }
 
     #[rstest]
     fn test_make_fill_trade_id_is_stable() {

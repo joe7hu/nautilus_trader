@@ -164,6 +164,8 @@ pub struct PerpAsset {
     /// Maximum leverage allowed for this asset.
     #[serde(default)]
     pub max_leverage: Option<u32>,
+    #[serde(default)]
+    pub margin_table_id: Option<u32>,
     /// Whether this asset requires isolated margin only.
     #[serde(default)]
     pub only_isolated: Option<bool>,

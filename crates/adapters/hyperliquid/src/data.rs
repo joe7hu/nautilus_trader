@@ -1508,10 +1508,11 @@ impl DataClient for HyperliquidDataClient {
                 .await
                 .with_context(|| format!("funding rates request failed for {instrument_id}"))?;
 
+            let received_ns = clock.get_time_ns();
             let mut funding_rates: Vec<FundingRateUpdate> = entries
                 .iter()
-                .map(|entry| funding_entry_to_update(entry, instrument_id))
-                .collect();
+                .map(|entry| funding_entry_to_update(entry, instrument_id, received_ns))
+                .collect::<anyhow::Result<_>>()?;
 
             if let Some(limit) = limit
                 && funding_rates.len() > limit
@@ -1575,7 +1576,7 @@ impl DataClient for HyperliquidDataClient {
                 price_precision,
                 size_precision,
                 depth,
-            );
+            )?;
 
             let response = DataResponse::Book(BookResponse::new(
                 request_id,
@@ -2229,9 +2230,9 @@ pub(crate) fn parse_l2_book_snapshot(
     price_precision: u8,
     size_precision: u8,
     depth: Option<usize>,
-) -> OrderBook {
+) -> anyhow::Result<OrderBook> {
+    let ts_event = millis_to_nanos(l2_book.time)?;
     let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
-    let ts_event = UnixNanos::from(l2_book.time * 1_000_000);
 
     let all_bids = l2_book
         .levels
@@ -2289,7 +2290,7 @@ pub(crate) fn parse_l2_book_snapshot(
         asks.len(),
     );
 
-    book
+    Ok(book)
 }
 
 // Reads optional `nSigFigs` / `mantissa` L2 precision controls from
@@ -2315,15 +2316,21 @@ pub(crate) fn parse_book_precision_params(
     Ok((read_u32("n_sig_figs")?, read_u32("mantissa")?))
 }
 
-// Hyperliquid funds perpetuals hourly, so `interval` is fixed at 60 mins;
-// `time` from the venue marks the end of the funding interval in ms.
 pub(crate) fn funding_entry_to_update(
     entry: &HyperliquidFundingHistoryEntry,
     instrument_id: InstrumentId,
-) -> FundingRateUpdate {
+    ts_init: UnixNanos,
+) -> anyhow::Result<FundingRateUpdate> {
     let rate = entry.funding_rate;
-    let ts = UnixNanos::from(entry.time * 1_000_000);
-    FundingRateUpdate::new(instrument_id, rate, Some(60), None, ts, ts)
+    let ts = millis_to_nanos(entry.time)?;
+    Ok(FundingRateUpdate::new(
+        instrument_id,
+        rate,
+        Some(60),
+        None,
+        ts,
+        ts_init,
+    ))
 }
 
 pub(crate) fn candle_to_bar(
@@ -2925,14 +2932,19 @@ mod tests {
         };
         let instrument_id = btc_perp_id();
 
-        let update = funding_entry_to_update(&entry, instrument_id);
+        let update = funding_entry_to_update(
+            &entry,
+            instrument_id,
+            UnixNanos::from(2_000_000_000_000_000_000),
+        )
+        .unwrap();
 
         assert_eq!(update.instrument_id, instrument_id);
         assert_eq!(update.rate, dec!(0.0000125));
         assert_eq!(update.interval, Some(60));
-        assert!(update.next_funding_ns.is_none());
-        assert_eq!(update.ts_event, UnixNanos::from(1769908800000 * 1_000_000));
-        assert_eq!(update.ts_init, update.ts_event);
+        assert_eq!(update.next_funding_ns, None);
+        assert_eq!(update.ts_event, UnixNanos::from(1_769_908_800_000_000_000));
+        assert_eq!(update.ts_init, UnixNanos::from(2_000_000_000_000_000_000));
     }
 
     #[rstest]
@@ -2943,8 +2955,56 @@ mod tests {
             premium: None,
             time: 1769912400000,
         };
-        let update = funding_entry_to_update(&entry, btc_perp_id());
+        let update = funding_entry_to_update(
+            &entry,
+            btc_perp_id(),
+            UnixNanos::from(2_000_000_000_000_000_000),
+        )
+        .unwrap();
         assert_eq!(update.rate, dec!(-0.0000081));
+    }
+
+    #[rstest]
+    #[case(1_793_761_380_771, 1_793_761_380_771_000_000)]
+    #[case(u64::MAX / 1_000_000, 18_446_744_073_709_000_000)]
+    fn test_funding_entry_to_update_exact_timestamp(#[case] millis: u64, #[case] nanos: u64) {
+        let entry = HyperliquidFundingHistoryEntry {
+            coin: Ustr::from("BTC"),
+            funding_rate: dec!(0.0000125),
+            premium: None,
+            time: millis,
+        };
+        let update = funding_entry_to_update(
+            &entry,
+            btc_perp_id(),
+            UnixNanos::from(2_000_000_000_000_000_000),
+        )
+        .unwrap();
+
+        assert_eq!(update.ts_event.as_u64(), nanos);
+        assert_eq!(update.next_funding_ns, None);
+        assert_eq!(update.ts_init, UnixNanos::from(2_000_000_000_000_000_000));
+    }
+
+    #[rstest]
+    #[case(u64::MAX / 1_000_000 + 1)]
+    #[case(u64::MAX)]
+    fn test_funding_entry_to_update_rejects_timestamp_overflow(#[case] millis: u64) {
+        let entry = HyperliquidFundingHistoryEntry {
+            coin: Ustr::from("BTC"),
+            funding_rate: dec!(0.0000125),
+            premium: None,
+            time: millis,
+        };
+
+        assert!(
+            funding_entry_to_update(
+                &entry,
+                btc_perp_id(),
+                UnixNanos::from(2_000_000_000_000_000_000)
+            )
+            .is_err()
+        );
     }
 
     #[rstest]
@@ -3001,8 +3061,15 @@ mod tests {
 
         let updates: Vec<FundingRateUpdate> = entries
             .iter()
-            .map(|e| funding_entry_to_update(e, btc_perp_id()))
-            .collect();
+            .map(|e| {
+                funding_entry_to_update(
+                    e,
+                    btc_perp_id(),
+                    UnixNanos::from(2_000_000_000_000_000_000),
+                )
+            })
+            .collect::<anyhow::Result<_>>()
+            .unwrap();
         assert_eq!(updates.len(), 3);
         assert_eq!(updates[0].rate, dec!(0.0000125));
         assert_eq!(updates[1].rate, dec!(-0.0000081));
@@ -3039,7 +3106,7 @@ mod tests {
     fn test_parse_l2_book_snapshot_populates_both_sides() {
         let book_data = sample_l2_book();
         let instrument_id = btc_perp_id();
-        let book = parse_l2_book_snapshot(&book_data, instrument_id, 2, 4, None);
+        let book = parse_l2_book_snapshot(&book_data, instrument_id, 2, 4, None).unwrap();
 
         assert_eq!(book.instrument_id, instrument_id);
         assert_eq!(book.book_type, BookType::L2_MBP);
@@ -3053,7 +3120,7 @@ mod tests {
     #[rstest]
     fn test_parse_l2_book_snapshot_truncates_to_depth() {
         let book_data = sample_l2_book();
-        let book = parse_l2_book_snapshot(&book_data, btc_perp_id(), 2, 4, Some(1));
+        let book = parse_l2_book_snapshot(&book_data, btc_perp_id(), 2, 4, Some(1)).unwrap();
 
         // depth=1 keeps the top of book on each side, drops the rest.
         assert_eq!(book.update_count, 2);
@@ -3064,12 +3131,33 @@ mod tests {
     #[rstest]
     fn test_parse_l2_book_snapshot_uses_venue_time_as_ts_event() {
         let book_data = sample_l2_book();
-        let book = parse_l2_book_snapshot(&book_data, btc_perp_id(), 2, 4, None);
+        let book = parse_l2_book_snapshot(&book_data, btc_perp_id(), 2, 4, None).unwrap();
         let expected_ts = UnixNanos::from(1769908800000_u64 * 1_000_000);
 
         // ts_last reflects the last applied delta; every added order
         // carries the venue time after the ms->ns conversion.
         assert_eq!(book.ts_last, expected_ts);
+    }
+
+    #[rstest]
+    #[case(1_793_761_380_771, 1_793_761_380_771_000_000)]
+    #[case(u64::MAX / 1_000_000, 18_446_744_073_709_000_000)]
+    fn test_parse_l2_book_snapshot_exact_timestamp(#[case] millis: u64, #[case] nanos: u64) {
+        let mut book_data = sample_l2_book();
+        book_data.time = millis;
+        let book = parse_l2_book_snapshot(&book_data, btc_perp_id(), 2, 4, None).unwrap();
+
+        assert_eq!(book.ts_last.as_u64(), nanos);
+    }
+
+    #[rstest]
+    #[case(u64::MAX / 1_000_000 + 1)]
+    #[case(u64::MAX)]
+    fn test_parse_l2_book_snapshot_rejects_timestamp_overflow(#[case] millis: u64) {
+        let mut book_data = sample_l2_book();
+        book_data.time = millis;
+
+        assert!(parse_l2_book_snapshot(&book_data, btc_perp_id(), 2, 4, None).is_err());
     }
 
     #[rstest]
@@ -3082,7 +3170,7 @@ mod tests {
             ],
             time: 1769908800000,
         };
-        let book = parse_l2_book_snapshot(&book_data, btc_perp_id(), 2, 4, None);
+        let book = parse_l2_book_snapshot(&book_data, btc_perp_id(), 2, 4, None).unwrap();
 
         assert_eq!(book.update_count, 2, "zero-sized levels must be skipped");
         assert_eq!(book.best_bid_price(), Some(Price::new(98450.50, 2)));
@@ -3099,7 +3187,7 @@ mod tests {
             ],
             time: 1769908800000,
         };
-        let book = parse_l2_book_snapshot(&book_data, btc_perp_id(), 2, 4, None);
+        let book = parse_l2_book_snapshot(&book_data, btc_perp_id(), 2, 4, None).unwrap();
 
         // Zero-size levels are skipped; one priced level remains per side.
         assert_eq!(book.update_count, 2);
@@ -3114,7 +3202,7 @@ mod tests {
             levels: vec![],
             time: 1769908800000,
         };
-        let book = parse_l2_book_snapshot(&book_data, btc_perp_id(), 2, 4, None);
+        let book = parse_l2_book_snapshot(&book_data, btc_perp_id(), 2, 4, None).unwrap();
 
         assert_eq!(book.update_count, 0);
         assert!(book.best_bid_price().is_none());

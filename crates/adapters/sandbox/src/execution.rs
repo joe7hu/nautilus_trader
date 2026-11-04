@@ -1928,18 +1928,25 @@ impl SandboxFunding {
             let cache = this.cache.borrow();
             due.into_iter()
                 .map(|(boundary, instrument)| {
-                    let price = cache
-                        .mark_price(&instrument)
-                        .copied()
-                        .map(FundingPriceCut::Mark)
-                        .or_else(|| {
-                            let engine = this.matching_engines.get(&instrument)?;
-                            Some(FundingPriceCut::Midpoint {
-                                bid: engine.best_bid_price()?,
-                                ask: engine.best_ask_price()?,
-                                observed_ns: now,
+                    let price = if instrument.venue.as_str() == "HYPERLIQUID" {
+                        cache
+                            .index_price(&instrument)
+                            .copied()
+                            .map(FundingPriceCut::Index)
+                    } else {
+                        cache
+                            .mark_price(&instrument)
+                            .copied()
+                            .map(FundingPriceCut::Mark)
+                            .or_else(|| {
+                                let engine = this.matching_engines.get(&instrument)?;
+                                Some(FundingPriceCut::Midpoint {
+                                    bid: engine.best_bid_price()?,
+                                    ask: engine.best_ask_price()?,
+                                    observed_ns: now,
+                                })
                             })
-                        });
+                    };
                     (boundary, instrument, price)
                 })
                 .collect()

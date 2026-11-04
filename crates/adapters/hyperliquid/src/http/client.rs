@@ -74,7 +74,8 @@ use crate::{
         parse::{
             bar_type_to_interval, cache_alias_for_symbol, clamp_price_to_precision,
             derive_limit_from_trigger, determine_order_list_grouping, extract_inner_error,
-            normalize_or_validate_wire_price, order_to_hyperliquid_request_with_optional_decimals,
+            millis_to_nanos, normalize_or_validate_wire_price,
+            order_to_hyperliquid_request_with_optional_decimals,
             parse_combined_account_balances_and_margins, parse_spot_account_balances,
             parse_trigger_order_type, round_to_sig_figs, time_in_force_to_hyperliquid_tif,
         },
@@ -2451,8 +2452,17 @@ impl HyperliquidHttpClient {
             ) {
                 Ok(mut report) => {
                     report.order_type = historical_order_type;
-                    report.ts_last = UnixNanos::from(entry.status_timestamp * 1_000_000);
-                    reports.push(report);
+
+                    match millis_to_nanos(entry.status_timestamp) {
+                        Ok(ts_last) => {
+                            report.ts_last = ts_last;
+                            reports.push(report);
+                        }
+                        Err(e) => {
+                            log::error!("Failed to parse historical order status timestamp: {e}");
+                            complete = false;
+                        }
+                    }
                 }
                 Err(e) => {
                     log::error!("Failed to parse historical order status report: {e}");
@@ -2596,7 +2606,11 @@ impl HyperliquidHttpClient {
         // Use status_timestamp for ts_last when available (more accurate
         // than the order creation timestamp for filled/canceled orders)
         if entry.status_timestamp > 0 {
-            report.ts_last = UnixNanos::from(entry.status_timestamp * 1_000_000);
+            report.ts_last = millis_to_nanos(entry.status_timestamp).map_err(|e| {
+                Error::bad_request(format!(
+                    "Failed to parse order status timestamp for oid {oid}: {e}"
+                ))
+            })?;
         }
 
         Ok(Some(report))
