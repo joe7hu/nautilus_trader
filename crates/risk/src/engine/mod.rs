@@ -43,10 +43,10 @@ use nautilus_execution::trailing::{
     trailing_stop_calculate_with_bid_ask, trailing_stop_calculate_with_last,
 };
 use nautilus_model::{
-    accounts::{Account, AccountAny},
+    accounts::{Account, AccountAny, margin_model::MarginAccounting},
     enums::{
-        AggregationSource, OrderSide, OrderStatus, OrderType, PositionSide, PriceType, TimeInForce,
-        TradingState, TrailingOffsetType, TriggerType,
+        AggregationSource, LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSide,
+        PriceType, TimeInForce, TradingState, TrailingOffsetType, TriggerType,
     },
     events::{
         OrderDenied, OrderDeniedReason, OrderEventAny, OrderModifyRejected, OrderPriceField,
@@ -1238,6 +1238,137 @@ impl RiskEngine {
             return true;
         };
 
+        let deny_margin = |detail: &str| {
+            let reason = OrderDeniedReason::InitialMarginCalculationFailed {
+                detail: detail.to_owned(),
+            }
+            .to_string();
+
+            for order in orders {
+                self.deny_order(order, &reason);
+            }
+        };
+        let current_mark =
+            if let AccountAny::Margin(margin) = &account {
+                if !margin.is_margin_model_ready() {
+                    deny_margin("Pinned margin model is not installed");
+                    return false;
+                }
+
+                if margin.margin_accounting() == MarginAccounting::CurrentMark {
+                    if orders.len() != 1
+                        || orders.iter().any(|order| {
+                            order.order_type() != OrderType::Limit
+                                || order.time_in_force() != TimeInForce::Ioc
+                                || order.is_quote_quantity()
+                        })
+                    {
+                        deny_margin(
+                            "Current-mark admission supports base-quantity limit IOC orders only",
+                        );
+                        return false;
+                    }
+                    let currency = instrument.cost_currency();
+                    if margin.base_currency.is_some_and(|base| {
+                        base != currency || base.precision != currency.precision
+                    }) || margin
+                        .balance(Some(currency))
+                        .is_none_or(|balance| balance.currency.precision != currency.precision)
+                    {
+                        deny_margin("Current-mark margin requires matching collateral without FX");
+                        return false;
+                    }
+                    let now = self.clock.borrow().timestamp_ns();
+                    let mark = self.cache.borrow().mark_price(&instrument.id()).copied();
+                    let Some(mark) = mark.filter(|mark| {
+                        mark.value.as_decimal() > Decimal::ZERO
+                            && mark.ts_event <= now
+                            && mark.ts_init <= now
+                    }) else {
+                        deny_margin("Positive, contemporaneously known mark required");
+                        return false;
+                    };
+
+                    if orders.iter().any(|order| {
+                        !order.is_reduce_only()
+                            && !full_position_exit
+                            && order.price().is_none_or(|limit| {
+                                (order.is_buy() && limit > mark.value)
+                                    || (order.is_sell() && limit < mark.value)
+                            })
+                    }) {
+                        deny_margin("Current-mark opening limit is worse than the mark");
+                        return false;
+                    }
+
+                    if orders.iter().any(|order| order.is_reduce_only()) {
+                        let cache = self.cache.borrow();
+                        let positions = cache.positions_open(
+                            None,
+                            Some(&instrument.id()),
+                            None,
+                            Some(&account.id()),
+                            None,
+                        );
+                        let net = positions.iter().try_fold(Decimal::ZERO, |net, position| {
+                            net.checked_add(position.signed_decimal_qty())
+                        });
+                        let reducing = net.is_some_and(|net| {
+                            orders.iter().all(|order| {
+                                !order.is_quote_quantity()
+                                    && order.quantity().as_decimal() <= net.abs()
+                                    && ((net > Decimal::ZERO && order.is_sell())
+                                        || (net < Decimal::ZERO && order.is_buy()))
+                            })
+                        });
+                        drop(positions);
+                        if !reducing {
+                            drop(cache);
+                            deny_margin("Current-mark exit does not reduce the existing position");
+                            return false;
+                        }
+                    }
+                    let opening_orders = orders
+                        .iter()
+                        .filter(|order| !order.is_reduce_only() && !full_position_exit)
+                        .count();
+
+                    if opening_orders > 0 {
+                        let cache = self.cache.borrow();
+                        let has_position = !cache
+                            .positions_open(None, None, None, Some(&account.id()), None)
+                            .is_empty();
+                        let has_other_opening = cache
+                            .orders(None, None, None, None, None)
+                            .iter()
+                            .any(|pending| {
+                                (pending.account_id() == Some(account.id())
+                                    || (pending.account_id().is_none()
+                                        && pending.instrument_id().venue == instrument.id().venue))
+                                    && !pending.is_closed()
+                                    && !pending.is_reduce_only()
+                                    && !pending.leaves_qty().is_zero()
+                                    && !orders.iter().any(|order| {
+                                        order.client_order_id() == pending.client_order_id()
+                                    })
+                            });
+
+                        if opening_orders > 1 || has_position || has_other_opening {
+                            drop(cache);
+                            deny_margin(
+                                "Additional current-mark cross-margin openings are unqualified",
+                            );
+                            return false;
+                        }
+                    }
+                    Some(mark.value)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
         let is_margin = matches!(account, AccountAny::Margin(_));
         let is_betting = matches!(account, AccountAny::Betting(_));
         let is_wallet = matches!(account, AccountAny::Wallet(_));
@@ -1676,12 +1807,15 @@ impl RiskEngine {
             }
 
             if is_margin {
+                if current_mark.is_some() && (order.is_reduce_only() || full_position_exit) {
+                    continue;
+                }
                 // Margin account: check initial margin requirement
                 let margin_req = match &mut account {
                     AccountAny::Margin(margin) => match margin.calculate_initial_margin(
                         instrument,
                         effective_quantity,
-                        last_px,
+                        current_mark.unwrap_or(last_px),
                         None,
                     ) {
                         Ok(margin) => margin,
@@ -1740,6 +1874,47 @@ impl RiskEngine {
                     }
                     continue;
                 };
+
+                if let Some(mark) = current_mark {
+                    let fee_price = mark.max(last_px);
+                    let fees = (
+                        account.calculate_commission(
+                            instrument,
+                            effective_quantity,
+                            fee_price,
+                            LiquiditySide::Maker,
+                            None,
+                        ),
+                        account.calculate_commission(
+                            instrument,
+                            effective_quantity,
+                            fee_price,
+                            LiquiditySide::Taker,
+                            None,
+                        ),
+                    );
+                    let required = match fees {
+                        (Ok(maker), Ok(taker))
+                            if maker.currency == margin_req.currency
+                                && taker.currency == margin_req.currency =>
+                        {
+                            margin_req
+                                .checked_add(maker.max(taker).max(Money::zero(margin_req.currency)))
+                        }
+                        _ => None,
+                    };
+                    let Some(required) = required else {
+                        deny_margin("Initial margin and commission budget cannot be calculated");
+                        return false;
+                    };
+
+                    if required > margin_free_val {
+                        deny_margin(&format!(
+                            "Initial margin and commission budget {required} exceeds free collateral {margin_free_val}"
+                        ));
+                        return false;
+                    }
+                }
 
                 // Per-order margin check
                 if margin_req > margin_free_val {

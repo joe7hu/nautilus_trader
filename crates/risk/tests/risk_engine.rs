@@ -45,7 +45,9 @@ use nautilus_core::{DurationNanos, Params, UUID4, UnixNanos};
 use nautilus_execution::engine::{ExecutionEngine, config::ExecutionEngineConfig};
 use nautilus_model::{
     accounts::{
-        AccountAny, BettingAccount, CashAccount, MarginAccount, WalletAccount, stubs::cash_account,
+        AccountAny, BettingAccount, CashAccount, MarginAccount, WalletAccount,
+        margin_model::{MarginAccounting, MarginModel},
+        stubs::cash_account,
     },
     data::{
         Bar, BarSpecification, BarType, QuoteTick, TradeTick,
@@ -10571,4 +10573,241 @@ fn test_spot_notional_fields_ignore_metadata(
         };
         assert_eq!(command.client_order_id, order.client_order_id());
     }
+}
+
+#[derive(Debug)]
+struct CurrentMarkMarginModel;
+
+impl MarginModel for CurrentMarkMarginModel {
+    fn name(&self) -> &'static str {
+        "current_mark_test"
+    }
+
+    fn accounting(&self) -> MarginAccounting {
+        MarginAccounting::CurrentMark
+    }
+
+    fn calculate_initial_margin(
+        &self,
+        instrument: &dyn Instrument,
+        quantity: Quantity,
+        price: Price,
+        leverage: Decimal,
+        inverse: Option<bool>,
+    ) -> anyhow::Result<Money> {
+        let notional = instrument.try_calculate_notional_value(quantity, price, inverse)?;
+        Money::from_decimal(notional.as_decimal() / leverage, notional.currency).map_err(Into::into)
+    }
+
+    fn calculate_maintenance_margin(
+        &self,
+        instrument: &dyn Instrument,
+        quantity: Quantity,
+        price: Price,
+        _leverage: Decimal,
+        inverse: Option<bool>,
+    ) -> anyhow::Result<Money> {
+        let notional = instrument.try_calculate_notional_value(quantity, price, inverse)?;
+        Money::from_decimal(notional.as_decimal() / dec!(80), notional.currency).map_err(Into::into)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ExistingExposure {
+    None,
+    Position,
+    SubmittedOrder,
+    InitializedOrder,
+    RestingOpening,
+    AdverseOpening,
+    QuoteOpening,
+}
+
+#[rstest]
+#[case::restored_disarmed(false, Some(0), "1000 USDT", ExistingExposure::None, false)]
+#[case::matching_reinstalled(true, Some(0), "1000 USDT", ExistingExposure::None, true)]
+#[case::missing_mark(true, None, "1000 USDT", ExistingExposure::None, false)]
+#[case::future_knowledge(true, Some(1), "1000 USDT", ExistingExposure::None, false)]
+#[case::mark_exceeds_cash_while_limit_would_pass(
+    true,
+    Some(0),
+    "275 USDT",
+    ExistingExposure::None,
+    false
+)]
+#[case::additional_cross_opening_refused(
+    true,
+    Some(0),
+    "1000 USDT",
+    ExistingExposure::Position,
+    false
+)]
+#[case::submitted_opening_refused(
+    true,
+    Some(0),
+    "1000 USDT",
+    ExistingExposure::SubmittedOrder,
+    false
+)]
+#[case::initialized_opening_refused(
+    true,
+    Some(0),
+    "1000 USDT",
+    ExistingExposure::InitializedOrder,
+    false
+)]
+#[case::resting_opening_refused(
+    true,
+    Some(0),
+    "1000 USDT",
+    ExistingExposure::RestingOpening,
+    false
+)]
+#[case::adverse_opening_refused(
+    true,
+    Some(0),
+    "1000 USDT",
+    ExistingExposure::AdverseOpening,
+    false
+)]
+#[case::quote_opening_refused(true, Some(0), "1000 USDT", ExistingExposure::QuoteOpening, false)]
+fn test_current_mark_risk_requires_pinned_model_known_mark_and_bounded_opening(
+    #[case] reinstall: bool,
+    #[case] mark_init: Option<u64>,
+    #[case] cash: &str,
+    #[case] existing_exposure: ExistingExposure,
+    #[case] admitted: bool,
+    strategy_id_ema_cross: StrategyId,
+    client_id_binance: ClientId,
+    trader_id: TraderId,
+    instrument_eth_usdt: InstrumentAny,
+    process_order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    execute_order_event_handler: TypedIntoMessageSavingHandler<TradingCommand>,
+    mut simple_cache: Cache,
+) {
+    use nautilus_model::{accounts::margin_model::MarginModelHandle, data::MarkPriceUpdate};
+    simple_cache
+        .add_instrument(instrument_eth_usdt.clone())
+        .unwrap();
+    let mut account = margin_account_with_usdt_balance(cash, "0 USDT", cash);
+    account.set_default_leverage(dec!(10));
+    account
+        .set_margin_model(MarginModelHandle::new(CurrentMarkMarginModel))
+        .unwrap();
+    let saved = serde_json::to_value(&account).unwrap();
+    let mut restored: MarginAccount = serde_json::from_value(saved.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&restored).unwrap(), saved);
+    assert!(!restored.is_margin_model_ready());
+    if reinstall {
+        restored
+            .set_margin_model(MarginModelHandle::new(CurrentMarkMarginModel))
+            .unwrap();
+    }
+    let account_id = restored.base.id;
+    simple_cache
+        .add_account(AccountAny::Margin(restored))
+        .unwrap();
+
+    if let Some(ts_init) = mark_init {
+        simple_cache
+            .add_mark_price(MarkPriceUpdate::new(
+                instrument_eth_usdt.id(),
+                Price::from("3000.00"),
+                0.into(),
+                ts_init.into(),
+            ))
+            .unwrap();
+    }
+
+    if matches!(existing_exposure, ExistingExposure::Position) {
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument_eth_usdt.id())
+            .account_id(account_id)
+            .position_id(PositionId::new("POSITION"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from("1.000"))
+            .last_px(Price::from("3000.00"))
+            .currency(Currency::USDT())
+            .build();
+        let position = Position::new(&instrument_eth_usdt, fill);
+        simple_cache
+            .add_position_without_order(&position, OmsType::Netting)
+            .unwrap();
+    }
+
+    if matches!(
+        existing_exposure,
+        ExistingExposure::SubmittedOrder | ExistingExposure::InitializedOrder
+    ) {
+        let pending = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument_eth_usdt.id())
+            .client_order_id(ClientOrderId::new("PENDING"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000"))
+            .price(Price::from("2500.00"))
+            .build();
+        let pending_id = pending.client_order_id();
+        simple_cache.add_order(pending, None, None, false).unwrap();
+        if matches!(existing_exposure, ExistingExposure::SubmittedOrder) {
+            simple_cache
+                .update_order(&OrderEventAny::Submitted(
+                    OrderSubmittedSpec::builder()
+                        .instrument_id(instrument_eth_usdt.id())
+                        .client_order_id(pending_id)
+                        .account_id(account_id)
+                        .build(),
+                ))
+                .unwrap();
+        }
+    }
+    let mut risk_engine =
+        get_risk_engine(Some(Rc::new(RefCell::new(simple_cache))), None, None, false);
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument_eth_usdt.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.000"))
+        .quote_quantity(matches!(existing_exposure, ExistingExposure::QuoteOpening))
+        .price(Price::from(
+            if matches!(existing_exposure, ExistingExposure::AdverseOpening) {
+                "3300.00"
+            } else {
+                "2500.00"
+            },
+        ))
+        .time_in_force(
+            if matches!(existing_exposure, ExistingExposure::RestingOpening) {
+                TimeInForce::Gtc
+            } else {
+                TimeInForce::Ioc
+            },
+        )
+        .build();
+    risk_engine
+        .cache()
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(client_id_binance), false)
+        .unwrap();
+    let command = SubmitOrder::new(
+        trader_id,
+        Some(client_id_binance),
+        strategy_id_ema_cross,
+        instrument_eth_usdt.id(),
+        order.client_order_id(),
+        order.init_event().clone(),
+        None,
+        None,
+        None,
+        UUID4::new(),
+        risk_engine.clock().borrow().timestamp_ns(),
+        None,
+    );
+    risk_engine.execute(TradingCommand::SubmitOrder(command));
+    assert_eq!(
+        get_execute_order_event_handler_messages(&execute_order_event_handler).len(),
+        usize::from(admitted)
+    );
+    assert_eq!(
+        get_process_order_event_handler_messages(&process_order_event_handler).len(),
+        usize::from(!admitted)
+    );
 }

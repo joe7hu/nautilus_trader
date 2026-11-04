@@ -602,6 +602,10 @@ fn canonical_account(account: &AccountAny) -> anyhow::Result<Value> {
 
     match account {
         AccountAny::Margin(margin) => {
+            anyhow::ensure!(
+                margin.is_margin_model_ready(),
+                "Pinned margin model is not installed"
+            );
             let leverages = margin
                 .leverages
                 .iter()
@@ -1204,7 +1208,7 @@ mod tests {
             (MarginModelAny::Standard(StandardMarginModel), "standard"),
             (MarginModelAny::Leveraged(LeveragedMarginModel), "leveraged"),
         ] {
-            account.set_margin_model(model.into());
+            account.set_margin_model(model.into()).unwrap();
             let value = canonical_account(&AccountAny::Margin(account.clone())).unwrap();
 
             assert_eq!(value["Margin"]["margin_model"], expected_name);

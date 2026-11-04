@@ -102,6 +102,8 @@ TEST_SUPPORT_DEV_PACKAGES = frozenset(
         "nautilus-data",
         "nautilus-event-store",
         "nautilus-execution",
+        # Native margin lifecycle fixtures use model order and fill builders.
+        "nautilus-hyperliquid",
         "nautilus-indicators",
         "nautilus-infrastructure",
         "nautilus-live",

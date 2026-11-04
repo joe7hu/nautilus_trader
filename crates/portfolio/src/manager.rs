@@ -22,7 +22,8 @@ use nautilus_common::{cache::Cache, clock::Clock};
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     accounts::{
-        Account, AccountAny, BaseAccount, BettingAccount, CashAccount, MarginAccount, WalletAccount,
+        Account, AccountAny, BaseAccount, BettingAccount, CashAccount, MarginAccount,
+        WalletAccount, margin_model::MarginAccounting,
     },
     enums::{AccountType, OrderSide, OrderType, PriceType},
     events::{AccountState, OrderFilled},
@@ -31,7 +32,7 @@ use nautilus_model::{
     orders::{Order, OrderAny},
     position::{Position, fold_net_position},
     types::{
-        AccountBalance, Currency, Money, Price, Quantity,
+        AccountBalance, Currency, MarginBalance, Money, Price, Quantity,
         fixed::{FIXED_PRECISION, check_fixed_raw_i128, check_fixed_raw_u128},
         money::MoneyRaw,
     },
@@ -174,6 +175,23 @@ impl AccountsManager {
     ) -> Option<AccountState> {
         match account {
             AccountAny::Margin(margin_account) => {
+                if margin_account.margin_accounting() == MarginAccounting::CurrentMark {
+                    let cache = self.cache.borrow();
+                    let positions = cache.positions_open(
+                        None,
+                        Some(&instrument.id()),
+                        None,
+                        Some(&margin_account.id()),
+                        None,
+                    );
+                    return self.update_current_mark_margin(
+                        margin_account,
+                        instrument,
+                        &positions.iter().map(|p| &**p).collect::<Vec<_>>(),
+                        orders_open,
+                        ts_event,
+                    );
+                }
                 self.update_margin_init(margin_account, instrument, orders_open, ts_event)
             }
             AccountAny::Cash(cash_account) => {
@@ -226,6 +244,24 @@ impl AccountsManager {
         positions: Vec<&Position>,
         ts_event: UnixNanos,
     ) -> Option<AccountState> {
+        if account.margin_accounting() == MarginAccounting::CurrentMark {
+            let cache = self.cache.borrow();
+            let orders = cache.orders_open(
+                None,
+                Some(&instrument.id()),
+                None,
+                Some(&account.id()),
+                None,
+            );
+            return self.update_current_mark_margin(
+                account,
+                instrument,
+                &positions,
+                &orders.iter().map(|o| &**o).collect::<Vec<_>>(),
+                ts_event,
+            );
+        }
+
         let mut ordered: Vec<&Position> = positions;
         ordered.sort_by_key(|p| (p.ts_opened, p.id));
 
@@ -375,6 +411,93 @@ impl AccountsManager {
 
         log::info!("{} margin_maint={margin_maint}", instrument.id());
 
+        Some(self.generate_margin_account_state(account, ts_event))
+    }
+
+    fn update_current_mark_margin(
+        &self,
+        account: &mut MarginAccount,
+        instrument: &InstrumentAny,
+        positions: &[&Position],
+        orders: &[&OrderAny],
+        ts_event: UnixNanos,
+    ) -> Option<AccountState> {
+        if !account.is_margin_model_ready() {
+            log::error!("Cannot refresh margin: pinned model is not installed");
+            return None;
+        }
+        let currency = instrument.cost_currency();
+
+        if account
+            .base_currency
+            .is_some_and(|base| base != currency || base.precision != currency.precision)
+        {
+            log::error!("Cannot refresh current-mark margin across collateral currencies");
+            return None;
+        }
+        let net =
+            positions
+                .iter()
+                .filter(|p| p.is_open())
+                .try_fold(Decimal::ZERO, |net, position| {
+                    assert_eq!(position.instrument_id, instrument.id());
+                    assert_eq!(position.account_id, account.id());
+                    net.checked_add(position.signed_decimal_qty())
+                })?;
+        let eligible: Vec<_> = orders
+            .iter()
+            .filter(|order| {
+                assert_eq!(order.instrument_id(), instrument.id());
+                order.is_open() && !order.is_reduce_only() && !order.leaves_qty().is_zero()
+            })
+            .collect();
+
+        if net.is_zero() && eligible.is_empty() {
+            account.clear_margin(instrument.id());
+            return Some(self.generate_margin_account_state(account, ts_event));
+        }
+        let mark = *self.cache.borrow().mark_price(&instrument.id())?;
+        let known_at = ts_event.min(self.clock.borrow().timestamp_ns());
+        if mark.value.as_decimal() <= Decimal::ZERO
+            || mark.ts_event > known_at
+            || mark.ts_init > known_at
+        {
+            log::error!("Cannot refresh margin: positive, contemporaneously known mark required");
+            return None;
+        }
+        let position_quantity =
+            Quantity::from_decimal_dp(net.abs(), instrument.size_precision()).ok()?;
+        let gross = eligible.iter().try_fold(net.abs(), |quantity, order| {
+            quantity.checked_add(order.leaves_qty().as_decimal())
+        })?;
+        let gross_quantity = Quantity::from_decimal_dp(gross, instrument.size_precision()).ok()?;
+        let initial = account
+            .calculate_reserved_initial_margin(instrument, gross_quantity, mark.value, None)
+            .ok()?;
+        let maintenance = if position_quantity.is_zero() {
+            Money::zero(currency)
+        } else {
+            account
+                .calculate_maintenance_margin(instrument, position_quantity, mark.value, None)
+                .ok()?
+        };
+
+        if initial.currency != currency
+            || initial.currency.precision != currency.precision
+            || maintenance.currency != currency
+            || maintenance.currency.precision != currency.precision
+            || account.margin(&instrument.id()).is_some_and(|existing| {
+                existing.currency != currency || existing.currency.precision != currency.precision
+            })
+        {
+            log::error!("Cannot refresh current-mark margin: collateral currency mismatch");
+            return None;
+        }
+        account.update_margin(MarginBalance::new(
+            initial,
+            maintenance,
+            Some(instrument.id()),
+        ));
         Some(self.generate_margin_account_state(account, ts_event))
     }
 
@@ -1492,7 +1615,10 @@ mod tests {
 
     use nautilus_common::{cache::Cache, clock::TestClock};
     use nautilus_model::{
-        accounts::{BettingAccount, CashAccount, MarginAccount},
+        accounts::{
+            BettingAccount, CashAccount, MarginAccount,
+            margin_model::{LeveragedMarginModel, MarginModel, MarginModelHandle},
+        },
         data::QuoteTick,
         enums::{AccountType, CurrencyType, OmsType, OrderSide, OrderType},
         events::{
@@ -3112,6 +3238,44 @@ mod tests {
         assert_eq!(account.balance_locked(Some(gbp)), Some(Money::zero(gbp)));
     }
 
+    // These cases exercise a model's calculated currency, independently of instrument cost currency.
+    #[derive(Debug)]
+    struct QuoteCurrencyMarginModel;
+
+    impl MarginModel for QuoteCurrencyMarginModel {
+        fn name(&self) -> &'static str {
+            "quote_currency_test"
+        }
+
+        fn calculate_initial_margin(
+            &self,
+            instrument: &dyn Instrument,
+            quantity: Quantity,
+            price: Price,
+            leverage: Decimal,
+            inverse: Option<bool>,
+        ) -> anyhow::Result<Money> {
+            let margin = LeveragedMarginModel
+                .calculate_initial_margin(instrument, quantity, price, leverage, inverse)?;
+            Money::from_decimal(margin.as_decimal(), instrument.quote_currency())
+                .map_err(Into::into)
+        }
+
+        fn calculate_maintenance_margin(
+            &self,
+            instrument: &dyn Instrument,
+            quantity: Quantity,
+            price: Price,
+            leverage: Decimal,
+            inverse: Option<bool>,
+        ) -> anyhow::Result<Money> {
+            let margin = LeveragedMarginModel
+                .calculate_maintenance_margin(instrument, quantity, price, leverage, inverse)?;
+            Money::from_decimal(margin.as_decimal(), instrument.quote_currency())
+                .map_err(Into::into)
+        }
+    }
+
     #[rstest]
     #[case(
         Some(Currency::EUR()),
@@ -3139,7 +3303,10 @@ mod tests {
             UnixNanos::default(),
             base_currency,
         );
-        let account = MarginAccount::new(account_state, true);
+        let mut account = MarginAccount::new(account_state, true);
+        account
+            .set_margin_model(MarginModelHandle::new(QuoteCurrencyMarginModel))
+            .unwrap();
         let clock = Rc::new(RefCell::new(TestClock::new()));
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
         add_usdeur_quote(&cache, "0.90000", "1.10000");
@@ -3213,6 +3380,9 @@ mod tests {
             None,
         );
         let mut account = MarginAccount::new(account_state, true);
+        account
+            .set_margin_model(MarginModelHandle::new(QuoteCurrencyMarginModel))
+            .unwrap();
         let manager = AccountsManager::new(
             Rc::new(RefCell::new(TestClock::new())),
             Rc::new(RefCell::new(Cache::new(None, None))),

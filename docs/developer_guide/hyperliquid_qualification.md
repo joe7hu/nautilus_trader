@@ -13,10 +13,36 @@ mismatches.
 The adapter retains each asset's margin-table association and referenced tiers.
 `HyperliquidMarginModel` calculates initial margin from the supplied current mark
 and user leverage, and tiered maintenance independently of user leverage. It is
-an explicit, uninstalled model. The portfolio's current margin price selectors
-and aggregate account reserve lifecycle still require qualification before this
-model can support a Hyperliquid paper profile. Zero default adapter fees are not
-a qualified trading fee schedule.
+an explicit model selected through `SimulatedVenueConfig.margin_model`; venue names do not
+install it. Its current-mark accounting capability makes the native portfolio reserve
+initial margin on net open positions plus the gross remaining quantity of non-reduce-only
+orders, using a positive mark known by both event and receipt clocks. Opening leverage tier checks remain separate from existing exposure reserves: a mark moving
+an existing position into a lower-leverage tier still refreshes position IM and tiered MM, and
+does not prevent an eligible reducing exit. Maintenance is reported separately and is not added to locked cash. Mark updates refresh these requirements
+even when portfolio PnL uses another price policy. Limit, fill and entry prices cannot replace
+the mark for these requirements; collateral currencies are not converted.
+
+The first account is constructed from the execution client's actual `AccountState`. Its
+configured model is installed before cache insertion and delivery to the portfolio; the original
+event is recorded once. `SimulatedExchange.configure_account` reinstalls configuration on a
+restored account without creating a financial event, and refuses leverage or model changes that
+differ from the restored contract. The account persists the model name and accounting capability.
+Deserialization preserves its original financial values but leaves a pinned account disarmed until the matching model is
+reinstalled through native configuration. Native risk refuses a disarmed account. Legacy
+accounts without a pin retain their existing model, serialization and reserve semantics.
+
+This is a bounded conservative reserve contract, not a qualified implementation of all venue
+cross-margin buying power. Native risk admits one base-quantity limit IOC opening order on a flat account with an opening limit no worse
+than the current mark, then only limit IOC reduce-only exits until all positions and opening
+orders clear. Resting opening orders are unqualified because native matching does not recheck
+venue equity and margin before subsequent matches.
+Additional ordinary openings and multi-opening batches are refused. A first opening also needs
+cash for initial margin plus the larger nonnegative maker/taker commission budget, calculated
+natively at the larger mark/order price. The instrument's simulation fees must be selected
+explicitly; this does not qualify arbitrary fee-model overrides. In particular, cash free
+balance is not venue opening capacity: the venue includes unrealized PnL in cross equity.
+Opposite-side open-order offsets and broader equity-aware admission remain unqualified.
+Zero default adapter fees are not a qualified trading fee schedule.
 
 Hyperliquid funding selects the full-precision positive oracle, with no mark or
 BBO fallback. Receipt-timed context predictions cannot become final hourly rates.
@@ -49,3 +75,8 @@ honestly. Its JSONL is retained evidence, not raw WebSocket wire frames.
 - [Margin tiers](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/margin-tiers)
 - [Funding](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding)
 - [Tick and lot size](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/tick-and-lot-size)
+
+Portfolio currency-conversion fixtures select an explicit legacy quote-currency test model when
+testing a model-calculated currency that differs from settlement. Default linear models retain
+the existing settlement/cost denomination; valuation fixtures assert that denomination and
+convert from the matching currency.

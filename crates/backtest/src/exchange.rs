@@ -49,7 +49,10 @@ use nautilus_execution::{
     },
 };
 use nautilus_model::{
-    accounts::{Account, AccountAny, margin_model::MarginModelHandle},
+    accounts::{
+        Account, AccountAny, MarginAccount,
+        margin_model::{MarginAccounting, MarginModel, MarginModelHandle},
+    },
     data::{
         Bar, Data, FundingRateUpdate, InstrumentClose, InstrumentStatus, OrderBookDelta,
         OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
@@ -403,7 +406,10 @@ impl SimulatedExchange {
     }
 
     pub fn initialize_account(&mut self) {
-        self.generate_fresh_account_state();
+        if let Err(e) = self.generate_fresh_account_state() {
+            self.module_error = Some(e.to_string());
+            return;
+        }
 
         if let Err(e) = self.initialize_maintenance_owners() {
             self.module_error = Some(e.to_string());
@@ -656,6 +662,45 @@ impl SimulatedExchange {
                 .flat_map(OrderMatchingEngine::get_open_ask_orders)
                 .collect(),
         }
+    }
+
+    pub(crate) fn margin_account_config(&self) -> MarginAccountConfig {
+        MarginAccountConfig {
+            model: self.margin_model.clone(),
+            default_leverage: self.default_leverage,
+            leverages: self.leverages.clone(),
+        }
+    }
+
+    /// Applies the configured account semantics without generating or replacing financial state.
+    ///
+    /// This reinstalls the explicitly selected runtime margin model after restoring a cached account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no account is cached, the model differs from its persisted pin, or
+    /// persisting the configured account fails.
+    pub fn configure_account(&self) -> anyhow::Result<()> {
+        let mut account = self
+            .get_account()
+            .or_else(|| {
+                self.cache
+                    .borrow()
+                    .account_for_venue(&self.id)
+                    .map(|account| account.cloned())
+            })
+            .ok_or_else(|| anyhow::anyhow!("No simulated account is cached for {}", self.id))?;
+        account.set_calculate_account_state(!self.frozen_account);
+        match &mut account {
+            AccountAny::Margin(margin_account) => {
+                self.margin_account_config().apply(margin_account)?;
+            }
+            AccountAny::Cash(cash_account) => {
+                cash_account.allow_borrowing = self.allow_cash_borrowing;
+            }
+            AccountAny::Betting(_) | AccountAny::Wallet(_) => {}
+        }
+        self.cache.borrow_mut().update_account(&account)
     }
 
     /// Returns the account for this exchange, if an execution client is registered.
@@ -1436,7 +1481,7 @@ impl SimulatedExchange {
     /// Returns an error if a simulation module cannot reset.
     pub fn reset(&mut self) -> anyhow::Result<()> {
         if !self.account_at_starting_balances() {
-            self.generate_fresh_account_state();
+            self.generate_fresh_account_state()?;
         }
 
         let mut module_error = None;
@@ -1741,7 +1786,7 @@ impl SimulatedExchange {
         true
     }
 
-    fn generate_fresh_account_state(&self) {
+    fn generate_fresh_account_state(&self) -> anyhow::Result<()> {
         let balances: Vec<AccountBalance> = self
             .starting_balances
             .iter()
@@ -1750,35 +1795,55 @@ impl SimulatedExchange {
 
         if let Some(exec_client) = &self.exec_client {
             let ts_event = self.clock.borrow().timestamp_ns();
-            exec_client
-                .generate_account_state(balances, vec![], true, ts_event, None)
-                .unwrap();
-        }
+            exec_client.generate_account_state(balances, vec![], true, ts_event, None)?;
 
-        let calculate_account_state = !self.frozen_account;
-
-        if let Some(mut account) = self.get_account() {
-            account.set_calculate_account_state(calculate_account_state);
-
-            match &mut account {
-                AccountAny::Margin(margin_account) => {
-                    margin_account.set_default_leverage(self.default_leverage);
-                    for (instrument_id, leverage) in &self.leverages {
-                        margin_account.set_leverage(*instrument_id, *leverage);
-                    }
-
-                    if let Some(model) = &self.margin_model {
-                        margin_account.set_margin_model(model.clone());
-                    }
-                }
-                AccountAny::Cash(cash_account) => {
-                    cash_account.allow_borrowing = self.allow_cash_borrowing;
-                }
-                AccountAny::Betting(_) | AccountAny::Wallet(_) => {}
+            if self.get_account().is_some() || self.margin_account_config().uses_current_mark() {
+                self.configure_account()?;
             }
-
-            self.cache.borrow_mut().update_account(&account).unwrap();
         }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MarginAccountConfig {
+    model: Option<MarginModelHandle>,
+    default_leverage: Decimal,
+    leverages: AHashMap<InstrumentId, Decimal>,
+}
+
+impl MarginAccountConfig {
+    pub(crate) fn uses_current_mark(&self) -> bool {
+        self.model
+            .as_ref()
+            .is_some_and(|model| model.accounting() == MarginAccounting::CurrentMark)
+    }
+
+    pub(crate) fn apply(&self, account: &mut MarginAccount) -> anyhow::Result<()> {
+        if account.margin_accounting() != MarginAccounting::Legacy {
+            anyhow::ensure!(
+                account.default_leverage == self.default_leverage
+                    && self.leverages.iter().all(|(instrument, leverage)| account.get_leverage(instrument) == *leverage),
+                "Configured leverage differs from the restored current-mark account"
+            );
+            anyhow::ensure!(
+                self.uses_current_mark(),
+                "Pinned current-mark model is not configured"
+            );
+        }
+
+        if let Some(model) = &self.model {
+            account.set_margin_model(model.clone())?;
+        }
+        anyhow::ensure!(
+            account.is_margin_model_ready(),
+            "Pinned margin model is not configured"
+        );
+        account.set_default_leverage(self.default_leverage);
+        for (instrument, leverage) in &self.leverages {
+            account.set_leverage(*instrument, *leverage);
+        }
+        Ok(())
     }
 }
 
@@ -1826,6 +1891,171 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[derive(Debug)]
+    struct CurrentMarkModel;
+
+    impl MarginModel for CurrentMarkModel {
+        fn name(&self) -> &'static str {
+            "current_mark_exchange_test"
+        }
+
+        fn accounting(&self) -> MarginAccounting {
+            MarginAccounting::CurrentMark
+        }
+
+        fn calculate_initial_margin(
+            &self,
+            instrument: &dyn Instrument,
+            quantity: Quantity,
+            price: Price,
+            leverage: Decimal,
+            inverse: Option<bool>,
+        ) -> anyhow::Result<Money> {
+            let notional = instrument.try_calculate_notional_value(quantity, price, inverse)?;
+            Money::from_decimal(notional.as_decimal() / leverage, notional.currency)
+                .map_err(Into::into)
+        }
+
+        fn calculate_maintenance_margin(
+            &self,
+            instrument: &dyn Instrument,
+            quantity: Quantity,
+            price: Price,
+            _leverage: Decimal,
+            inverse: Option<bool>,
+        ) -> anyhow::Result<Money> {
+            let notional = instrument.try_calculate_notional_value(quantity, price, inverse)?;
+            Money::from_decimal(notional.as_decimal() / Decimal::from(80), notional.currency)
+                .map_err(Into::into)
+        }
+    }
+
+    #[rstest]
+    fn test_config_reinstalls_pinned_model_without_rewriting_restored_account() {
+        let state = AccountState::new(
+            AccountId::new("SIM-001"),
+            AccountType::Margin,
+            vec![AccountBalance::new(
+                Money::from("1000 USD"),
+                Money::from("6.1 USD"),
+                Money::from("993.9 USD"),
+            )],
+            vec![],
+            true,
+            UUID4::new(),
+            0.into(),
+            0.into(),
+            None,
+        );
+        let mut account = MarginAccount::new(state, true);
+        account.set_default_leverage(Decimal::TEN);
+        account
+            .set_margin_model(MarginModelHandle::new(CurrentMarkModel))
+            .unwrap();
+        let saved = serde_json::to_value(&account).unwrap();
+        let restored: MarginAccount = serde_json::from_value(saved.clone()).unwrap();
+        assert!(!restored.is_margin_model_ready());
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_account(AccountAny::Margin(restored))
+            .unwrap();
+        let config = SimulatedVenueConfig::builder()
+            .venue(Venue::new("SIM"))
+            .oms_type(OmsType::Netting)
+            .account_type(AccountType::Margin)
+            .book_type(BookType::L1_MBP)
+            .starting_balances(vec![Money::from("1000 USD")])
+            .margin_model(MarginModelHandle::new(CurrentMarkModel))
+            .build()
+            .unwrap();
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let exchange = SimulatedExchange::new(config, Rc::clone(&cache), clock).unwrap();
+        exchange.configure_account().unwrap();
+        let AccountAny::Margin(restored) = cache
+            .borrow()
+            .account_for_venue(&Venue::new("SIM"))
+            .unwrap()
+            .cloned()
+        else {
+            panic!("Margin account required")
+        };
+        assert!(restored.is_margin_model_ready());
+        assert_eq!(serde_json::to_value(&restored).unwrap(), saved);
+    }
+
+    #[rstest]
+    fn test_current_mark_model_is_installed_before_first_account_state_delivery() {
+        use crate::execution_client::BacktestExecutionClient;
+        use nautilus_common::msgbus::{MessageBus, TypedHandler};
+        use nautilus_portfolio::Portfolio;
+        *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let config = SimulatedVenueConfig::builder()
+            .venue(Venue::new("SIM"))
+            .oms_type(OmsType::Netting)
+            .account_type(AccountType::Margin)
+            .book_type(BookType::L1_MBP)
+            .starting_balances(vec![Money::from("1000 USD")])
+            .margin_model(MarginModelHandle::new(CurrentMarkModel))
+            .build()
+            .unwrap();
+        let exchange = Rc::new(RefCell::new(
+            SimulatedExchange::new(config, Rc::clone(&cache), Rc::clone(&clock)).unwrap(),
+        ));
+        let portfolio = Rc::new(RefCell::new(Portfolio::new(
+            Rc::clone(&clock),
+            Rc::clone(&cache),
+            None,
+        )));
+        let observed = Rc::new(Cell::new(false));
+        let callback = TypedHandler::from({
+            let cache = Rc::clone(&cache);
+            let portfolio = Rc::clone(&portfolio);
+            let observed = Rc::clone(&observed);
+            move |state: &AccountState| {
+                {
+                    let cache = cache.borrow();
+                    let account = cache.account(&state.account_id).unwrap();
+                    let AccountAny::Margin(account) = &*account else {
+                        panic!("Margin account required")
+                    };
+                    assert!(account.is_margin_model_ready());
+                    assert_eq!(account.margin_accounting(), MarginAccounting::CurrentMark);
+                    assert_eq!(account.margin_model().name(), "current_mark_exchange_test");
+                    assert_eq!(account.events(), vec![state.clone()]);
+                }
+                portfolio.borrow_mut().update_account(state);
+                observed.set(true);
+            }
+        });
+        msgbus::register_account_state_endpoint(
+            MessagingSwitchboard::portfolio_update_account(),
+            callback,
+        );
+        let client = BacktestExecutionClient::new(
+            TraderId::test_default(),
+            AccountId::new("SIM-001"),
+            &exchange,
+            Rc::clone(&cache),
+            clock,
+            None,
+            None,
+        );
+        exchange.borrow_mut().register_client(Rc::new(client));
+        exchange.borrow_mut().initialize_account();
+        assert!(observed.get());
+        assert_eq!(
+            cache
+                .borrow()
+                .account(&AccountId::new("SIM-001"))
+                .unwrap()
+                .event_count(),
+            1
+        );
+    }
 
     /// The three `send` dispatch modes a query must be intercepted ahead of.
     #[derive(Clone, Copy)]
