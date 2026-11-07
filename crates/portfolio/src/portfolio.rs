@@ -43,7 +43,7 @@ use nautilus_model::{
     data::{Bar, MarkPriceUpdate, QuoteTick},
     enums::{OmsType, OrderType, PositionSide, PriceType},
     events::{AccountState, OrderEventAny, PortfolioSnapshot, position::PositionEvent},
-    identifiers::{AccountId, InstrumentId, PositionId, Venue},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId, Venue},
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
     position::Position,
@@ -67,6 +67,15 @@ pub struct ReportingValuation {
     pub is_stale: bool,
 }
 
+#[derive(Clone, Copy)]
+struct RealizedPositionCycle {
+    pnl: Money,
+    opening_order_id: ClientOrderId,
+    initialized: UnixNanos,
+    opened: UnixNanos,
+    closed: Option<UnixNanos>,
+}
+
 struct PortfolioState {
     accounts: AccountsManager,
     analyzer: PortfolioAnalyzer,
@@ -74,7 +83,7 @@ struct PortfolioState {
     realized_pnls: IndexMap<InstrumentId, Money>,
     recorded_closed_position_cycles: AHashSet<(PositionId, UnixNanos)>,
     snapshot_sum_per_position: AHashMap<PositionId, Money>,
-    snapshot_last_per_position: AHashMap<PositionId, Money>,
+    snapshot_last_per_position: AHashMap<PositionId, RealizedPositionCycle>,
     snapshot_currency_mismatches: AHashSet<PositionId>,
     snapshot_aggregation_overflows: AHashSet<PositionId>,
     snapshot_processed_counts: AHashMap<PositionId, usize>,
@@ -2509,7 +2518,7 @@ impl Portfolio {
                     .position_snapshots(Some(position_id), None);
 
                 let mut sum_pnl: Option<Money> = None;
-                let mut last_pnl: Option<Money> = None;
+                let mut last_pnl: Option<RealizedPositionCycle> = None;
                 let mut snapshot_account_id: Option<AccountId> = None;
                 let mut currency_mismatch = false;
                 let mut aggregation_overflow = false;
@@ -2530,7 +2539,13 @@ impl Portfolio {
                         } else {
                             sum_pnl = Some(realized_pnl);
                         }
-                        last_pnl = Some(realized_pnl);
+                        last_pnl = Some(RealizedPositionCycle {
+                            pnl: realized_pnl,
+                            opening_order_id: snapshot.opening_order_id,
+                            initialized: snapshot.ts_init,
+                            opened: snapshot.ts_opened,
+                            closed: snapshot.ts_closed,
+                        });
                     }
                 }
 
@@ -2642,7 +2657,13 @@ impl Portfolio {
                         } else {
                             sum_pnl = Some(realized_pnl);
                         }
-                        last_pnl = Some(realized_pnl);
+                        last_pnl = Some(RealizedPositionCycle {
+                            pnl: realized_pnl,
+                            opening_order_id: snapshot.opening_order_id,
+                            initialized: snapshot.ts_init,
+                            opened: snapshot.ts_opened,
+                            closed: snapshot.ts_closed,
+                        });
                     }
                 }
 
@@ -2781,7 +2802,12 @@ impl Portfolio {
                         inner
                             .snapshot_sum_per_position
                             .get(position_id)
-                            .or_else(|| inner.snapshot_last_per_position.get(position_id))
+                            .or_else(|| {
+                                inner
+                                    .snapshot_last_per_position
+                                    .get(position_id)
+                                    .map(|cycle| &cycle.pnl)
+                            })
                             .map(|pnl| pnl.currency)
                     })
                 })
@@ -2807,34 +2833,32 @@ impl Portfolio {
                     .get(position_id)
                     .copied();
 
-                // A closed position whose final cycle was snapshotted carries that cycle both in
-                // its last frame and in its own realized PnL, which the loop below adds; drop
-                // the frame here so the cycle lands once.
                 let sum_pnl = if let Some(sum_pnl) = sum_pnl {
-                    let closed_position_pnl = position
-                        .filter(|position| !position.is_open())
-                        .and_then(|position| position.realized_pnl);
-                    let last_pnl = self
+                    let last_cycle = self
                         .inner
                         .borrow()
                         .snapshot_last_per_position
                         .get(position_id)
                         .copied();
 
-                    Some(match (closed_position_pnl, last_pnl) {
-                        (Some(realized_pnl), Some(last_pnl)) if last_pnl == realized_pnl => {
-                            match sum_pnl.checked_sub(last_pnl) {
-                                Some(remaining) => remaining,
-                                None => {
-                                    log::error!(
-                                        "Cannot calculate realized PnL: snapshot adjustment exceeds Money bounds"
-                                    );
-                                    return None;
-                                }
+                    match (position, last_cycle) {
+                        (Some(position), Some(last))
+                            if !position.is_open()
+                                && position.opening_order_id == last.opening_order_id
+                                && position.ts_init == last.initialized
+                                && position.ts_opened == last.opened
+                                && position.ts_closed == last.closed =>
+                        {
+                            if position.realized_pnl != Some(last.pnl) {
+                                log::error!(
+                                    "Conflicting realized PnL for the same closed position cycle"
+                                );
+                                return None;
                             }
+                            Some(sum_pnl.checked_sub(last.pnl)?)
                         }
-                        _ => sum_pnl,
-                    })
+                        _ => Some(sum_pnl),
+                    }
                 } else {
                     None
                 };
