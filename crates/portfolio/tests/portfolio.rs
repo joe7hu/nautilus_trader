@@ -5897,6 +5897,7 @@ fn test_identical_closed_netting_cycle_amounts_retain_every_distinct_cycle(
         position.apply(&fill(index, OrderSide::Sell));
         assert!(position.is_closed());
         assert_eq!(position.realized_pnl, Some(Money::from("-0.01 USD")));
+
         if index == 0 {
             portfolio
                 .cache()

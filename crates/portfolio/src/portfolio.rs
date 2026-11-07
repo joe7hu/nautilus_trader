@@ -2840,6 +2840,7 @@ impl Portfolio {
                         .snapshot_last_per_position
                         .get(position_id)
                         .copied();
+
                     match (position, last_cycle) {
                         (Some(position), Some(last))
                             if !position.is_open()
