@@ -10576,7 +10576,9 @@ fn test_spot_notional_fields_ignore_metadata(
 }
 
 #[derive(Debug)]
-struct CurrentMarkMarginModel;
+struct CurrentMarkMarginModel {
+    wrong_precision: bool,
+}
 
 impl MarginModel for CurrentMarkMarginModel {
     fn name(&self) -> &'static str {
@@ -10596,7 +10598,11 @@ impl MarginModel for CurrentMarkMarginModel {
         inverse: Option<bool>,
     ) -> anyhow::Result<Money> {
         let notional = instrument.try_calculate_notional_value(quantity, price, inverse)?;
-        Money::from_decimal(notional.as_decimal() / leverage, notional.currency).map_err(Into::into)
+        let mut currency = notional.currency;
+        if self.wrong_precision {
+            currency.precision += 1;
+        }
+        Money::from_decimal(notional.as_decimal() / leverage, currency).map_err(Into::into)
     }
 
     fn calculate_maintenance_margin(
@@ -10616,6 +10622,12 @@ impl MarginModel for CurrentMarkMarginModel {
 enum ExistingExposure {
     None,
     Position,
+    OtherPosition,
+    OtherPositionGain,
+    OtherPositionLoss,
+    OtherPendingOpening,
+    ReportedOtherPosition,
+    WrongMarginPrecision,
     SubmittedOrder,
     InitializedOrder,
     RestingOpening,
@@ -10671,6 +10683,56 @@ enum ExistingExposure {
     false
 )]
 #[case::quote_opening_refused(true, Some(0), "1000 USDT", ExistingExposure::QuoteOpening, false)]
+#[case::second_market_opening(true, Some(0), "400 USDT", ExistingExposure::OtherPosition, true)]
+#[case::second_market_exceeds_account_collateral(
+    true,
+    Some(0),
+    "340 USDT",
+    ExistingExposure::OtherPosition,
+    false
+)]
+#[case::second_market_uses_mark_equity(
+    true,
+    Some(0),
+    "100 USDT",
+    ExistingExposure::OtherPositionGain,
+    true
+)]
+#[case::second_market_counts_unrealized_loss(
+    true,
+    Some(0),
+    "600 USDT",
+    ExistingExposure::OtherPositionLoss,
+    false
+)]
+#[case::second_market_counts_pending_opening(
+    true,
+    Some(0),
+    "400 USDT",
+    ExistingExposure::OtherPendingOpening,
+    true
+)]
+#[case::pending_opening_commissions_are_reserved(
+    true,
+    Some(0),
+    "360 USDT",
+    ExistingExposure::OtherPendingOpening,
+    false
+)]
+#[case::reported_other_market_stays_unqualified(
+    true,
+    Some(0),
+    "1000 USDT",
+    ExistingExposure::ReportedOtherPosition,
+    false
+)]
+#[case::candidate_margin_precision_mismatch(
+    true,
+    Some(0),
+    "1000 USDT",
+    ExistingExposure::WrongMarginPrecision,
+    false
+)]
 fn test_current_mark_risk_requires_pinned_model_known_mark_and_bounded_opening(
     #[case] reinstall: bool,
     #[case] mark_init: Option<u64>,
@@ -10692,7 +10754,9 @@ fn test_current_mark_risk_requires_pinned_model_known_mark_and_bounded_opening(
     let mut account = margin_account_with_usdt_balance(cash, "0 USDT", cash);
     account.set_default_leverage(dec!(10));
     account
-        .set_margin_model(MarginModelHandle::new(CurrentMarkMarginModel))
+        .set_margin_model(MarginModelHandle::new(CurrentMarkMarginModel {
+            wrong_precision: matches!(existing_exposure, ExistingExposure::WrongMarginPrecision),
+        }))
         .unwrap();
     let saved = serde_json::to_value(&account).unwrap();
     let mut restored: MarginAccount = serde_json::from_value(saved.clone()).unwrap();
@@ -10700,8 +10764,17 @@ fn test_current_mark_risk_requires_pinned_model_known_mark_and_bounded_opening(
     assert!(!restored.is_margin_model_ready());
     if reinstall {
         restored
-            .set_margin_model(MarginModelHandle::new(CurrentMarkMarginModel))
+            .set_margin_model(MarginModelHandle::new(CurrentMarkMarginModel {
+                wrong_precision: matches!(
+                    existing_exposure,
+                    ExistingExposure::WrongMarginPrecision
+                ),
+            }))
             .unwrap();
+    }
+
+    if matches!(existing_exposure, ExistingExposure::ReportedOtherPosition) {
+        restored.base.calculate_account_state = false;
     }
     let account_id = restored.base.id;
     simple_cache
@@ -10717,6 +10790,58 @@ fn test_current_mark_risk_requires_pinned_model_known_mark_and_bounded_opening(
                 ts_init.into(),
             ))
             .unwrap();
+    }
+
+    if matches!(
+        existing_exposure,
+        ExistingExposure::OtherPosition
+            | ExistingExposure::OtherPositionGain
+            | ExistingExposure::OtherPositionLoss
+            | ExistingExposure::OtherPendingOpening
+            | ExistingExposure::ReportedOtherPosition
+    ) {
+        let other = InstrumentAny::CurrencyPair(currency_pair_btcusdt());
+        simple_cache.add_instrument(other.clone()).unwrap();
+        let price = match existing_exposure {
+            ExistingExposure::OtherPositionGain => "90000.00",
+            ExistingExposure::OtherPositionLoss => "30000.00",
+            _ => "60000.00",
+        };
+        simple_cache
+            .add_mark_price(MarkPriceUpdate::new(
+                other.id(),
+                Price::from(price),
+                0.into(),
+                0.into(),
+            ))
+            .unwrap();
+
+        if matches!(existing_exposure, ExistingExposure::OtherPendingOpening) {
+            let pending = OrderTestBuilder::new(OrderType::Limit)
+                .instrument_id(other.id())
+                .client_order_id(ClientOrderId::new("OTHER-PENDING"))
+                .side(OrderSide::Buy)
+                .quantity(Quantity::from("0.010000"))
+                .price(Price::from("60000.00"))
+                .time_in_force(TimeInForce::Ioc)
+                .build();
+            simple_cache
+                .add_order(pending, None, Some(client_id_binance), false)
+                .unwrap();
+        } else {
+            let fill = OrderFilledSpec::builder()
+                .instrument_id(other.id())
+                .account_id(account_id)
+                .position_id(PositionId::new("OTHER-POSITION"))
+                .order_side(OrderSide::Buy)
+                .last_qty(Quantity::from("0.010000"))
+                .last_px(Price::from("60000.00"))
+                .currency(Currency::USDT())
+                .build();
+            simple_cache
+                .add_position_without_order(&Position::new(&other, fill), OmsType::Netting)
+                .unwrap();
+        }
     }
 
     if matches!(existing_exposure, ExistingExposure::Position) {
