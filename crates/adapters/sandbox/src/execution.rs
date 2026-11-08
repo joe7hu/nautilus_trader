@@ -63,7 +63,7 @@ use nautilus_execution::{
     models::{fee::FeeModelHandle, fill::FillModelHandle, latency::LatencyModel},
 };
 use nautilus_model::{
-    accounts::{Account, AccountAny},
+    accounts::{Account, AccountAny, MarginAccount, margin_model::MarginModelHandle},
     data::{
         Bar, FundingRateUpdate, InstrumentClose, InstrumentStatus, OrderBookDeltas, QuoteTick,
         TradeTick,
@@ -102,6 +102,7 @@ pub struct SandboxExecutionClient {
     inner: Rc<RefCell<SandboxInner>>,
     handlers: RefCell<Option<RegisteredHandlers>>,
     restored: Cell<bool>,
+    initial_margin_model: RefCell<Option<MarginModelHandle>>,
     clock: Rc<RefCell<dyn Clock>>,
     cache: Rc<RefCell<Cache>>,
 }
@@ -479,9 +480,36 @@ impl SandboxExecutionClient {
             inner,
             handlers: RefCell::new(None),
             restored: Cell::new(false),
+            initial_margin_model: RefCell::new(None),
             clock,
             cache,
         }
+    }
+
+    /// Selects the margin model installed before the initial account event is delivered.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the client owns a fresh margin account at its configured venue.
+    pub fn set_initial_margin_model(&mut self, model: MarginModelHandle) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.config.account_type == AccountType::Margin
+                && self.config.account_id.get_issuer() == self.config.venue
+                && !self.core.borrow().is_connected()
+                && self
+                    .cache
+                    .borrow()
+                    .account(&self.config.account_id)
+                    .is_none()
+                && self
+                    .cache
+                    .borrow()
+                    .account_for_venue(&self.config.venue)
+                    .is_none(),
+            "Initial margin model requires a fresh margin account at the configured venue"
+        );
+        *self.initial_margin_model.get_mut() = Some(model);
+        Ok(())
     }
 
     /// Restores the original quote-only sandbox account and order state.
@@ -1467,6 +1495,23 @@ impl ExecutionClient for SandboxExecutionClient {
         let state = self
             .factory
             .generate_account_state(balances, margins, reported, ts_event, ts_init, info);
+        let initial_model = self.initial_margin_model.borrow().clone();
+        if let Some(model) = initial_model {
+            let mut cache = self.cache.borrow_mut();
+            anyhow::ensure!(
+                cache.account(&state.account_id).is_none()
+                    && cache.account_for_venue(&self.config.venue).is_none(),
+                "Initial margin model cannot replace an existing account"
+            );
+            let mut account = MarginAccount::new(state.clone(), !self.config.frozen_account);
+            account.set_default_leverage(self.config.default_leverage);
+            for (instrument, leverage) in &self.config.leverages {
+                account.set_leverage(*instrument, *leverage);
+            }
+            account.set_margin_model(model)?;
+            cache.add_account(AccountAny::Margin(account))?;
+            self.initial_margin_model.borrow_mut().take();
+        }
         let endpoint = MessagingSwitchboard::portfolio_update_account();
         msgbus::send_account_state(endpoint, &state);
         self.sync_cached_account_config()?;
