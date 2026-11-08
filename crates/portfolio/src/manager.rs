@@ -25,6 +25,7 @@ use nautilus_model::{
         Account, AccountAny, BaseAccount, BettingAccount, CashAccount, MarginAccount,
         WalletAccount, margin_model::MarginAccounting,
     },
+    data::MarkPriceUpdate,
     enums::{AccountType, OrderSide, OrderType, PriceType},
     events::{AccountState, OrderFilled},
     identifiers::InstrumentId,
@@ -52,6 +53,109 @@ impl Debug for AccountsManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(AccountsManager)).finish()
     }
+}
+
+#[derive(Debug)]
+pub struct CurrentMarkMargin {
+    pub margin: MarginBalance,
+    pub gross_quantity: Quantity,
+}
+
+#[must_use]
+pub fn current_mark_margin(
+    account: &MarginAccount,
+    instrument: &InstrumentAny,
+    positions: &[&Position],
+    orders: &[&OrderAny],
+    mark: Option<MarkPriceUpdate>,
+    known_at: UnixNanos,
+) -> Option<CurrentMarkMargin> {
+    if !account.is_margin_model_ready() {
+        log::error!("Cannot refresh margin: pinned model is not installed");
+        return None;
+    }
+    let currency = instrument.cost_currency();
+
+    if account
+        .base_currency
+        .is_some_and(|base| base != currency || base.precision != currency.precision)
+    {
+        log::error!("Cannot refresh current-mark margin across collateral currencies");
+        return None;
+    }
+
+    if positions.iter().any(|position| {
+        position.instrument_id != instrument.id() || position.account_id != account.id()
+    }) || orders
+        .iter()
+        .any(|order| order.instrument_id() != instrument.id())
+    {
+        return None;
+    }
+    let net = positions
+        .iter()
+        .filter(|p| p.is_open())
+        .try_fold(Decimal::ZERO, |net, position| {
+            net.checked_add(position.signed_decimal_qty())
+        })?;
+    let eligible: Vec<_> = orders
+        .iter()
+        .filter(|order| {
+            !order.is_closed() && !order.is_reduce_only() && !order.leaves_qty().is_zero()
+        })
+        .collect();
+
+    if net.is_zero() && eligible.is_empty() {
+        return Some(CurrentMarkMargin {
+            margin: MarginBalance::new(
+                Money::zero(currency),
+                Money::zero(currency),
+                Some(instrument.id()),
+            ),
+            gross_quantity: Quantity::zero(instrument.size_precision()),
+        });
+    }
+    let mark = mark?;
+    if mark.instrument_id != instrument.id()
+        || mark.value.as_decimal() <= Decimal::ZERO
+        || mark.ts_event > known_at
+        || mark.ts_init > known_at
+    {
+        log::error!("Cannot refresh margin: positive, contemporaneously known mark required");
+        return None;
+    }
+    let position_quantity =
+        Quantity::from_decimal_dp(net.abs(), instrument.size_precision()).ok()?;
+    let gross = eligible.iter().try_fold(net.abs(), |quantity, order| {
+        quantity.checked_add(order.leaves_qty().as_decimal())
+    })?;
+    let gross_quantity = Quantity::from_decimal_dp(gross, instrument.size_precision()).ok()?;
+    let initial = account
+        .calculate_reserved_initial_margin(instrument, gross_quantity, mark.value, None)
+        .ok()?;
+    let maintenance = if position_quantity.is_zero() {
+        Money::zero(currency)
+    } else {
+        account
+            .calculate_maintenance_margin(instrument, position_quantity, mark.value, None)
+            .ok()?
+    };
+
+    if initial.currency != currency
+        || initial.currency.precision != currency.precision
+        || maintenance.currency != currency
+        || maintenance.currency.precision != currency.precision
+        || account.margin(&instrument.id()).is_some_and(|existing| {
+            existing.currency != currency || existing.currency.precision != currency.precision
+        })
+    {
+        log::error!("Cannot refresh current-mark margin: collateral currency mismatch");
+        return None;
+    }
+    Some(CurrentMarkMargin {
+        margin: MarginBalance::new(initial, maintenance, Some(instrument.id())),
+        gross_quantity,
+    })
 }
 
 impl AccountsManager {
@@ -422,82 +526,25 @@ impl AccountsManager {
         orders: &[&OrderAny],
         ts_event: UnixNanos,
     ) -> Option<AccountState> {
-        if !account.is_margin_model_ready() {
-            log::error!("Cannot refresh margin: pinned model is not installed");
-            return None;
-        }
-        let currency = instrument.cost_currency();
-
-        if account
-            .base_currency
-            .is_some_and(|base| base != currency || base.precision != currency.precision)
-        {
-            log::error!("Cannot refresh current-mark margin across collateral currencies");
-            return None;
-        }
-        let net =
-            positions
-                .iter()
-                .filter(|p| p.is_open())
-                .try_fold(Decimal::ZERO, |net, position| {
-                    assert_eq!(position.instrument_id, instrument.id());
-                    assert_eq!(position.account_id, account.id());
-                    net.checked_add(position.signed_decimal_qty())
-                })?;
-        let eligible: Vec<_> = orders
+        let orders: Vec<_> = orders
             .iter()
-            .filter(|order| {
-                assert_eq!(order.instrument_id(), instrument.id());
-                order.is_open() && !order.is_reduce_only() && !order.leaves_qty().is_zero()
-            })
+            .copied()
+            .filter(|order| order.is_open())
             .collect();
+        let margin = current_mark_margin(
+            account,
+            instrument,
+            positions,
+            &orders,
+            self.cache.borrow().mark_price(&instrument.id()).copied(),
+            ts_event.min(self.clock.borrow().timestamp_ns()),
+        )?;
 
-        if net.is_zero() && eligible.is_empty() {
+        if margin.gross_quantity.is_zero() {
             account.clear_margin(instrument.id());
-            return Some(self.generate_margin_account_state(account, ts_event));
-        }
-        let mark = *self.cache.borrow().mark_price(&instrument.id())?;
-        let known_at = ts_event.min(self.clock.borrow().timestamp_ns());
-        if mark.value.as_decimal() <= Decimal::ZERO
-            || mark.ts_event > known_at
-            || mark.ts_init > known_at
-        {
-            log::error!("Cannot refresh margin: positive, contemporaneously known mark required");
-            return None;
-        }
-        let position_quantity =
-            Quantity::from_decimal_dp(net.abs(), instrument.size_precision()).ok()?;
-        let gross = eligible.iter().try_fold(net.abs(), |quantity, order| {
-            quantity.checked_add(order.leaves_qty().as_decimal())
-        })?;
-        let gross_quantity = Quantity::from_decimal_dp(gross, instrument.size_precision()).ok()?;
-        let initial = account
-            .calculate_reserved_initial_margin(instrument, gross_quantity, mark.value, None)
-            .ok()?;
-        let maintenance = if position_quantity.is_zero() {
-            Money::zero(currency)
         } else {
-            account
-                .calculate_maintenance_margin(instrument, position_quantity, mark.value, None)
-                .ok()?
-        };
-
-        if initial.currency != currency
-            || initial.currency.precision != currency.precision
-            || maintenance.currency != currency
-            || maintenance.currency.precision != currency.precision
-            || account.margin(&instrument.id()).is_some_and(|existing| {
-                existing.currency != currency || existing.currency.precision != currency.precision
-            })
-        {
-            log::error!("Cannot refresh current-mark margin: collateral currency mismatch");
-            return None;
+            account.update_margin(margin.margin);
         }
-        account.update_margin(MarginBalance::new(
-            initial,
-            maintenance,
-            Some(instrument.id()),
-        ));
         Some(self.generate_margin_account_state(account, ts_event))
     }
 
