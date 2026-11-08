@@ -38,12 +38,13 @@ use nautilus_common::{
     runner::{TradingCommandMessage, try_get_trading_cmd_sender},
     throttler::{RateLimit, Throttler},
 };
-use nautilus_core::{UUID4, WeakCell};
+use nautilus_core::{UUID4, UnixNanos, WeakCell};
 use nautilus_execution::trailing::{
     trailing_stop_calculate_with_bid_ask, trailing_stop_calculate_with_last,
 };
 use nautilus_model::{
     accounts::{Account, AccountAny, MarginAccount, margin_model::MarginAccounting},
+    data::MarkPriceUpdate,
     enums::{
         AggregationSource, LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSide,
         PriceType, TimeInForce, TradingState, TrailingOffsetType, TriggerType,
@@ -52,7 +53,7 @@ use nautilus_model::{
         OrderDenied, OrderDeniedReason, OrderEventAny, OrderModifyRejected, OrderPriceField,
         PositionEvent,
     },
-    identifiers::{AccountId, InstrumentId},
+    identifiers::{AccountId, ClientOrderId, InstrumentId},
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
     types::{Currency, Money, Price, Quantity, quantity::QuantityRaw},
@@ -86,6 +87,24 @@ fn format_rate_limit(rate_limit: &RateLimit) -> String {
         let micros = remainder_ns / 1_000;
         format!("{limit}/{hours:02}:{minutes:02}:{seconds:02}.{micros:06}")
     }
+}
+
+/// A read-only native collateral calculation for one proposed current-mark opening.
+///
+/// This is not an order approval. Normal risk checks still apply at submission.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CurrentMarkOrderBudget {
+    pub account_id: AccountId,
+    pub instrument_id: InstrumentId,
+    pub client_order_id: ClientOrderId,
+    pub quantity: Quantity,
+    pub limit_price: Price,
+    pub mark: MarkPriceUpdate,
+    pub available: Money,
+    pub initial_margin: Money,
+    pub commission: Money,
+    pub required: Money,
+    pub ts_init: UnixNanos,
 }
 
 type SubmitCommandFn = Box<dyn Fn(TradingCommand)>;
@@ -1123,6 +1142,103 @@ impl RiskEngine {
         }
 
         true
+    }
+
+    /// Calculates the same account collateral and opening costs used by current-mark risk.
+    ///
+    /// The candidate's own ID is excluded from pending openings. Existing positions,
+    /// other pending openings and their fee reserves remain included. This method does
+    /// not mutate the account, reserve funds, emit events or approve the order.
+    /// Returns `None` when the native model, collateral or market inputs are unavailable.
+    #[must_use]
+    pub fn current_mark_order_budget(
+        &self,
+        account_id: AccountId,
+        order: &OrderAny,
+    ) -> Option<CurrentMarkOrderBudget> {
+        if order.order_type() != OrderType::Limit
+            || order.time_in_force() != TimeInForce::Ioc
+            || order.is_quote_quantity()
+            || order.is_reduce_only()
+            || order.quantity().is_zero()
+            || order.account_id().is_some_and(|id| id != account_id)
+        {
+            return None;
+        }
+        let cache = self.cache.borrow();
+        let instrument = cache.instrument(&order.instrument_id())?;
+        let account = cache.account_for_venue(&instrument.id().venue)?;
+        let AccountAny::Margin(account) = &*account else {
+            return None;
+        };
+
+        if account.id() != account_id {
+            return None;
+        }
+
+        if let Some(cached) = cache.order(&order.client_order_id())
+            && (cached.init_event() != order.init_event()
+                || cached.quantity() != order.quantity()
+                || cached.price() != order.price()
+                || cached.leaves_qty() != order.leaves_qty()
+                || cached.account_id() != order.account_id())
+        {
+            return None;
+        }
+        let currency = instrument.cost_currency();
+
+        if !account.is_margin_model_ready()
+            || account.margin_accounting() != MarginAccounting::CurrentMark
+            || !account.base.calculate_account_state
+            || account
+                .base_currency
+                .is_some_and(|base| base != currency || base.precision != currency.precision)
+            || account.balance(Some(currency))?.currency.precision != currency.precision
+        {
+            return None;
+        }
+        let ts_init = self.clock.borrow().timestamp_ns();
+        let mark = cache.mark_price(&instrument.id()).copied()?;
+
+        if mark.value.as_decimal() <= Decimal::ZERO
+            || mark.ts_event > ts_init
+            || mark.ts_init > ts_init
+        {
+            return None;
+        }
+        let limit_price = order.price()?;
+        let available = self.current_mark_available_collateral(account, instrument, &[order])?;
+        let initial_margin = account
+            .calculate_initial_margin(instrument, order.quantity(), mark.value, None)
+            .ok()?;
+        let commission = Self::current_mark_commission_reserve(
+            account,
+            instrument,
+            order.quantity(),
+            mark.value.max(limit_price),
+        )?;
+
+        if initial_margin.currency != currency
+            || initial_margin.currency.precision != currency.precision
+            || available.currency != currency
+            || available.currency.precision != currency.precision
+        {
+            return None;
+        }
+        let required = initial_margin.checked_add(commission)?;
+        Some(CurrentMarkOrderBudget {
+            account_id,
+            instrument_id: instrument.id(),
+            client_order_id: order.client_order_id(),
+            quantity: order.quantity(),
+            limit_price,
+            mark,
+            available,
+            initial_margin,
+            commission,
+            required,
+            ts_init,
+        })
     }
 
     fn current_mark_commission_reserve(

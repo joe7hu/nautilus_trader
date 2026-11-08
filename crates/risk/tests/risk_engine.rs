@@ -461,7 +461,7 @@ fn test_deny_order_exceeding_max_notional(
     matches!(saved_events[0], OrderEventAny::Denied(_));
 }
 
-use nautilus_risk::engine::{RiskEngine, config::RiskEngineConfig};
+use nautilus_risk::engine::{CurrentMarkOrderBudget, RiskEngine, config::RiskEngineConfig};
 
 #[fixture]
 fn process_order_event_handler() -> TypedIntoMessageSavingHandler<OrderEventAny> {
@@ -10912,6 +10912,99 @@ fn test_current_mark_risk_requires_pinned_model_known_mark_and_bounded_opening(
         .borrow_mut()
         .add_order(order.clone(), None, Some(client_id_binance), false)
         .unwrap();
+    let account_before =
+        serde_json::to_value(&*risk_engine.cache().borrow().account(&account_id).unwrap()).unwrap();
+    let order_before = serde_json::to_value(
+        &*risk_engine
+            .cache()
+            .borrow()
+            .order(&order.client_order_id())
+            .unwrap(),
+    )
+    .unwrap();
+    let budget = risk_engine.current_mark_order_budget(account_id, &order);
+
+    if matches!(existing_exposure, ExistingExposure::OtherPendingOpening) {
+        let aliased = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument_eth_usdt.id())
+            .client_order_id(ClientOrderId::new("OTHER-PENDING"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000"))
+            .price(Price::from("2500.00"))
+            .time_in_force(TimeInForce::Ioc)
+            .build();
+        assert!(
+            risk_engine
+                .current_mark_order_budget(account_id, &aliased)
+                .is_none()
+        );
+    }
+    assert!(
+        risk_engine
+            .current_mark_order_budget(AccountId::from("OTHER-001"), &order)
+            .is_none()
+    );
+
+    if !reinstall
+        || mark_init != Some(0)
+        || matches!(
+            existing_exposure,
+            ExistingExposure::ReportedOtherPosition | ExistingExposure::WrongMarginPrecision
+        )
+    {
+        assert!(budget.is_none());
+    }
+
+    if reinstall && mark_init == Some(0) {
+        let deduction = match existing_exposure {
+            ExistingExposure::None => Some(dec!(0)),
+            ExistingExposure::OtherPosition => Some(dec!(60)),
+            ExistingExposure::OtherPositionGain => Some(dec!(-210)),
+            ExistingExposure::OtherPositionLoss => Some(dec!(330)),
+            ExistingExposure::OtherPendingOpening => Some(dec!(60.6)),
+            _ => None,
+        };
+
+        if let Some(deduction) = deduction {
+            let budget = budget.as_ref().unwrap();
+            assert_eq!(budget.account_id, account_id);
+            assert_eq!(budget.instrument_id, instrument_eth_usdt.id());
+            assert_eq!(budget.client_order_id, order.client_order_id());
+            assert_eq!(budget.mark.value, Price::from("3000.00"));
+            assert_eq!(budget.initial_margin, Money::from("300 USDT"));
+            assert_eq!(budget.commission, Money::from("1.2 USDT"));
+            assert_eq!(budget.required, Money::from("301.2 USDT"));
+            assert_eq!(
+                budget.available.as_decimal(),
+                Money::from(cash).as_decimal() - deduction
+            );
+            assert_eq!(budget.required <= budget.available, admitted);
+            assert_eq!(
+                serde_json::from_value::<CurrentMarkOrderBudget>(
+                    serde_json::to_value(budget).unwrap(),
+                )
+                .unwrap(),
+                *budget,
+            );
+        }
+    }
+    assert_eq!(
+        serde_json::to_value(&*risk_engine.cache().borrow().account(&account_id).unwrap()).unwrap(),
+        account_before,
+    );
+    assert_eq!(
+        serde_json::to_value(
+            &*risk_engine
+                .cache()
+                .borrow()
+                .order(&order.client_order_id())
+                .unwrap()
+        )
+        .unwrap(),
+        order_before,
+    );
+    assert!(get_execute_order_event_handler_messages(&execute_order_event_handler).is_empty());
+    assert!(get_process_order_event_handler_messages(&process_order_event_handler).is_empty());
     let command = SubmitOrder::new(
         trader_id,
         Some(client_id_binance),
