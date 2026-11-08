@@ -53,7 +53,10 @@ use nautilus_execution::{
     },
 };
 use nautilus_model::{
-    accounts::{AccountAny, MarginAccount},
+    accounts::{
+        AccountAny, MarginAccount,
+        margin_model::{MarginModel, MarginModelHandle, StandardMarginModel},
+    },
     data::{
         Bar, BarType, Data, FundingRateUpdate, InstrumentClose, InstrumentStatus, QuoteTick,
         TradeTick,
@@ -78,6 +81,7 @@ use nautilus_model::{
     position::Position,
     types::{AccountBalance, Currency, Money, Price, Quantity, price::ERROR_PRICE},
 };
+use nautilus_portfolio::portfolio::Portfolio;
 use nautilus_sandbox::{SandboxExecutionClient, SandboxExecutionClientConfig};
 #[cfg(feature = "python")]
 use pyo3::{IntoPyObjectExt, Python, ffi::c_str, types::PyAnyMethods};
@@ -2134,6 +2138,120 @@ async fn test_client_connect_syncs_cached_margin_account_config(
     assert!(margin.base.calculate_account_state);
     assert_eq!(margin.default_leverage, leverage);
     assert_eq!(margin.get_leverage(&instrument_id), leverage);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_client_initial_margin_model_is_visible_before_first_account_delivery(
+    trader_id: TraderId,
+    venue: Venue,
+    instrument: InstrumentAny,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    let account_id = AccountId::from("SIM-PAPER");
+    let instrument_id = instrument.id();
+    let mut context = create_test_context_with(trader_id, account_id, venue, |config| {
+        config.default_leverage = Decimal::TEN;
+        config.leverages.insert(instrument_id, Decimal::from(5));
+    });
+    context
+        .client
+        .set_initial_margin_model(MarginModelHandle::new(StandardMarginModel))
+        .unwrap();
+    let observed = Rc::new(Cell::new(0));
+    let count = observed.clone();
+    let cache = context.cache.clone();
+    let handler = TypedHandler::from(move |event: &AccountState| {
+        let cached = cache.borrow();
+        let account = cached.account(&event.account_id).unwrap();
+        let AccountAny::Margin(margin) = &*account else {
+            panic!("expected margin account")
+        };
+        assert_eq!(margin.margin_model().name(), "standard");
+        assert_eq!(margin.default_leverage, Decimal::TEN);
+        assert_eq!(margin.get_leverage(&instrument_id), Decimal::from(5));
+        assert_eq!(account.events(), vec![event.clone()]);
+        count.set(count.get() + 1);
+    });
+    msgbus::register_account_state_endpoint(
+        MessagingSwitchboard::portfolio_update_account(),
+        handler,
+    );
+    context.client.connect().await.unwrap();
+    context.client.connect().await.unwrap();
+    assert_eq!(observed.get(), 1);
+    assert!(
+        context
+            .client
+            .set_initial_margin_model(MarginModelHandle::new(StandardMarginModel))
+            .is_err()
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_client_initial_margin_model_preserves_one_original_event_in_portfolio(
+    trader_id: TraderId,
+    venue: Venue,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    let account_id = AccountId::from("SIM-PAPER");
+    let expected = create_config(trader_id, account_id, venue).starting_balances;
+    let mut context = create_test_context(trader_id, account_id, venue);
+    let _portfolio = Portfolio::new(context.test_clock.clone(), context.cache.clone(), None);
+    context
+        .client
+        .set_initial_margin_model(MarginModelHandle::new(StandardMarginModel))
+        .unwrap();
+    context.client.connect().await.unwrap();
+    context.client.connect().await.unwrap();
+    let cache = context.cache.borrow();
+    let account = cache.account(&account_id).unwrap();
+    let AccountAny::Margin(margin) = &*account else {
+        panic!("expected margin account")
+    };
+    assert_eq!(margin.margin_model().name(), "standard");
+    assert_eq!(account.events().len(), 1);
+    assert_eq!(
+        account.events()[0]
+            .balances
+            .iter()
+            .map(|balance| balance.total)
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_client_initial_margin_model_cannot_replace_a_later_venue_account(
+    trader_id: TraderId,
+    venue: Venue,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    let mut context = create_test_context(trader_id, AccountId::from("SIM-PAPER"), venue);
+    context
+        .client
+        .set_initial_margin_model(MarginModelHandle::new(StandardMarginModel))
+        .unwrap();
+    let mut existing = margin_account_state();
+    existing.account_id = AccountId::from("SIM-ORIGINAL");
+    context
+        .cache
+        .borrow_mut()
+        .add_account(AccountAny::Margin(MarginAccount::new(
+            existing.clone(),
+            true,
+        )))
+        .unwrap();
+    assert!(context.client.connect().await.is_err());
+    assert!(!context.client.is_connected());
+    let cache = context.cache.borrow();
+    assert!(cache.account(&AccountId::from("SIM-PAPER")).is_none());
+    assert_eq!(
+        cache.account(&existing.account_id).unwrap().events(),
+        vec![existing]
+    );
 }
 
 #[rstest]
