@@ -10633,6 +10633,7 @@ enum ExistingExposure {
     RestingOpening,
     AdverseOpening,
     AdverseSellOpening,
+    AdverseFractionalOpening,
     OtherAdversePendingOpening,
     QuoteOpening,
 }
@@ -10711,6 +10712,13 @@ enum ExistingExposure {
     "601.19 USDT",
     ExistingExposure::AdverseSellOpening,
     false
+)]
+#[case::adverse_fractional_loss_is_exact(
+    true,
+    Some(0),
+    "1000 USDT",
+    ExistingExposure::AdverseFractionalOpening,
+    true
 )]
 #[case::pending_adverse_opening_reserves_price_loss(
     true,
@@ -10953,9 +10961,19 @@ fn test_current_mark_risk_requires_pinned_model_known_mark_and_bounded_opening(
                 OrderSide::Buy
             },
         )
-        .quantity(Quantity::from("1.000"))
+        .quantity(Quantity::from(
+            if matches!(
+                existing_exposure,
+                ExistingExposure::AdverseFractionalOpening
+            ) {
+                "0.010"
+            } else {
+                "1.000"
+            },
+        ))
         .quote_quantity(matches!(existing_exposure, ExistingExposure::QuoteOpening))
         .price(Price::from(match existing_exposure {
+            ExistingExposure::AdverseFractionalOpening => "3000.01",
             ExistingExposure::AdverseOpening => "3300.00",
             ExistingExposure::AdverseSellOpening => "2700.00",
             _ => "2500.00",
@@ -10984,6 +11002,23 @@ fn test_current_mark_risk_requires_pinned_model_known_mark_and_bounded_opening(
     )
     .unwrap();
     let budget = risk_engine.current_mark_order_budget(account_id, &order);
+
+    if matches!(
+        existing_exposure,
+        ExistingExposure::AdverseFractionalOpening
+    ) {
+        let fractional = budget.as_ref().unwrap();
+        assert_eq!(fractional.price_loss, Some(Money::from("0.0001 USDT")));
+        assert_eq!(
+            fractional.required,
+            fractional
+                .initial_margin
+                .checked_add(fractional.commission)
+                .unwrap()
+                .checked_add(Money::from("0.0001 USDT"))
+                .unwrap()
+        );
+    }
 
     if matches!(existing_exposure, ExistingExposure::OtherPendingOpening) {
         let aliased = OrderTestBuilder::new(OrderType::Limit)

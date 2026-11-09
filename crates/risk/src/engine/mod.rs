@@ -1287,17 +1287,22 @@ impl RiskEngine {
         if instrument.is_inverse() {
             return None;
         }
-        let limit_value = instrument
-            .try_calculate_notional_value(quantity, limit, None)
-            .ok()?;
-        let mark_value = instrument
-            .try_calculate_notional_value(quantity, mark, None)
-            .ok()?;
-        let loss = match side {
-            OrderSide::Buy => limit_value.checked_sub(mark_value)?,
-            OrderSide::Sell => mark_value.checked_sub(limit_value)?,
+        let adverse = match side {
+            OrderSide::Buy => limit.as_decimal().checked_sub(mark.as_decimal())?,
+            OrderSide::Sell => mark.as_decimal().checked_sub(limit.as_decimal())?,
         };
-        Some(loss.max(Money::zero(instrument.cost_currency())))
+        let currency = instrument.cost_currency();
+        if adverse <= Decimal::ZERO {
+            return Some(Money::zero(currency));
+        }
+        let loss = adverse
+            .checked_mul(quantity.as_decimal())?
+            .checked_mul(instrument.multiplier().as_decimal())?
+            .round_dp_with_strategy(
+                u32::from(currency.precision),
+                rust_decimal::RoundingStrategy::ToPositiveInfinity,
+            );
+        Money::from_decimal(loss, currency).ok()
     }
 
     fn current_mark_available_collateral(
