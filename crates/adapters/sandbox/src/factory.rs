@@ -171,6 +171,34 @@ impl SandboxExecutionClientFactory {
         client.restore_quote_only()?;
         Ok(Box::new(client))
     }
+
+    /// Creates a restored multi-market margin client from the original cached account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the original cache state or restoration profile is unsupported.
+    pub fn create_restored_account(
+        &self,
+        trader_id: TraderId,
+        name: &str,
+        config: &SandboxExecutionClientConfig,
+        cache: Rc<RefCell<Cache>>,
+    ) -> anyhow::Result<Box<dyn ExecutionClient>> {
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(LiveClock::default()));
+        let core = ExecutionClientCore::new(
+            trader_id,
+            ClientId::from(name),
+            config.venue,
+            config.oms_type,
+            config.account_id,
+            config.account_type,
+            config.base_currency,
+            cache.clone(),
+        );
+        let mut client = SandboxExecutionClient::new(core, config.clone(), clock, cache);
+        client.restore_account_quote_only()?;
+        Ok(Box::new(client))
+    }
 }
 
 impl SimulatedExecutionClientFactory for SandboxExecutionClientFactory {

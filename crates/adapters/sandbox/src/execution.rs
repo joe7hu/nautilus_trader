@@ -636,6 +636,130 @@ impl SandboxExecutionClient {
         Ok(())
     }
 
+    /// Restores a multi-market margin account whose original orders are all terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is active, an original order is still open, a market
+    /// allocation is foreign or incomplete, or the account or profile differs from the original.
+    pub fn restore_account_quote_only(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.restored.get()
+                && !self.core.borrow().is_connected()
+                && self.inner.borrow().matching_engines.is_empty()
+                && self.inner.borrow().maintenance.is_none()
+                && !self.inner.borrow().funding.enabled.get()
+                && self.config.account_type == AccountType::Margin
+                && self.config.oms_type == OmsType::Netting
+                && self.config.book_type == BookType::L1_MBP
+                && !self.config.bar_execution
+                && !self.config.trade_execution
+                && !self.config.queue_position
+                && !self.config.liquidity_consumption
+                && !self.config.frozen_account
+                && self.config.latency_model.is_none()
+                && self.config.fill_model.is_none(),
+            "unsupported sandbox account restoration state or configuration"
+        );
+        let account_id = self.config.account_id;
+        let (account, orders, instruments) = {
+            let cache = self.cache.borrow();
+            let account = cache
+                .account_owned(&account_id)
+                .ok_or_else(|| anyhow::anyhow!("original margin account unavailable"))?;
+            anyhow::ensure!(
+                account.account_type() == AccountType::Margin
+                    && account.base_currency() == self.config.base_currency
+                    && account
+                        .balances()
+                        .keys()
+                        .all(|currency| Some(*currency) == self.config.base_currency),
+                "original account type mismatch"
+            );
+            let orders = cache
+                .orders(Some(&self.config.venue), None, None, None, None)
+                .iter()
+                .map(|order| (*order).clone())
+                .collect::<Vec<_>>();
+            let instruments = cache
+                .instruments(&self.config.venue, None)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            (account, orders, instruments)
+        };
+        anyhow::ensure!(
+            !instruments.is_empty() && orders.iter().all(OrderAny::is_closed),
+            "account restoration requires its original markets and terminal orders"
+        );
+        let prefix = format!("{}-", self.config.venue);
+        let mut raw_ids = AHashMap::new();
+        let mut used = ahash::AHashSet::new();
+        for instrument in &instruments {
+            let market: Vec<_> = orders
+                .iter()
+                .filter(|order| order.instrument_id() == instrument.id())
+                .cloned()
+                .collect();
+            let raw_id = market
+                .iter()
+                .find_map(|order| order.venue_order_id())
+                .map(|id| {
+                    id.as_str()
+                        .strip_prefix(&prefix)
+                        .and_then(|rest| rest.split('-').next())
+                        .ok_or_else(|| anyhow::anyhow!("foreign native original venue allocation"))?
+                        .parse::<u32>()
+                        .map_err(anyhow::Error::from)
+                })
+                .transpose()?;
+            if let Some(raw_id) = raw_id {
+                anyhow::ensure!(
+                    used.insert(raw_id),
+                    "duplicate native original market allocation"
+                );
+                raw_ids.insert(instrument.id(), raw_id);
+            } else {
+                anyhow::ensure!(
+                    market.iter().all(|order| order.filled_qty().is_zero()),
+                    "native original allocation missing"
+                );
+            }
+        }
+        let next = used
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |max| max.wrapping_add(1));
+        {
+            let mut inner = self.inner.borrow_mut();
+            for instrument in &instruments {
+                if let Some(raw_id) = raw_ids.get(&instrument.id()) {
+                    inner.ensure_matching_engine_with_raw_id(instrument, Some(*raw_id));
+                    let market: Vec<_> = orders
+                        .iter()
+                        .filter(|order| order.instrument_id() == instrument.id())
+                        .cloned()
+                        .collect();
+                    inner
+                        .matching_engines
+                        .get_mut(&instrument.id())
+                        .unwrap()
+                        .restore_quote_only_terminal_orders(&market, account_id)?;
+                }
+            }
+            inner.next_engine_raw_id = next;
+        }
+        self.inner.borrow_mut().balances = account
+            .balances()
+            .into_values()
+            .map(|balance| (balance.currency.code.to_string(), balance.total))
+            .collect();
+        self.sync_cached_account_config()?;
+        self.restored.set(true);
+        Ok(())
+    }
+
     /// Enables native funding settlement before the client starts.
     ///
     /// # Errors
@@ -2529,6 +2653,14 @@ impl SandboxInner {
     }
 
     fn ensure_matching_engine(&mut self, instrument: &InstrumentAny) {
+        self.ensure_matching_engine_with_raw_id(instrument, None);
+    }
+
+    fn ensure_matching_engine_with_raw_id(
+        &mut self,
+        instrument: &InstrumentAny,
+        restored_raw_id: Option<u32>,
+    ) {
         let instrument_id = instrument.id();
 
         if !self.matching_engines.contains_key(&instrument_id) {
@@ -2540,8 +2672,11 @@ impl SandboxInner {
                 .clone()
                 .map(FeeModelHandle::from)
                 .unwrap_or_default();
-            let raw_id = self.next_engine_raw_id;
-            self.next_engine_raw_id = self.next_engine_raw_id.wrapping_add(1);
+            let raw_id = restored_raw_id.unwrap_or_else(|| {
+                let raw_id = self.next_engine_raw_id;
+                self.next_engine_raw_id = self.next_engine_raw_id.wrapping_add(1);
+                raw_id
+            });
 
             let mut engine = OrderMatchingEngine::new(
                 instrument.clone(),
