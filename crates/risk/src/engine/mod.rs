@@ -103,6 +103,8 @@ pub struct CurrentMarkOrderBudget {
     pub available: Money,
     pub initial_margin: Money,
     pub commission: Money,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_loss: Option<Money>,
     pub required: Money,
     pub ts_init: UnixNanos,
 }
@@ -1225,7 +1227,16 @@ impl RiskEngine {
         {
             return None;
         }
-        let required = initial_margin.checked_add(commission)?;
+        let price_loss = Self::current_mark_price_loss(
+            instrument,
+            order.order_side(),
+            order.quantity(),
+            limit_price,
+            mark.value,
+        )?;
+        let required = initial_margin
+            .checked_add(commission)?
+            .checked_add(price_loss)?;
         Some(CurrentMarkOrderBudget {
             account_id,
             instrument_id: instrument.id(),
@@ -1236,6 +1247,7 @@ impl RiskEngine {
             available,
             initial_margin,
             commission,
+            price_loss: (!price_loss.is_zero()).then_some(price_loss),
             required,
             ts_init,
         })
@@ -1263,6 +1275,29 @@ impl RiskEngine {
             return None;
         }
         Some(maker.max(taker).max(Money::zero(currency)))
+    }
+
+    fn current_mark_price_loss(
+        instrument: &InstrumentAny,
+        side: OrderSide,
+        quantity: Quantity,
+        limit: Price,
+        mark: Price,
+    ) -> Option<Money> {
+        if instrument.is_inverse() {
+            return None;
+        }
+        let limit_value = instrument
+            .try_calculate_notional_value(quantity, limit, None)
+            .ok()?;
+        let mark_value = instrument
+            .try_calculate_notional_value(quantity, mark, None)
+            .ok()?;
+        let loss = match side {
+            OrderSide::Buy => limit_value.checked_sub(mark_value)?,
+            OrderSide::Sell => mark_value.checked_sub(limit_value)?,
+        };
+        Some(loss.max(Money::zero(instrument.cost_currency())))
     }
 
     fn current_mark_available_collateral(
@@ -1364,6 +1399,14 @@ impl RiskEngine {
                     price,
                 )?;
                 available = available.checked_sub(fees)?;
+                let loss = Self::current_mark_price_loss(
+                    definition,
+                    order.order_side(),
+                    order.leaves_qty(),
+                    order.price()?,
+                    mark.value,
+                )?;
+                available = available.checked_sub(loss)?;
             }
         }
         Some(available)
@@ -1534,18 +1577,6 @@ impl RiskEngine {
                     deny_margin("Positive, contemporaneously known mark required");
                     return false;
                 };
-
-                if orders.iter().any(|order| {
-                    !order.is_reduce_only()
-                        && !full_position_exit
-                        && order.price().is_none_or(|limit| {
-                            (order.is_buy() && limit > mark.value)
-                                || (order.is_sell() && limit < mark.value)
-                        })
-                }) {
-                    deny_margin("Current-mark opening limit is worse than the mark");
-                    return false;
-                }
 
                 if orders.iter().any(|order| order.is_reduce_only()) {
                     let cache = self.cache.borrow();
@@ -2081,7 +2112,7 @@ impl RiskEngine {
                     continue;
                 }
                 // Margin account: check initial margin requirement
-                let margin_req = match &mut account {
+                let mut margin_req = match &mut account {
                     AccountAny::Margin(margin) => match margin.calculate_initial_margin(
                         instrument,
                         effective_quantity,
@@ -2160,7 +2191,17 @@ impl RiskEngine {
                         effective_quantity,
                         fee_price,
                     )
-                    .and_then(|fees| margin_req.checked_add(fees));
+                    .and_then(|fees| margin_req.checked_add(fees))
+                    .and_then(|required| {
+                        Self::current_mark_price_loss(
+                            instrument,
+                            order.order_side(),
+                            effective_quantity,
+                            last_px,
+                            mark,
+                        )
+                        .and_then(|loss| required.checked_add(loss))
+                    });
                     let Some(required) = required else {
                         deny_margin("Initial margin and commission budget cannot be calculated");
                         return false;
@@ -2172,6 +2213,7 @@ impl RiskEngine {
                         ));
                         return false;
                     }
+                    margin_req = required;
                 }
 
                 // Per-order margin check

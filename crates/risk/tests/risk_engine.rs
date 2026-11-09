@@ -10632,6 +10632,8 @@ enum ExistingExposure {
     InitializedOrder,
     RestingOpening,
     AdverseOpening,
+    AdverseSellOpening,
+    OtherAdversePendingOpening,
     QuoteOpening,
 }
 
@@ -10675,12 +10677,54 @@ enum ExistingExposure {
     ExistingExposure::RestingOpening,
     false
 )]
-#[case::adverse_opening_refused(
+#[case::adverse_opening_reserves_price_loss(
     true,
     Some(0),
     "1000 USDT",
     ExistingExposure::AdverseOpening,
+    true
+)]
+#[case::adverse_opening_cannot_spend_its_price_loss_reserve(
+    true,
+    Some(0),
+    "600 USDT",
+    ExistingExposure::AdverseOpening,
     false
+)]
+#[case::adverse_opening_exact_budget(
+    true,
+    Some(0),
+    "601.32 USDT",
+    ExistingExposure::AdverseOpening,
+    true
+)]
+#[case::adverse_sell_exact_budget(
+    true,
+    Some(0),
+    "601.2 USDT",
+    ExistingExposure::AdverseSellOpening,
+    true
+)]
+#[case::adverse_sell_exceeds_collateral(
+    true,
+    Some(0),
+    "601.19 USDT",
+    ExistingExposure::AdverseSellOpening,
+    false
+)]
+#[case::pending_adverse_opening_reserves_price_loss(
+    true,
+    Some(0),
+    "400 USDT",
+    ExistingExposure::OtherAdversePendingOpening,
+    false
+)]
+#[case::pending_adverse_opening_exact_budget(
+    true,
+    Some(0),
+    "421.86 USDT",
+    ExistingExposure::OtherAdversePendingOpening,
+    true
 )]
 #[case::quote_opening_refused(true, Some(0), "1000 USDT", ExistingExposure::QuoteOpening, false)]
 #[case::second_market_opening(true, Some(0), "400 USDT", ExistingExposure::OtherPosition, true)]
@@ -10798,6 +10842,7 @@ fn test_current_mark_risk_requires_pinned_model_known_mark_and_bounded_opening(
             | ExistingExposure::OtherPositionGain
             | ExistingExposure::OtherPositionLoss
             | ExistingExposure::OtherPendingOpening
+            | ExistingExposure::OtherAdversePendingOpening
             | ExistingExposure::ReportedOtherPosition
     ) {
         let other = InstrumentAny::CurrencyPair(currency_pair_btcusdt());
@@ -10816,13 +10861,25 @@ fn test_current_mark_risk_requires_pinned_model_known_mark_and_bounded_opening(
             ))
             .unwrap();
 
-        if matches!(existing_exposure, ExistingExposure::OtherPendingOpening) {
+        if matches!(
+            existing_exposure,
+            ExistingExposure::OtherPendingOpening | ExistingExposure::OtherAdversePendingOpening
+        ) {
             let pending = OrderTestBuilder::new(OrderType::Limit)
                 .instrument_id(other.id())
                 .client_order_id(ClientOrderId::new("OTHER-PENDING"))
                 .side(OrderSide::Buy)
                 .quantity(Quantity::from("0.010000"))
-                .price(Price::from("60000.00"))
+                .price(Price::from(
+                    if matches!(
+                        existing_exposure,
+                        ExistingExposure::OtherAdversePendingOpening
+                    ) {
+                        "66000.00"
+                    } else {
+                        "60000.00"
+                    },
+                ))
                 .time_in_force(TimeInForce::Ioc)
                 .build();
             simple_cache
@@ -10889,16 +10946,20 @@ fn test_current_mark_risk_requires_pinned_model_known_mark_and_bounded_opening(
         get_risk_engine(Some(Rc::new(RefCell::new(simple_cache))), None, None, false);
     let order = OrderTestBuilder::new(OrderType::Limit)
         .instrument_id(instrument_eth_usdt.id())
-        .side(OrderSide::Buy)
+        .side(
+            if matches!(existing_exposure, ExistingExposure::AdverseSellOpening) {
+                OrderSide::Sell
+            } else {
+                OrderSide::Buy
+            },
+        )
         .quantity(Quantity::from("1.000"))
         .quote_quantity(matches!(existing_exposure, ExistingExposure::QuoteOpening))
-        .price(Price::from(
-            if matches!(existing_exposure, ExistingExposure::AdverseOpening) {
-                "3300.00"
-            } else {
-                "2500.00"
-            },
-        ))
+        .price(Price::from(match existing_exposure {
+            ExistingExposure::AdverseOpening => "3300.00",
+            ExistingExposure::AdverseSellOpening => "2700.00",
+            _ => "2500.00",
+        }))
         .time_in_force(
             if matches!(existing_exposure, ExistingExposure::RestingOpening) {
                 TimeInForce::Gtc
@@ -10962,6 +11023,9 @@ fn test_current_mark_risk_requires_pinned_model_known_mark_and_bounded_opening(
             ExistingExposure::OtherPositionGain => Some(dec!(-210)),
             ExistingExposure::OtherPositionLoss => Some(dec!(330)),
             ExistingExposure::OtherPendingOpening => Some(dec!(60.6)),
+            ExistingExposure::AdverseOpening => Some(dec!(0)),
+            ExistingExposure::AdverseSellOpening => Some(dec!(0)),
+            ExistingExposure::OtherAdversePendingOpening => Some(dec!(120.66)),
             _ => None,
         };
 
@@ -10972,8 +11036,26 @@ fn test_current_mark_risk_requires_pinned_model_known_mark_and_bounded_opening(
             assert_eq!(budget.client_order_id, order.client_order_id());
             assert_eq!(budget.mark.value, Price::from("3000.00"));
             assert_eq!(budget.initial_margin, Money::from("300 USDT"));
-            assert_eq!(budget.commission, Money::from("1.2 USDT"));
-            assert_eq!(budget.required, Money::from("301.2 USDT"));
+            let adverse_buy = matches!(existing_exposure, ExistingExposure::AdverseOpening);
+            let adverse_sell = matches!(existing_exposure, ExistingExposure::AdverseSellOpening);
+            assert_eq!(
+                budget.commission,
+                Money::from(if adverse_buy { "1.32 USDT" } else { "1.2 USDT" })
+            );
+            assert_eq!(
+                budget.price_loss,
+                (adverse_buy || adverse_sell).then_some(Money::from("300 USDT"))
+            );
+            assert_eq!(
+                budget.required,
+                Money::from(if adverse_buy {
+                    "601.32 USDT"
+                } else if adverse_sell {
+                    "601.2 USDT"
+                } else {
+                    "301.2 USDT"
+                })
+            );
             assert_eq!(
                 budget.available.as_decimal(),
                 Money::from(cash).as_decimal() - deduction
