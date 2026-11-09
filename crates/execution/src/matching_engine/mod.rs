@@ -3076,6 +3076,49 @@ impl OrderMatchingEngine {
         Ok(())
     }
 
+    /// Restores an account market's terminal immediate-or-cancel order history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an open order, a foreign scope or incomplete venue allocations.
+    pub fn restore_quote_only_terminal_orders(
+        &mut self,
+        orders: &[OrderAny],
+        account_id: AccountId,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.core.iter_orders().next().is_none()
+                && self.book_type == BookType::L1_MBP
+                && self.account_type == AccountType::Margin
+                && self.oms_type == OmsType::Netting
+                && !self.config.queue_position
+                && !self.config.liquidity_consumption,
+            "unsupported matching engine restoration state"
+        );
+        for order in orders {
+            anyhow::ensure!(
+                order.instrument_id() == self.instrument.id()
+                    && (order.account_id() == Some(account_id)
+                        || (order.account_id().is_none()
+                            && matches!(order.status(), OrderStatus::Denied)))
+                    && matches!(order.order_type(), OrderType::Market | OrderType::Limit)
+                    && order.time_in_force() == TimeInForce::Ioc
+                    && order.is_closed()
+                    && order.filled_qty() <= order.quantity()
+                    && order.contingency_type().is_none()
+                    && !order.is_emulated()
+                    && !order.is_quote_quantity()
+                    && order.quantity().precision == self.instrument.size_precision(),
+                "unsupported original terminal order"
+            );
+        }
+        self.ids_generator.restore_quote_only_allocations(orders)?;
+        for order in orders {
+            self.account_ids.insert(order.trader_id(), account_id);
+        }
+        Ok(())
+    }
+
     /// Restores the complete original limit-order history into an empty quote-only engine.
     ///
     /// # Errors
